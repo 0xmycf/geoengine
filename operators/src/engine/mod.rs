@@ -7,8 +7,9 @@ pub use execution_context::{
     ExecutionContext, MetaData, MetaDataProvider, MockExecutionContext, StaticMetaData,
     StatisticsWrappingMockExecutionContext,
 };
+pub(crate) use operator::OperatorSchema;
 pub use operator::{
-    CanonicOperatorName, InitializedPlotOperator, InitializedRasterOperator,
+    build_workflow_schema, CanonicOperatorName, InitializedPlotOperator, InitializedRasterOperator,
     InitializedVectorOperator, OperatorData, OperatorName, PlotOperator, RasterOperator,
     TypedOperator, VectorOperator,
 };

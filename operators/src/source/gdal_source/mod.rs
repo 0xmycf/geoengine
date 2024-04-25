@@ -1,6 +1,7 @@
 use crate::adapters::{
     FillerTileCacheExpirationStrategy, FillerTimeBounds, SparseTilesFillAdapter,
 };
+use crate::define_operator;
 use crate::engine::{
     CanonicOperatorName, MetaData, OperatorData, OperatorName, QueryProcessor, WorkflowOperatorPath,
 };
@@ -11,7 +12,7 @@ use crate::util::retry::retry;
 use crate::{
     engine::{
         InitializedRasterOperator, RasterOperator, RasterQueryProcessor, RasterResultDescriptor,
-        SourceOperator, TypedRasterQueryProcessor,
+        TypedRasterQueryProcessor,
     },
     error::Error,
     util::Result,
@@ -53,6 +54,7 @@ pub use loading_info::{
 };
 use num::FromPrimitive;
 use postgres_types::{FromSql, ToSql};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, ensure};
 use std::collections::HashMap;
@@ -72,7 +74,32 @@ static GDAL_RETRY_MAX_BACKOFF_MS: u64 = 60 * 60 * 1000;
 static GDAL_RETRY_EXPONENTIAL_BACKOFF_FACTOR: f64 = 2.;
 
 /// Parameters for the GDAL Source Operator
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+///
+/// # Examples
+///
+/// ```rust
+/// use serde_json::{Result, Value};
+/// use geoengine_operators::source::{GdalSource, GdalSourceParameters};
+/// use geoengine_datatypes::dataset::{NamedData};
+/// use geoengine_datatypes::util::Identifier;
+///
+/// let json_string = r#"
+///     {
+///         "type": "GdalSource",
+///         "params": {
+///             "data": "ns:dataset"
+///         }
+///     }"#;
+///
+/// let operator: GdalSource = serde_json::from_str(json_string).unwrap();
+///
+/// assert_eq!(operator, GdalSource {
+///     params: GdalSourceParameters {
+///         data: NamedData::with_namespaced_name("ns", "dataset"),
+///     },
+/// });
+/// ```
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GdalSourceParameters {
     pub data: NamedData,
 }
@@ -774,11 +801,12 @@ where
     }
 }
 
-pub type GdalSource = SourceOperator<GdalSourceParameters>;
-
-impl OperatorName for GdalSource {
-    const TYPE_NAME: &'static str = "GdalSource";
-}
+define_operator!(
+    GdalSource,
+    GdalSourceParameters,
+    output_type = "raster",
+    help_text = "https://docs.geoengine.io/operators/gdalsource.html"
+);
 
 #[typetag::serde]
 #[async_trait]
