@@ -8,8 +8,9 @@ use crate::users::UserSession;
 use crate::util::middleware::OutputRequestId;
 use crate::util::postgres::DatabaseConnectionConfig;
 use crate::util::server::{
-    CustomRootSpanBuilder, calculate_max_blocking_threads_per_worker, configure_extractors,
-    connection_init, log_server_info, render_404, render_405, serve_openapi_json,
+    CustomRootSpanBuilder, calculate_max_blocking_threads_per_worker, configure_cors,
+    configure_extractors, connection_init, log_server_info, render_404, render_405,
+    serve_openapi_json,
 };
 use actix_files::Files;
 use actix_web::{App, FromRequest, HttpServer, http, middleware, web};
@@ -107,6 +108,7 @@ where
                     .handler(http::StatusCode::NOT_FOUND, render_404)
                     .handler(http::StatusCode::METHOD_NOT_ALLOWED, render_405),
             )
+            .wrap(configure_cors())
             .wrap(TracingLogger::<CustomRootSpanBuilder>::new())
             .service(api)
     })

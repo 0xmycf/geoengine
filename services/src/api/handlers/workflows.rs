@@ -25,8 +25,8 @@ use geoengine_datatypes::primitives::{
 };
 use geoengine_operators::call_on_typed_operator;
 use geoengine_operators::engine::{
-    ExecutionContext, OperatorData,  TypedResultDescriptor,
-     WorkflowOperatorPath,  build_workflow_schema,
+    ExecutionContext, OperatorData, TypedResultDescriptor, WorkflowOperatorPath,
+    build_workflow_schema,
 };
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
