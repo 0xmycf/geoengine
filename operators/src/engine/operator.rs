@@ -1,5 +1,7 @@
+use std::borrow::Cow;
+
 use schemars::{
-    r#gen::SchemaSettings,
+    r#gen::{SchemaGenerator, SchemaSettings},
     schema::{InstanceType, RootSchema, Schema, SchemaObject, SingleOrVec},
     JsonSchema,
 };
@@ -70,6 +72,28 @@ pub trait RasterOperator:
     fn span(&self) -> CreateSpan;
 }
 
+impl JsonSchema for dyn RasterOperator {
+    fn schema_name() -> String {
+        "RasterOperator".to_owned()
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed(concat!(module_path!(), "::RasterOperator"))
+    }
+
+    fn is_referenceable() -> bool {
+        false
+    }
+
+    fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
+        use schemars::schema::*;
+        Schema::Object(SchemaObject {
+            reference: Some("#/definitions/raster".to_owned()),
+            ..Default::default()
+        })
+    }
+}
+
 /// Common methods for `VectorOperator`s
 #[typetag::serde(tag = "type")]
 #[async_trait]
@@ -103,6 +127,28 @@ pub trait VectorOperator:
     }
 
     fn span(&self) -> CreateSpan;
+}
+
+impl JsonSchema for dyn VectorOperator {
+    fn schema_name() -> String {
+        "VectorOperator".to_owned()
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed(concat!(module_path!(), "::VectorOperator"))
+    }
+
+    fn is_referenceable() -> bool {
+        false
+    }
+
+    fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
+        use schemars::schema::*;
+        Schema::Object(SchemaObject {
+            reference: Some("#/definitions/vector".to_owned()),
+            ..Default::default()
+        })
+    }
 }
 
 /// Common methods for `PlotOperator`s
@@ -141,6 +187,28 @@ pub trait PlotOperator:
 }
 
 // TODO: implement a derive macro for common fields of operators: name, path, data, result_descriptor and automatically implement common trait functions
+impl JsonSchema for dyn PlotOperator {
+    fn schema_name() -> String {
+        "PlotOperator".to_owned()
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Cow::Borrowed(concat!(module_path!(), "::PlotOperator"))
+    }
+
+    fn is_referenceable() -> bool {
+        false
+    }
+
+    fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
+        use schemars::schema::*;
+        Schema::Object(SchemaObject {
+            reference: Some("#/definitions/plot".to_owned()),
+            ..Default::default()
+        })
+    }
+}
+
 pub trait InitializedRasterOperator: Send + Sync {
     /// Get the result descriptor of the `Operator`
     fn result_descriptor(&self) -> &RasterResultDescriptor;
@@ -503,6 +571,17 @@ inventory::collect!(OperatorSchema);
 macro_rules! define_operator {
     ($operator_name:ident, $operator_params:ident, output_type = $output_type:literal, help_text = $help_text:literal) => {
         pub type $operator_name = $crate::engine::SourceOperator<$operator_params>;
+
+        impl $crate::engine::OperatorName for $operator_name {
+            const TYPE_NAME: &'static str = stringify!($operator_name);
+        }
+
+        inventory::submit! {
+            $crate::engine::OperatorSchema::new::<$operator_name>($output_type, $help_text)
+        }
+    };
+    ($operator_name:ident, $operator_params:ident, $operator_sources:ident, output_type = $output_type:literal, help_text = $help_text:literal) => {
+        pub type $operator_name = $crate::engine::Operator<$operator_params, $operator_sources>;
 
         impl $crate::engine::OperatorName for $operator_name {
             const TYPE_NAME: &'static str = stringify!($operator_name);

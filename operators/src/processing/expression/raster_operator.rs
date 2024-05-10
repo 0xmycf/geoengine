@@ -3,21 +3,21 @@ use super::{
     raster_query_processor::{ExpressionInput, ExpressionQueryProcessor},
 };
 use crate::{
-    engine::{
-        CanonicOperatorName, InitializedRasterOperator, InitializedSources, Operator, OperatorName,
+    define_operator, engine::{
+        CanonicOperatorName, InitializedRasterOperator, InitializedSources, OperatorName,
         RasterBandDescriptor, RasterBandDescriptors, RasterOperator, RasterQueryProcessor,
         RasterResultDescriptor, SingleRasterSource, TypedRasterQueryProcessor,
         WorkflowOperatorPath,
     },
-    error::InvalidNumberOfExpressionInputBands,
     processing::expression::canonicalize_name,
-    util::Result,
+    error::InvalidNumberOfExpressionInputBands, util::Result
 };
 use async_trait::async_trait;
 use geoengine_datatypes::raster::RasterDataType;
 use geoengine_expression::{
     DataType, ExpressionAst, ExpressionParser, LinkedExpression, Parameter,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use snafu::ensure;
 use std::borrow::Cow;
@@ -28,7 +28,7 @@ use std::borrow::Cow;
 /// * `output_type` is the data type of the produced raster tiles.
 /// * `output_no_data_value` is the no data value of the output raster
 /// * `output_measurement` is the measurement description of the output
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ExpressionParams {
     pub expression: String,
@@ -38,7 +38,13 @@ pub struct ExpressionParams {
 }
 /// The `Expression` operator calculates an expression for all pixels of the input rasters bands and
 /// produces raster tiles of a given output type
-pub type Expression = Operator<ExpressionParams, SingleRasterSource>;
+define_operator!(
+    Expression,
+    ExpressionParams,
+    SingleRasterSource,
+    output_type = "raster",
+    help_text = "https://docs.geoengine.io/operators/expression.html"
+);
 
 /// Create a parameter name from an index.
 /// Starts with `A`.
@@ -130,10 +136,6 @@ impl RasterOperator for Expression {
     }
 
     span_fn!(Expression);
-}
-
-impl OperatorName for Expression {
-    const TYPE_NAME: &'static str = "Expression";
 }
 
 pub struct InitializedExpression {

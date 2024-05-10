@@ -10,8 +10,8 @@ use crate::util::input::StringOrNumberRange;
 use crate::util::{Result, safe_lock_mutex};
 use crate::{
     engine::{
-        InitializedVectorOperator, MetaData, QueryContext,
-        TypedVectorQueryProcessor, VectorOperator, VectorQueryProcessor, VectorResultDescriptor,
+        InitializedVectorOperator, MetaData, QueryContext, TypedVectorQueryProcessor,
+        VectorOperator, VectorQueryProcessor, VectorResultDescriptor,
     },
     error,
 };
