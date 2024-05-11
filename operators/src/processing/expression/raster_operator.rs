@@ -3,14 +3,16 @@ use super::{
     raster_query_processor::{ExpressionInput, ExpressionQueryProcessor},
 };
 use crate::{
-    define_operator, engine::{
+    define_operator,
+    engine::{
         CanonicOperatorName, InitializedRasterOperator, InitializedSources, OperatorName,
         RasterBandDescriptor, RasterBandDescriptors, RasterOperator, RasterQueryProcessor,
         RasterResultDescriptor, SingleRasterSource, TypedRasterQueryProcessor,
         WorkflowOperatorPath,
     },
     processing::expression::canonicalize_name,
-    error::InvalidNumberOfExpressionInputBands, util::Result
+    util::Result,
+    error::InvalidNumberOfExpressionInputBands,
 };
 use async_trait::async_trait;
 use geoengine_datatypes::raster::RasterDataType;
