@@ -4,7 +4,6 @@ use crate::engine::{
     VectorQueryProcessor, VectorResultDescriptor, WorkflowOperatorPath,
 };
 use crate::util::Result;
-use crate::{define_operator, error};
 use crate::util::input::StringOrNumberRange;
 use crate::{adapters::FeatureCollectionChunkMerger, engine::SingleVectorSource};
 use crate::{define_operator, error};
