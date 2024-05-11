@@ -17,7 +17,17 @@ use std::{
 use wkt::{ToWkt, Wkt};
 
 #[derive(
-    Clone, Copy, Debug, Deserialize, PartialEq, PartialOrd, Serialize, Default, ToSql, FromSql, JsonSchema
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+    Default,
+    ToSql,
+    FromSql,
+    JsonSchema,
 )]
 #[repr(C)]
 pub struct Coordinate2D {
