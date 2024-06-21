@@ -7,7 +7,7 @@ use crate::{
         SparseTilesFillAdapter, TileReprojectionSubQuery, fold_by_coordinate_lookup_future,
     },
     define_operator,
-    engine::{
+     engine::{
         CanonicOperatorName, ExecutionContext, InitializedRasterOperator, InitializedSources,
         InitializedVectorOperator, OperatorName, QueryContext, QueryProcessor, RasterOperator,
         RasterQueryProcessor, RasterResultDescriptor, SingleRasterOrVectorSource,
