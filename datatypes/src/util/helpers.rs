@@ -261,12 +261,15 @@ pub fn ge_report<E: snafu::Error>(error: E) -> String {
 }
 
 pub fn json_schema_help_link(url: &str) -> (String, serde_json::Value) {
-    ("links".to_owned(), serde_json::json!([
-        {
-            "rel": "external help",
-            "href": url
-        }
-    ]))
+    (
+        "links".to_owned(),
+        serde_json::json!([
+            {
+                "rel": "external help",
+                "href": url
+            }
+        ]),
+    )
 }
 
 #[cfg(test)]
