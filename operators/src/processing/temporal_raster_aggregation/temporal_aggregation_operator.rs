@@ -10,9 +10,10 @@ use super::first_last_subquery::{
 };
 use super::subquery::GlobalStateTemporalRasterAggregationSubQuery;
 use crate::adapters::stack_individual_aligned_raster_bands;
+use crate::define_operator;
 use crate::engine::{
-    CanonicOperatorName, ExecutionContext, InitializedSources, Operator, QueryProcessor,
-    RasterOperator, SingleRasterSource, WorkflowOperatorPath,
+    CanonicOperatorName, ExecutionContext, InitializedSources, QueryProcessor, RasterOperator,
+    SingleRasterSource, WorkflowOperatorPath,
 };
 use crate::processing::temporal_raster_aggregation::aggregators::PercentileEstimateAggregator;
 use crate::{
@@ -30,6 +31,7 @@ use geoengine_datatypes::primitives::{
 };
 use geoengine_datatypes::raster::{Pixel, RasterDataType, RasterTile2D};
 use geoengine_datatypes::{primitives::TimeStep, raster::TilingSpecification};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use snafu::ensure;
 use std::marker::PhantomData;
@@ -38,7 +40,7 @@ use tracing::debug;
 
 use typetag;
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TemporalRasterAggregationParameters {
     pub aggregation: Aggregation,
@@ -51,7 +53,7 @@ pub struct TemporalRasterAggregationParameters {
     pub output_type: Option<RasterDataType>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[serde(tag = "type")]
 pub enum Aggregation {
@@ -77,12 +79,13 @@ pub enum Aggregation {
     },
 }
 
-pub type TemporalRasterAggregation =
-    Operator<TemporalRasterAggregationParameters, SingleRasterSource>;
-
-impl OperatorName for TemporalRasterAggregation {
-    const TYPE_NAME: &'static str = "TemporalRasterAggregation";
-}
+define_operator!(
+    TemporalRasterAggregation,
+    TemporalRasterAggregationParameters,
+    SingleRasterSource,
+    output_type = "raster",
+    help_url = "https://docs.geoengine.io/operators/temporalrasteraggregation.html"
+);
 
 #[typetag::serde]
 #[async_trait]
