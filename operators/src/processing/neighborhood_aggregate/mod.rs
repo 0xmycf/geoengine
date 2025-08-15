@@ -20,7 +20,7 @@ use geoengine_datatypes::raster::{
 };
 use num::Integer;
 use num_traits::AsPrimitive;
-use schemars::{r#gen::SchemaGenerator, schema::Schema, JsonSchema};
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 use snafu::{Snafu, ensure};
 use std::marker::PhantomData;
@@ -58,36 +58,20 @@ pub enum AggregateFunctionParams {
 
 /// Generates a schema for [usize; 2] where each dimension is odd.
 fn odd_usize2_schema(_gen: &mut SchemaGenerator) -> Schema {
-    use schemars::schema::*;
-    Schema::Object(SchemaObject {
-        instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::Array))),
-        array: Some(Box::new(ArrayValidation {
-            items: Some(SingleOrVec::Single(Box::new(Schema::Object(
-                SchemaObject {
-                    instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::Integer))),
-                    format: Some("uint".to_owned()),
-                    subschemas: Some(Box::new(SubschemaValidation {
-                        not: Some(Box::new(Schema::Object(SchemaObject {
-                            number: Some(Box::new(NumberValidation {
-                                multiple_of: Some(2.0),
-                                ..Default::default()
-                            })),
-                            ..Default::default()
-                        }))),
-                        ..Default::default()
-                    })),
-                    number: Some(Box::new(NumberValidation {
-                        minimum: Some(0.0),
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                },
-            )))),
-            max_items: Some(2),
-            min_items: Some(2),
-            ..Default::default()
-        })),
-        ..Default::default()
+    use schemars::json_schema;
+    json_schema!({
+        "type": "array",
+        "items": {
+            "type": "integer",
+            "format": "uint",
+            "not" : {
+                "type": "integer",
+                "multipleOf": 2
+            },
+            "minimum": 0
+        },
+        "minItems": 2,
+        "maxItems": 2,
     })
 }
 
@@ -95,46 +79,22 @@ fn odd_usize2_schema(_gen: &mut SchemaGenerator) -> Schema {
 // count using JSON Schema (see https://stackoverflow.com/a/77910644).
 // Workaround using min length 1 for now.
 fn weights_matrix_schema(_gen: &mut SchemaGenerator) -> Schema {
-    use schemars::schema::*;
-    Schema::Object(SchemaObject {
-        metadata: Some(Box::new(Metadata {
-            title: Some("Rows".to_owned()),
-            ..Default::default()
-        })),
-        instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::Array))),
-        array: Some(Box::new(ArrayValidation {
-            items: Some(SingleOrVec::Single(Box::new(Schema::Object(
-                SchemaObject {
-                    metadata: Some(Box::new(Metadata {
-                        title: Some("Row".to_owned()),
-                        ..Default::default()
-                    })),
-                    instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::Array))),
-                    format: Some("table".to_owned()),
-                    array: Some(Box::new(ArrayValidation {
-                        items: Some(SingleOrVec::Single(Box::new(Schema::Object(
-                            SchemaObject {
-                                metadata: Some(Box::new(Metadata {
-                                    title: Some("Cell".to_owned()),
-                                    ..Default::default()
-                                })),
-                                instance_type: Some(SingleOrVec::Single(Box::new(
-                                    InstanceType::Number,
-                                ))),
-                                format: Some("double".to_owned()),
-                                ..Default::default()
-                            },
-                        )))),
-                        min_items: Some(1),
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                },
-            )))),
-            min_items: Some(1),
-            ..Default::default()
-        })),
-        ..Default::default()
+    use schemars::json_schema;
+    json_schema!({
+        "title": "Rows",
+        "type": "array",
+        "items": {
+            "title": "Row",
+            "type": "array",
+            "format": "table",
+            "items": {
+                "title": "Cell",
+                "type": "number",
+                "format": "double",
+            },
+            "minItems": 1
+        },
+        "minItems": 1,
     })
 }
 

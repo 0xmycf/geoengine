@@ -6,7 +6,7 @@ use crate::util::Result;
 use crate::util::input::StringOrNumber;
 use geoengine_datatypes::primitives::FeatureDataValue;
 use num_traits::AsPrimitive;
-use schemars::{r#gen::SchemaGenerator, schema::Schema, JsonSchema};
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::de::{Error, SeqAccess, Visitor};
 use serde::ser::SerializeTuple;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -22,8 +22,8 @@ pub enum StringOrNumberRange {
 }
 
 impl JsonSchema for StringOrNumberRange {
-    fn schema_name() -> String {
-        "StringOrNumberRange".to_owned()
+    fn schema_name() -> Cow<'static, str> {
+        "StringOrNumberRange".to_owned().into()
     }
 
     fn schema_id() -> Cow<'static, str> {
@@ -31,85 +31,42 @@ impl JsonSchema for StringOrNumberRange {
     }
 
     fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
-        use schemars::schema::*;
-        Schema::Object(SchemaObject {
-            subschemas: Some(Box::new(SubschemaValidation {
-                one_of: Some(vec![
-                    Schema::Object(SchemaObject {
-                        metadata: Some(Box::new(Metadata {
-                            title: Some("String range".to_owned()),
-                            ..Default::default()
-                        })),
-                        instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::Array))),
-                        array: Some(Box::new(ArrayValidation {
-                            items: Some(SingleOrVec::Vec(vec![
-                                Schema::Object(SchemaObject {
-                                    metadata: Some(Box::new(Metadata {
-                                        title: Some("Start inclusive".to_owned()),
-                                        ..Default::default()
-                                    })),
-                                    instance_type: Some(SingleOrVec::Single(Box::new(
-                                        InstanceType::String,
-                                    ))),
-                                    ..Default::default()
-                                }),
-                                Schema::Object(SchemaObject {
-                                    metadata: Some(Box::new(Metadata {
-                                        title: Some("End inclusive".to_owned()),
-                                        ..Default::default()
-                                    })),
-                                    instance_type: Some(SingleOrVec::Single(Box::new(
-                                        InstanceType::String,
-                                    ))),
-                                    ..Default::default()
-                                }),
-                            ])),
-                            max_items: Some(2),
-                            min_items: Some(2),
-                            ..Default::default()
-                        })),
-                        ..Default::default()
-                    }),
-                    Schema::Object(SchemaObject {
-                        metadata: Some(Box::new(Metadata {
-                            title: Some("Number range".to_owned()),
-                            ..Default::default()
-                        })),
-                        instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::Array))),
-                        array: Some(Box::new(ArrayValidation {
-                            items: Some(SingleOrVec::Vec(vec![
-                                Schema::Object(SchemaObject {
-                                    metadata: Some(Box::new(Metadata {
-                                        title: Some("Start inclusive".to_owned()),
-                                        ..Default::default()
-                                    })),
-                                    instance_type: Some(SingleOrVec::Single(Box::new(
-                                        InstanceType::Number,
-                                    ))),
-                                    ..Default::default()
-                                }),
-                                Schema::Object(SchemaObject {
-                                    metadata: Some(Box::new(Metadata {
-                                        title: Some("End inclusive".to_owned()),
-                                        ..Default::default()
-                                    })),
-                                    instance_type: Some(SingleOrVec::Single(Box::new(
-                                        InstanceType::Number,
-                                    ))),
-                                    ..Default::default()
-                                }),
-                            ])),
-                            max_items: Some(2),
-                            min_items: Some(2),
-                            ..Default::default()
-                        })),
-                        ..Default::default()
-                    }),
-                ]),
-                ..Default::default()
-            })),
-            ..Default::default()
-        })
+        use schemars::json_schema;
+
+        json_schema!({"oneOf": [
+            {
+                "title": "String range",
+                "type": "array",
+                "items": [
+                    {
+                        "title": "Start inclusive",
+                        "type": "string"
+                    },
+                    {
+                        "title": "End inclusive",
+                        "type": "string"
+                    }
+                ],
+                "minItems": 2,
+                "maxItems": 2
+            },
+            {
+                "title": "Number range",
+                "type": "array",
+                "items": [
+                    {
+                        "title": "Start inclusive",
+                        "type": "number"
+                    },
+                    {
+                        "title": "End inclusive",
+                        "type": "number"
+                    }
+                ],
+                "minItems": 2,
+                "maxItems": 2
+            }
+        ]})
     }
 }
 

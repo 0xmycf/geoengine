@@ -1,12 +1,8 @@
 use std::borrow::Cow;
 
 use crate::{identifier, util::helpers::json_schema_help_link};
-use schemars::{
-    r#gen::SchemaGenerator,
-    schema::Schema,
-    JsonSchema
-};
-use serde::{de::Visitor, Deserialize, Serialize};
+use schemars::{JsonSchema, Schema, SchemaGenerator};
+use serde::{Deserialize, Serialize, de::Visitor};
 
 identifier!(DataProviderId);
 
@@ -94,23 +90,26 @@ pub struct NamedData {
 }
 
 impl JsonSchema for NamedData {
-    fn schema_name() -> String {
-        "NamedData".to_owned()
+    fn schema_name() -> Cow<'static, str> {
+        "NamedData".to_owned().into()
     }
 
     fn schema_id() -> Cow<'static, str> {
         Cow::Borrowed(concat!(module_path!(), "::NamedData"))
     }
 
-    fn is_referenceable() -> bool {
-        false
+    fn inline_schema() -> bool {
+        true
     }
 
     fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
-        use schemars::schema::*;
-        Schema::Object(SchemaObject {
-            metadata: Some(Box::new(Metadata {
-                description: Some("The user-facing identifier for loadable data.
+        use schemars::json_schema;
+        let (key, value) =
+            json_schema_help_link("https://docs.geoengine.io/geoengine/datasets.html");
+        json_schema!({
+            "type": "string",
+            "description": "
+The user-facing identifier for loadable data.
 It can be resolved into a [`DataId`].
 
 It is a triple of namespace, provider and name.
@@ -120,14 +119,8 @@ The namespace and provider are optional and default to the system namespace and 
 
 * `dataset` -> `NamedData { namespace: None, provider: None, name: \"dataset\" }`
 * `namespace:dataset` -> `NamedData { namespace: Some(\"namespace\"), provider: None, name: \"dataset\" }`
-* `namespace:provider:dataset` -> `NamedData { namespace: Some(\"namespace\"), provider: Some(\"provider\"), name: \"dataset\" }`".to_owned()),
-..Default::default()
-            })),
-            instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
-            extensions: schemars::Map::from([
-                json_schema_help_link("https://docs.geoengine.io/geoengine/datasets.html")
-            ]),
-            ..Default::default()
+* `namespace:provider:dataset` -> `NamedData { namespace: Some(\"namespace\"), provider: Some(\"provider\"), name: \"dataset\" }`",
+            key: value
         })
     }
 }
