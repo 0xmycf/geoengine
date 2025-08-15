@@ -217,6 +217,6 @@ walkdir = "2.4"
 wkt = "0.14"
 xml-rs = "0.8"
 zip = "4.2"
-schemars = "0.8.16"
+schemars = "1.0.4"
 inventory = "0.3.15"
 

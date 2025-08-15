@@ -10,7 +10,7 @@ use postgres_types::private::BytesMut;
 
 use postgres_types::{FromSql, IsNull, ToSql, Type};
 use proj::Proj;
-use schemars::{r#gen::SchemaGenerator, schema::Schema, JsonSchema};
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -54,24 +54,24 @@ pub struct SpatialReference {
 }
 
 impl JsonSchema for SpatialReference {
-    fn schema_name() -> String {
-        "SpatialReference".to_owned()
+    fn schema_name() -> Cow<'static, str> {
+        "SpatialReference".to_owned().into()
     }
 
     fn schema_id() -> Cow<'static, str> {
         Cow::Borrowed(concat!(module_path!(), "::SpatialReference"))
     }
 
-    fn is_referenceable() -> bool {
-        false
+    fn inline_schema() -> bool {
+        true
     }
 
     fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
-        use schemars::schema::*;
-        Schema::Object(SchemaObject {
-            instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
-            extensions: schemars::Map::from([json_schema_help_link("https://epsg.io")]),
-            ..Default::default()
+        use schemars::json_schema;
+        let (key,value) = json_schema_help_link("https://epsg.io");
+        json_schema!({
+            "type": "string",
+            key: value
         })
     }
 }

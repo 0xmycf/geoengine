@@ -24,9 +24,10 @@ use geoengine_datatypes::{
     collections::{FeatureCollection, FeatureCollectionInfos},
     raster::GridSize,
 };
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 use snafu::ensure;
+use std::borrow::Cow;
 use std::convert::TryFrom;
 
 pub const HISTOGRAM_OPERATOR_NAME: &str = "Histogram";
@@ -78,26 +79,23 @@ fn default_max_number_of_buckets() -> u8 {
 string_token!(Data, "data");
 
 impl schemars::JsonSchema for Data {
-    fn schema_name() -> String {
-        "Data".to_owned()
+    fn schema_name() -> Cow<'static, str> {
+        "Data".to_owned().into()
     }
 
     fn schema_id() -> std::borrow::Cow<'static, str> {
         std::borrow::Cow::Borrowed(concat!(module_path!(), "::Data"))
     }
 
-    fn is_referenceable() -> bool {
-        false
+    fn inline_schema() -> bool {
+        true
     }
 
-    fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-        use schemars::schema::*;
-        Schema::Object(SchemaObject {
-            instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
-            enum_values: Some(vec![
-                serde_json::Value::String("data".to_owned())
-            ]),
-            ..Default::default()
+    fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
+        use schemars::json_schema;
+        json_schema!({
+            "type": "string",
+            "enum": ["data"],
         })
     }
 }

@@ -1,12 +1,11 @@
 use super::datetime::DateTimeError;
 use super::{DateTime, Duration};
 use crate::primitives::error;
-use crate::util::helpers::json_schema_help_link;
 use crate::util::Result;
+use crate::util::helpers::json_schema_help_link;
 use postgres_types::{FromSql, ToSql};
-use schemars::r#gen::SchemaGenerator;
-use schemars::schema::Schema;
-use schemars::JsonSchema;
+use schemars::SchemaGenerator;
+use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use snafu::ensure;
 use std::borrow::Cow;
@@ -24,51 +23,37 @@ use std::{
 pub struct TimeInstance(i64);
 
 impl JsonSchema for TimeInstance {
-    fn schema_name() -> String {
-        "TimeInstance".to_owned()
+    fn schema_name() -> Cow<'static, str> {
+        "TimeInstance".to_owned().into()
     }
 
     fn schema_id() -> Cow<'static, str> {
         Cow::Borrowed(concat!(module_path!(), "::TimeInstance"))
     }
 
-    fn is_referenceable() -> bool {
-        true
+    fn inline_schema() -> bool {
+        false
     }
 
     fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
-        use schemars::schema::*;
-        Schema::Object(SchemaObject {
-            subschemas: Some(Box::new(SubschemaValidation {
-                one_of: Some(vec![
-                    Schema::Object(SchemaObject {
-                        metadata: Some(Box::new(Metadata {
-                            title: Some("Unix Timestamp".to_owned()),
-                            description: Some("Unix timestamp in milliseconds".to_owned()),
-                            ..Default::default()
-                        })),
-                        instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::Integer))),
-                        ..Default::default()
-                    }),
-                    Schema::Object(SchemaObject {
-                        metadata: Some(Box::new(Metadata {
-                            title: Some("Datetime String".to_owned()),
-                            description: Some(
-                                "Date and time as defined in RFC 3339, section 5.6".to_owned(),
-                            ),
-                            ..Default::default()
-                        })),
-                        instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
-                        format: Some("date-time".to_owned()),
-                        extensions: schemars::Map::from([json_schema_help_link(
-                            "http://tools.ietf.org/html/rfc3339",
-                        )]),
-                        ..Default::default()
-                    }),
-                ]),
-                ..Default::default()
-            })),
-            ..Default::default()
+        use schemars::json_schema;
+        let (key, value) = json_schema_help_link("http://tools.ietf.org/html/rfc3339");
+        json_schema!({
+            "type": "object",
+            "oneOf": [
+                {
+                   "type": "integer",
+                   "title": "Unix Timestamp",
+                   "description": "Unix timestamp in milliseconds"
+                },
+                {
+                    "type": "string",
+                    "title": "Datetime String",
+                    "description": "Date and time as defined in RFC 3339, section 5.6",
+                    "format": "date-time",
+                    key: value
+                }
+            ]
         })
     }
 }
