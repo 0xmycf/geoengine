@@ -1,5 +1,5 @@
 [workspace]
-members = ["datatypes", "expression", "macros", "operators", "services"]
+members = ["datatypes", "expression", "gdalprocess", "macros", "operators", "services"]
 exclude = [
     "expression/deps-workspace", # Buggy, cf. https://github.com/rust-lang/cargo/issues/6745
     ".scripts",
@@ -77,7 +77,8 @@ actix-ws = "0.3"
 aes-gcm = "0.10.3"
 anyhow = "1.0"
 approx = "0.5"
-arrow = { version = "57.0", features = ["ipc_compression"] }
+arrow = { version = "57.0.0", features = ["ipc_compression"] }
+arrow-flight = "57.0.0" # https://github.com/apache/arrow-rs/blob/main/arrow-flight/README.md
 arrow-array = "57.0"
 arrow-ord = "57.0"
 arrow-schema = { version = "57.0", features = ["serde"] }
@@ -105,7 +106,7 @@ flexi_logger = { version = "0.31", features = ["trc"] }
 float-cmp = "0.10"
 futures = "0.3"
 futures-util = "0.3"
-gdal = "0.18"
+gdal = { version = "0.18", features = ["bindgen"] }
 gdal-sys = "0.11"
 # when changing geo version also adapt the Cargo.toml in the expression "deps-workspace"!
 geo = "0.31.0"
@@ -185,10 +186,11 @@ tokio = { version = "1.48", features = [
 ] }
 tokio-postgres = "0.7"
 toml = { version = "0.9", features = ["parse"] }
-tonic = { version = "0.11", features = [
-    "tls",
-    "tls-roots",
-] } # must be compatible with `aruna-rust-api`
+
+
+# tonic = { version = "0.14", features = [ "tls", "tls-roots", ] } # must be compatible with `aruna-rust-api`
+tonic = { version = "0.14" } # eh, maybe it works? 
+
 tracing = { version = "0.1", features = ["release_max_level_debug"] }
 tracing-actix-web = "0.7"
 tracing-opentelemetry = "0.32" # As of 0.26, tracing-opentelemetry is one version ahead of the opentelemetry crates
