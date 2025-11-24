@@ -396,6 +396,16 @@ where
     pub _phantom_data: PhantomData<T>,
 }
 
+// TODO (high): remove this again 
+pub fn load_tile<T: Pixel + GdalType + FromPrimitive>(
+        dataset_params: &GdalDatasetParameters,
+        tile_information: TileInformation,
+        tile_time: TimeInterval,
+        cache_hint: CacheHint,
+) -> Result<RasterTile2D<T>> {
+    GdalRasterLoader::load_tile_data(dataset_params, tile_information, tile_time, cache_hint)
+}
+
 struct GdalRasterLoader {}
 
 impl GdalRasterLoader {

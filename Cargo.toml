@@ -151,7 +151,7 @@ prettyplease = "0.2"
 proc-macro2 = "1.0"
 proj = "0.28" # needs to stay fixed to use fixed proj version
 proj-sys = "0.25" # needs to stay fixed to use fixed proj version
-prost = "0.12" # must be compatible with `aruna-rust-api`
+# prost = "0.11" # must be compatible with `aruna-rust-api`
 pwhash = "1.0"
 quote = "1.0"
 rand = "0.9"
@@ -188,8 +188,9 @@ tokio-postgres = "0.7"
 toml = { version = "0.9", features = ["parse"] }
 
 
-# tonic = { version = "0.14", features = [ "tls", "tls-roots", ] } # must be compatible with `aruna-rust-api`
-tonic = { version = "0.14" } # eh, maybe it works? 
+# tonic = { version = "0.11", features = [ "tls", "tls-roots", ] } # must be compatible with `aruna-rust-api`
+# tonic = { version = "0.14" } # eh, maybe it works? 
+# tonic-prost = { version = "0.14" }
 
 tracing = { version = "0.1", features = ["release_max_level_debug"] }
 tracing-actix-web = "0.7"

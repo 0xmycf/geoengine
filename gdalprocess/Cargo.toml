@@ -1,3 +1,4 @@
+
 [package]
 name = "gdalprocess"
 version.workspace = true
@@ -8,12 +9,41 @@ license-file.workspace = true
 documentation.workspace = true
 repository.workspace = true
 
+[lib]
+name = "libgdalprocess"
+path = "src/lib.rs"
+
+[[bin]] # Bin to run the HelloWorld gRPC server
+name = "gdalprocess"
+path = "src/main.rs"
+
+[[bin]] # Bin to run the HelloWorld gRPC client
+name = "gdalprocess-client"
+path = "src/client.rs"
+
+[[bin]] # Bin to run the HelloWorld gRPC client
+name = "gdalprocess-arrow-client"
+path = "src/arrow_client.rs"
+
+[[bin]] # Bin to run the HelloWorld gRPC client
+name = "gdalprocess-arrow-server"
+path = "src/arrow_server.rs"
+
 # copied from operators ( then modified )
 [dependencies]
+
 geoengine-operators = { path = "../operators" }
+
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
-tonic = { workspace = true}
+arrow-schema = { workspace = true }
+arrow-array = { workspace = true }
+
+prost = { version = "0.14" }
+prost-types = { version = "0.14" }
+tonic = { version = "0.14" }
+tonic-prost = { version = "0.14" }
+
 async-trait = { workspace = true }
 bb8-postgres = { workspace = true }
 bytes = { workspace = true }
@@ -54,8 +84,13 @@ typetag = { workspace = true }
 uuid = { workspace = true }
 strum = { workspace = true }
 
+[build-dependencies]
+tonic-prost-build = "*" # TODO (low): fix version
+
 [dev-dependencies]
+
 async-stream = { workspace = true }
+
 approx = { workspace = true }
 geo-rand = { workspace = true }
 httptest = { workspace = true }

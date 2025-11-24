@@ -1,5 +1,5 @@
 mod csv;
-mod gdal_source;
+pub mod gdal_source; // TOOD (high): make this private again after this hacking thing is done 
 mod ogr_source;
 
 pub use self::csv::{
