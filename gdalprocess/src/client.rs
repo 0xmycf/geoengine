@@ -1,8 +1,8 @@
 use geoengine_datatypes::raster::{GridShapeAccess, arrow_ipc_file_to_raster_tile_2d};
-use hello_world::GdalDatasetParameters;
-use hello_world::gdal_dataset_service_client::GdalDatasetServiceClient;
+use test_impl::GdalDatasetParameters;
+use test_impl::gdal_dataset_service_client::GdalDatasetServiceClient;
 
-pub mod hello_world {
+pub mod test_impl {
     tonic::include_proto!("gdal_dataset_service");
 }
 

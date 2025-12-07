@@ -9,25 +9,37 @@ license-file.workspace = true
 documentation.workspace = true
 repository.workspace = true
 
-[lib]
+[lib] # some lib that is currently empty
 name = "libgdalprocess"
 path = "src/lib.rs"
 
-[[bin]] # Bin to run the HelloWorld gRPC server
+[[bin]] # Bin to run the gRPC server
 name = "gdalprocess"
 path = "src/main.rs"
 
-[[bin]] # Bin to run the HelloWorld gRPC client
+[[bin]] # Bin to run the gRPC client
 name = "gdalprocess-client"
 path = "src/client.rs"
 
-[[bin]] # Bin to run the HelloWorld gRPC client
+#######################################################################################
+
+[[bin]] # Bin to run the arrow-flight-client
 name = "gdalprocess-arrow-client"
 path = "src/arrow_client.rs"
 
-[[bin]] # Bin to run the HelloWorld gRPC client
+[[bin]] # Bin to run the arrow-flight-server
 name = "gdalprocess-arrow-server"
 path = "src/arrow_server.rs"
+
+#######################################################################################
+
+[[bin]] # Bin to run the ipc-channel client
+name = "gdalprocess-ipc-channel-client"
+path = "src/ipc-client-main.rs"
+
+[[bin]] # Bin to run the ipc-channel server
+name = "gdalprocess-ipc-channel-server"
+path = "src/ipc-server-main.rs"
 
 # copied from operators ( then modified )
 [dependencies]
@@ -43,6 +55,10 @@ prost = { version = "0.14" }
 prost-types = { version = "0.14" }
 tonic = { version = "0.14" }
 tonic-prost = { version = "0.14" }
+
+ipc-channel = { workspace = true }
+criterion = { workspace = true }
+rand = { workspace = true }
 
 async-trait = { workspace = true }
 bb8-postgres = { workspace = true }

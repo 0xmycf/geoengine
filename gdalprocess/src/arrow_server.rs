@@ -27,7 +27,6 @@ use arrow_array::record_batch;
 use arrow_flight::Location;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_descriptor::DescriptorType;
-use arrow_schema::ArrowError;
 use futures::stream::BoxStream;
 use futures::{Stream, TryStreamExt};
 use tonic::transport::Server;

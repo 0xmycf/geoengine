@@ -98,7 +98,7 @@ clap = { version = "4.5", features = ["derive"] }
 clap_derive = "4.5"
 config = "0.15"
 convert_case = "0.8"
-criterion = "0.7"
+criterion = { version = "0.7", features = ["async_tokio"]}
 csv = "1.4"
 erased-serde = "0.4"
 fallible-iterator = "0.2" # only for postgres-protocol
@@ -187,6 +187,7 @@ tokio = { version = "1.48", features = [
 tokio-postgres = "0.7"
 toml = { version = "0.9", features = ["parse"] }
 
+ipc-channel = "0.20.2"
 
 # tonic = { version = "0.11", features = [ "tls", "tls-roots", ] } # must be compatible with `aruna-rust-api`
 # tonic = { version = "0.14" } # eh, maybe it works? 
