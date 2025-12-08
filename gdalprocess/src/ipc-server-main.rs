@@ -1,72 +1,105 @@
 // server
 
-use std::any::Any;
-
-use geoengine_datatypes::raster::{GridShape, raster_tile_2d_to_arrow_ipc_file};
-use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
-use libgdalprocess::{IpcChannelMessage, construct_tile, random_data};
+use geoengine_datatypes::raster::{GridShape, RasterTile2D, raster_tile_2d_to_arrow_ipc_file};
+use libgdalprocess::{
+    construct_tile,
+    ipc_channel_service::{
+        self, SendType, SimpleIpcChannelMessage, client::setup_client,
+        client::setup_client_for_bytes,
+    },
+    random_data,
+};
 
 fn main() {
-    let (server, token) = ipc::IpcOneShotServer::<(
-        IpcSender<IpcChannelMessage>,
-        IpcReceiver<IpcChannelMessage>,
-    )>::new()
-    .expect("Failed to create IPC Server");
+    let (send_type, token) = setup();
 
-    println!(
-        "[SERVER] IPC channel created with token: \x1b[31m{}\x1b[0m",
-        token
-    );
+    let tile = prepare_tile(100_000, [100, 1000].into());
 
-    let (_rx, (sender, receiver)) = server.accept().expect("accept failed to receive message");
-    log(&format!("Received channel: {:?}", sender.type_id()));
-
-    loop {
-        match receiver.recv() {
-            Ok(IpcChannelMessage::RequestTileData {}) => {
-                match send_random_data(10_000, [1000, 1000].into(), &sender) {
-                    Ok(_) => log("Sent tile data successfully."),
-                    Err(err) => log(&format!("Error sending tile data: {}", err)),
+    match send_type {
+        SendType::IpcArrow => {
+            let (sender, receiver) = setup_client(token);
+            let the_data = to_vec8(tile).expect("Failed to convert tile to IPC data");
+            loop {
+                let the_data = the_data.clone();
+                let msg = receiver
+                    .recv()
+                    .expect("Failed to receive message from client");
+                match msg {
+                    SimpleIpcChannelMessage::RequestTileData {} => {
+                        sender
+                            .send(SimpleIpcChannelMessage::Data(the_data))
+                            .expect("Failed to send tile to client");
+                    }
+                    _ => panic!("Received unexpected message from client"),
+                };
+            }
+        }
+        SendType::Serde => {
+            let (sender, receiver) = setup_client(token);
+            loop {
+                let tile = tile.clone();
+                let msg = receiver
+                    .recv()
+                    .expect("Failed to receive message from client");
+                match msg {
+                    SimpleIpcChannelMessage::RequestTileData {} => {
+                        sender.send(tile).expect("Failed to send tile to client");
+                    }
+                    _ => panic!("Received unexpected message from client"),
+                };
+            }
+        }
+        SendType::Bytes => {
+            let (sender, receiver) = setup_client_for_bytes(token);
+            let the_data = to_vec8(tile).expect("Failed to convert tile to IPC data");
+            loop {
+                let msg = receiver
+                    .recv()
+                    .expect("Failed to receive message from client");
+                match msg {
+                    SimpleIpcChannelMessage::RequestTileData {} => {
+                        sender
+                            .send(&the_data)
+                            .expect("Failed to send tile to client");
+                    }
+                    _ => panic!("Received unexpected message from client"),
                 }
-            }
-            Ok(IpcChannelMessage::EndConnection) => {
-                log("Client requested to end connection.");
-                sender
-                    .send(IpcChannelMessage::EndConnection)
-                    .expect("Failed to send EndConnection to client");
-                break;
-            }
-            Ok(msg) => {
-                log(&format!("Received unexpected message: {:?}", msg));
-            }
-            Err(err) => {
-                log(&format!("Error receiving message: {}", err));
             }
         }
     }
-
-    log("Server exiting.");
 }
 
-fn send_random_data(
-    upper: u32,
-    shape: GridShape<[usize; 2]>,
-    sender: &IpcSender<IpcChannelMessage>,
-) -> Result<(), String> {
+type Token = String;
+
+fn setup() -> (SendType, Token) {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 3 {
+        panic!("Usage: gdalprocess-ipc-channel-server <token> <send_type>");
+    }
+    let token = &args[1];
+    let send_type_str = &args[2];
+    let send_type =
+        ipc_channel_service::parse_input(send_type_str).expect("Failed to parse send type");
+    (
+        send_type,
+        token.clone(),
+    )
+}
+
+fn prepare_tile(upper: u32, shape: GridShape<[usize; 2]>) -> RasterTile2D<u8> {
     let data = random_data(upper);
-    let tile = construct_tile(data, shape);
+    construct_tile(data, shape)
+}
+
+fn to_vec8(tile: RasterTile2D<u8>) -> Result<Vec<u8>, String> {
     let ipc_data = raster_tile_2d_to_arrow_ipc_file(
         tile,
         geoengine_datatypes::spatial_reference::SpatialReferenceOption::Unreferenced,
     );
-    let the_data = ipc_data.map_err(|e| format!("Failed to convert tile to IPC data: {}", e))?;
-    sender
-        .send(IpcChannelMessage::Data(the_data))
-        .map_err(|e| format!("Failed to send tile: {}", e))?;
-
-    Ok(())
+    ipc_data.map_err(|e| format!("Failed to convert tile to IPC data: {}", e))
 }
 
+#[allow(unused)]
 fn log(message: &str) {
     println!("[SERVER] {}", message);
 }

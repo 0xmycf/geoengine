@@ -2,10 +2,9 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use geoengine_datatypes::raster::{RasterTile2D, raster_tile_2d_to_arrow_ipc_file};
 use geoengine_datatypes::spatial_reference::SpatialReferenceOption;
 use libgdalprocess::grpc_service::TileServiceImpl;
-use libgdalprocess::grpc_service::proto_service::{RequestTileData, TileDataReply};
+use libgdalprocess::grpc_service::proto_service::RequestTileData;
 use libgdalprocess::grpc_service::proto_service::gdal_dataset_service_client::GdalDatasetServiceClient;
 use libgdalprocess::grpc_service::proto_service::gdal_dataset_service_server::GdalDatasetServiceServer;
-use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tonic::transport::Server;
@@ -20,17 +19,16 @@ async fn start_server(svc: TileServiceImpl, addr: SocketAddr) {
 
 async fn setup_server(tile_data: RasterTile2D<u8>) -> SocketAddr {
     let addr = "127.0.0.1:50051".parse().unwrap();
-    let data = raster_tile_2d_to_arrow_ipc_file(tile_data, SpatialReferenceOption::Unreferenced).expect("conversion to arrow ipc format failed");
+    let data = raster_tile_2d_to_arrow_ipc_file(tile_data, SpatialReferenceOption::Unreferenced)
+        .expect("conversion to arrow ipc format failed");
     tokio::spawn(async move {
-        let svc = libgdalprocess::grpc_service::TileServiceImpl { grid: Arc::new(data) };
+        let svc = libgdalprocess::grpc_service::TileServiceImpl { grid: data };
         start_server(svc, addr).await;
     });
     addr
 }
 
-async fn setup_client(
-    addr: SocketAddr,
-) -> GdalDatasetServiceClient<tonic::transport::Channel> {
+async fn setup_client(addr: SocketAddr) -> GdalDatasetServiceClient<tonic::transport::Channel> {
     GdalDatasetServiceClient::connect(format!("http://{}", addr))
         .await
         .expect("Failed to connect to server")
@@ -46,7 +44,7 @@ fn grpc_bench(c: &mut Criterion) {
     let client = Arc::new(Mutex::new(client));
 
     c.bench_function("client-server roundtrip of grpc", |b| {
-        let client = client.clone(); // not sure if i could create the client here directly
+        let client = client.clone();
         b.to_async(&rt).iter(move || {
             let client = client.clone();
             async move {
@@ -58,5 +56,21 @@ fn grpc_bench(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, grpc_bench);
+fn raster_to_ipc_data_bench(c: &mut Criterion) {
+    let data =
+        libgdalprocess::construct_tile(libgdalprocess::random_data(100_000), [100, 1000].into());
+
+    c.bench_function("raster tile to arrow ipc data", |b| {
+        b.iter(|| {
+            let ipc_data = raster_tile_2d_to_arrow_ipc_file(
+                data.clone(),
+                SpatialReferenceOption::Unreferenced,
+            )
+            .expect("conversion to arrow ipc format failed");
+            std::hint::black_box(ipc_data);
+        });
+    });
+}
+
+criterion_group!(benches, grpc_bench, raster_to_ipc_data_bench);
 criterion_main!(benches);

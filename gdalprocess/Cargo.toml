@@ -41,6 +41,32 @@ path = "src/ipc-client-main.rs"
 name = "gdalprocess-ipc-channel-server"
 path = "src/ipc-server-main.rs"
 
+#### for benchmarks ###################################################################
+
+[[bin]] # Bin to run the ipc-channel server
+name = "gdalprocess-grpc-bench-server"
+path = "src/grpc_server_main.rs"
+
+#######################################################################################
+
+[[bench]]
+name = "ipc_channel_bench"
+harness = false
+
+[[bench]]
+name = "ipc_channel_process_bench"
+harness = false
+
+[[bench]]
+name = "grpc_process_bench"
+harness = false
+
+[[bench]]
+name = "grpc_bench"
+harness = false
+ 
+ ######################################################################################
+
 # copied from operators ( then modified )
 [dependencies]
 

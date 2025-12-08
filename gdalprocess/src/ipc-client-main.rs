@@ -1,78 +1,59 @@
 // client
 
-use geoengine_datatypes::raster::arrow_ipc_file_to_raster_tile_2d;
 use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
-use libgdalprocess::IpcChannelMessage;
+use libgdalprocess::ipc_channel_service::{SendType, SimpleIpcChannelMessage};
 
 fn main() {
-    let token = std::env::var("IPC_CHANNEL").expect("IPC_CHANNEL not set");
+    let (sender, receiver) = spawn_ipc_server_proccess::<
+        SimpleIpcChannelMessage,
+        SimpleIpcChannelMessage,
+    >(SendType::IpcArrow);
 
-    println!("[CLIENT] Connecting to IPC channel with token: {}", token);
+    log("Requesting tile data from server...");
 
-    let (server_sender, client_reciever) =
-        ipc::channel::<IpcChannelMessage>().expect("Failed to create IPC channel");
-    let (client_sender, server_reciever) =
-        ipc::channel::<IpcChannelMessage>().expect("Failed to create IPC channel");
+    (0..100).for_each(|_| {
+        sender
+            .send(SimpleIpcChannelMessage::RequestTileData {})
+            .expect("Failed to send request to server");
 
-    let sender =
-        ipc::IpcSender::<(IpcSender<IpcChannelMessage>, IpcReceiver<IpcChannelMessage>)>::connect(
-            token,
-        )
-        .expect("Failed to connect to IPC Server");
-
-    sender
-        .send((server_sender, server_reciever))
-        .expect("Failed to send sender to server");
-
-    loop {
-        let input = read_input("Request Tile? (Y/n)");
-        if input.to_lowercase() == "n" {
-            client_sender
-                .send(IpcChannelMessage::EndConnection)
-                .expect("Failed to send EndConnection to server");
-        }
-        client_sender
-            .send(IpcChannelMessage::RequestTileData {})
-            .expect("Failed to send message to server");
-        let msg = client_reciever
+        receiver
             .recv()
-            .expect("Failed to receive ack from server");
-        match msg {
-            IpcChannelMessage::RequestTileData {} => {
-                log("Received unexpected RequestTileData message from server (makes no sense)");
-            }
-            IpcChannelMessage::Data(tile_data) => {
-                let tile = arrow_ipc_file_to_raster_tile_2d::<u8>(tile_data, None);
-                log(&format!("Received tile from server: {:?}", tile));
-            }
-            IpcChannelMessage::Error(err) => {
-                log(&format!("Received error from server: {}", err));
-            }
-            IpcChannelMessage::EndConnection => {
-                log("Server ended connection.");
-                break;
-            }
-        }
+            .map(|msg| match msg {
+                SimpleIpcChannelMessage::Data(data) => {
+                    log(&format!("Received tile data of length: {}", data.len()));
+                }
+                _ => {
+                    log("Received unexpected message from server");
+                }
+            })
+            .expect("Failed to receive message from server");
+    });
+}
 
-        if input == "exit" {
-            break;
-        }
-    }
+fn spawn_ipc_server_proccess<S, C>(t: SendType) -> (IpcSender<S>, IpcReceiver<C>) {
+    assert!(
+        matches!(t, SendType::IpcArrow | SendType::Serde),
+        "Only IpcArrow and Serde types supported in this function"
+    );
+    let (server, token) = ipc::IpcOneShotServer::<(IpcSender<S>, IpcReceiver<C>)>::new()
+        .expect("Failed to create IPC Server");
+
+    println!(
+        "cargo run --bin gdalprocess-ipc-channel-server -- {} {}",
+        token,
+        SendType::IpcArrow.to_string(),
+    );
+
+    let (_rx, channels) = server.accept().expect("accept failed to receive message");
+    (
+        channels.0,
+        match t {
+            SendType::IpcArrow | SendType::Serde => channels.1,
+            SendType::Bytes => panic!("Bytes type not supported in this function"),
+        },
+    )
 }
 
 fn log(message: &str) {
     println!("[CLIENT] {}", message);
-}
-
-fn read_input(prompt: &str) -> String {
-    use std::io::{self, Write};
-
-    print!("{}", prompt);
-    io::stdout().flush().expect("Failed to flush stdout");
-
-    let mut input = String::new();
-    io::stdin()
-        .read_line(&mut input)
-        .expect("Failed to read line");
-    input.trim().to_string()
 }
