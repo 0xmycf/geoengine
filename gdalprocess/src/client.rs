@@ -1,6 +1,6 @@
-use geoengine_datatypes::raster::GridShapeAccess;
+use geoengine_datatypes::raster::{GridShapeAccess, arrow_ipc_file_to_raster_tile_2d};
+use hello_world::GdalDatasetParameters;
 use hello_world::gdal_dataset_service_client::GdalDatasetServiceClient;
-use hello_world::{GdalDatasetParameters};
 
 pub mod hello_world {
     tonic::include_proto!("gdal_dataset_service");
@@ -29,6 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let file_path = FILE_NAMES[selection];
 
+        // In a real application this stuff is known / computed beforehand
         let request = tonic::Request::new(GdalDatasetParameters {
             file_path: file_path.to_string(),
             rasterband_channel: 1,
@@ -43,22 +44,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Error during request: {}", e);
                 continue;
             }
-            Ok(result) => result.into_inner()
+            Ok(result) => result.into_inner(),
         };
 
-        println!("Received {} bytes of IPC data", result.data_size);
-
-        // let grid = arrow_ipc_file_to_raster_tile_2d::<f64>(result.ipc_data, None);
-        // match grid {
-        //     Err(e) => {
-        //         println!("Error converting response to raster tile: {}", e);
-        //         continue;
-        //     }
-        //     Ok(grid) => {
-        //         println!("Shape: {:?}", grid.grid_shape());
-        //         println!("{:?}", grid);  
-        //     }
-        // }
+        let grid = arrow_ipc_file_to_raster_tile_2d::<f64>(result.ipc_data, None);
+        match grid {
+            Err(e) => {
+                println!("Error converting response to raster tile: {}", e);
+                continue;
+            }
+            Ok(grid) => {
+                println!("Shape: {:?}", grid.grid_shape());
+                println!("{:?}", grid);
+            }
+        }
 
         // println!("RESPONSE={:?}", result);
     }

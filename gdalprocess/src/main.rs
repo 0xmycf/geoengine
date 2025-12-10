@@ -90,7 +90,7 @@ impl GdalDatasetService for TileReaderImpl {
             Err(_) => Ok(Response::new(hello_world::TileDataReply {
                 success: false,
                 data_size: 0,
-                // ipc_data: vec![],
+                ipc_data: vec![],
             })),
             Ok(ok) => {
                 use geoengine_datatypes::spatial_reference::SpatialReferenceOption;
@@ -98,10 +98,11 @@ impl GdalDatasetService for TileReaderImpl {
                 Ok(Response::new(hello_world::TileDataReply {
                     success: true,
                     data_size: bytes as u32,
-                    // ipc_data: raster_tile_2d_to_arrow_ipc_file(
-                    //     ok,
-                    //     SpatialReferenceOption::Unreferenced,
-                    // ).expect("it should be possible to convert the tile to arrow ipc"),
+                    ipc_data: raster_tile_2d_to_arrow_ipc_file(
+                        ok,
+                        SpatialReferenceOption::Unreferenced,
+                    )
+                    .expect("it should be possible to convert the tile to arrow ipc"),
                 }))
             }
         }

@@ -55,5 +55,5 @@ message GdalDatasetParameters {
 message TileDataReply {
   bool success = 1;
   uint32 data_size = 2;
-  // bytes ipc_data = 3;
+  bytes ipc_data = 3;
 }
