@@ -42,17 +42,22 @@
   <component name="MacroExpansionManager">
     <option name="directoryName" value="tcuUaLtE" />
   </component>
-  <component name="ProjectColorInfo"><![CDATA[{
-  "associatedIndex": 6
-}]]></component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 6
+}</component>
   <component name="ProjectId" id="36hf6HC0Jxkz99uSohFX24v5VkD" />
   <component name="ProjectViewState">
     <option name="showLibraryContents" value="true" />
   </component>
   <component name="PropertiesComponent"><![CDATA[{
   "keyToString": {
+    "Cargo.--benches.executor": "Run",
+    "Cargo.Bench.executor": "Run",
+    "Cargo.Bench2.executor": "Run",
     "Cargo.Test GdalProcess (1).executor": "Debug",
     "Cargo.Test GdalProcess.executor": "Debug",
+    "Cargo.Test.executor": "Run",
+    "Cargo.test benches.executor": "Debug",
     "ModuleVcsDetector.initialDetectionPerformed": "true",
     "RunOnceActivity.ShowReadmeOnStart": "true",
     "RunOnceActivity.git.unshallow": "true",
@@ -69,10 +74,9 @@
     "vue.rearranger.settings.migration": "true"
   }
 }]]></component>
-  <component name="RunManager" selected="Cargo.Test GdalProcess">
-    <configuration name="Run geoengine-cli" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
-      <option name="buildProfileId" value="dev" />
-      <option name="command" value="run --package geoengine-services --bin geoengine-cli" />
+  <component name="RunManager" selected="Cargo.Test">
+    <configuration name="Bench2" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
+      <option name="command" value="bench --bench ipc_channel_process_bench --no-run" />
       <option name="workingDirectory" value="file://$PROJECT_DIR$/.." />
       <envs />
       <option name="emulateTerminal" value="true" />
@@ -88,45 +92,9 @@
         <option name="CARGO.BUILD_TASK_PROVIDER" enabled="true" />
       </method>
     </configuration>
-    <configuration name="Test GdalProcess (1)" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
+    <configuration name="Test" type="CargoCommandRunConfiguration" factoryName="Cargo Command" nameIsGenerated="true">
       <option name="buildProfileId" value="test" />
-      <option name="command" value="test --package gdalprocess --test" />
-      <option name="workingDirectory" value="file://$PROJECT_DIR$/.." />
-      <envs />
-      <option name="emulateTerminal" value="true" />
-      <option name="channel" value="DEFAULT" />
-      <option name="requiredFeatures" value="true" />
-      <option name="allFeatures" value="false" />
-      <option name="withSudo" value="false" />
-      <option name="buildTarget" value="REMOTE" />
-      <option name="backtrace" value="SHORT" />
-      <option name="isRedirectInput" value="false" />
-      <option name="redirectInputPath" value="" />
-      <method v="2">
-        <option name="CARGO.BUILD_TASK_PROVIDER" enabled="true" />
-      </method>
-    </configuration>
-    <configuration name="Test GdalProcess" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
-      <option name="buildProfileId" value="test" />
-      <option name="command" value="test --package gdalprocess --test bincode_tests" />
-      <option name="workingDirectory" value="file://$PROJECT_DIR$/.." />
-      <envs />
-      <option name="emulateTerminal" value="true" />
-      <option name="channel" value="DEFAULT" />
-      <option name="requiredFeatures" value="true" />
-      <option name="allFeatures" value="false" />
-      <option name="withSudo" value="false" />
-      <option name="buildTarget" value="REMOTE" />
-      <option name="backtrace" value="SHORT" />
-      <option name="isRedirectInput" value="false" />
-      <option name="redirectInputPath" value="" />
-      <method v="2">
-        <option name="CARGO.BUILD_TASK_PROVIDER" enabled="true" />
-      </method>
-    </configuration>
-    <configuration name="Test geoengine-workflow-backend" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
-      <option name="buildProfileId" value="test" />
-      <option name="command" value="test --workspace" />
+      <option name="command" value="test --bench ipc_channel_process_bench --package gdalprocess" />
       <option name="workingDirectory" value="file://$PROJECT_DIR$/.." />
       <envs />
       <option name="emulateTerminal" value="true" />
@@ -143,10 +111,8 @@
       </method>
     </configuration>
     <list>
-      <item itemvalue="Cargo.Test GdalProcess" />
-      <item itemvalue="Cargo.Test GdalProcess (1)" />
-      <item itemvalue="Cargo.Run geoengine-cli" />
-      <item itemvalue="Cargo.Test geoengine-workflow-backend" />
+      <item itemvalue="Cargo.Test" />
+      <item itemvalue="Cargo.Bench2" />
     </list>
   </component>
   <component name="RustProjectSettings">
@@ -161,6 +127,8 @@
       <option name="presentableId" value="Default" />
       <updated>1745758586160</updated>
       <workItem from="1765463547976" duration="2539000" />
+      <workItem from="1765735538175" duration="885000" />
+      <workItem from="1765736678753" duration="592000" />
     </task>
     <servers />
   </component>
@@ -179,6 +147,11 @@
           <url>file://$USER_HOME$/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bincode-2.0.1/src/features/serde/de_borrowed.rs</url>
           <line>59</line>
           <option name="timeStamp" value="4" />
+        </line-breakpoint>
+        <line-breakpoint enabled="true" type="com.jetbrains.cidr.execution.debugger.OCBreakpointType">
+          <url>file://$PROJECT_DIR$/benches/ipc_channel_process_bench.rs</url>
+          <line>266</line>
+          <option name="timeStamp" value="5" />
         </line-breakpoint>
       </breakpoints>
     </breakpoint-manager>

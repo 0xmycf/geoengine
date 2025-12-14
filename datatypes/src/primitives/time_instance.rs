@@ -13,7 +13,7 @@ use std::{
     str::FromStr,
 };
 
-#[derive(Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord, Debug, FromSql, ToSql)]
+#[derive(Clone, Copy,/*  Serialize, */ PartialEq, Eq, PartialOrd, Ord, Debug, FromSql, ToSql)]
 #[repr(C)]
 #[postgres(transparent)]
 pub struct TimeInstance(i64);
@@ -183,6 +183,23 @@ impl FromStr for TimeInstance {
     }
 }
 
+impl Serialize for TimeInstance {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if serializer.is_human_readable() {
+            let s = self
+                .as_date_time()
+                .map(|dt| dt.to_datetime_string_with_millis())
+                .unwrap_or_else(|| format!("Invalid TimeInstance({})", self.0));
+            serializer.serialize_str(&s)
+        } else {
+            serializer.serialize_i64(self.0)
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for TimeInstance {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -219,7 +236,12 @@ impl<'de> Deserialize<'de> for TimeInstance {
             }
         }
 
-        deserializer.deserialize_any(IsoStringOrUnixTimestamp)
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_any(IsoStringOrUnixTimestamp)
+        } else {
+            let millis = i64::deserialize(deserializer)?;
+            TimeInstance::from_millis(millis).map_err(serde::de::Error::custom)
+        }
     }
 }
 

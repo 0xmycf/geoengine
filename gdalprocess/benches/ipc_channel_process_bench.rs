@@ -1,6 +1,7 @@
 use std::process::{Child, Command};
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use geoengine_datatypes::raster::RasterTile2D;
 use ipc_channel::ipc::{self, IpcBytesReceiver, IpcReceiver, IpcSender};
 use libgdalprocess::ipc_channel_service::{SendType, SimpleIpcChannelMessage};
 
@@ -39,7 +40,7 @@ fn spawn_ipc_server_proccess_bytes<S>(
             SendType::Bytes => channels.1,
         },
     )
-}//}}}
+} //}}}
 
 fn spawn_ipc_server_proccess<S, C>(
     t: SendType,
@@ -70,7 +71,7 @@ fn spawn_ipc_server_proccess<S, C>(
             SendType::Bytes => panic!("Bytes type not supported in this function"),
         },
     )
-}//}}}
+} //}}}
 
 // this one spawns a new process each benching process
 fn ipc_channel_process_start_per_iter(c: &mut Criterion) {
@@ -101,12 +102,12 @@ fn ipc_channel_process_start_per_iter(c: &mut Criterion) {
     );
 } //}}}
 
-fn bench_ipc_channel_process(c: &mut Criterion, serialize_during_iteration: bool) {
+fn bench_ipc_channel_process(c: &mut Criterion, serialize_during_iteration: bool, t: SendType) {
     // {{{
     let (mut child, sender, receiver) = spawn_ipc_server_proccess::<
         SimpleIpcChannelMessage,
         SimpleIpcChannelMessage,
-    >(SendType::IpcArrow, serialize_during_iteration);
+    >(t, serialize_during_iteration);
 
     c.bench_function(
         &format!(
@@ -134,65 +135,67 @@ fn bench_ipc_channel_process(c: &mut Criterion, serialize_during_iteration: bool
 
 // this one only requests / sends data
 fn ipc_channel_process(c: &mut Criterion) {
-    bench_ipc_channel_process(c, false);
+    bench_ipc_channel_process(c, false, SendType::IpcArrow);
 }
 
-// serde {{{
-// fn ipc_channel_serde_process(c: &mut Criterion) {
-//     let (mut child, sender, receiver) =
-//         spawn_ipc_server_proccess::<SimpleIpcChannelMessage, RasterTile2D<u8>>(SendType::Serde);
-//
-//     c.bench_function(
-//         "client-server roundtrip of ipc-channel (serde|process|iter)",
-//         |b| {
-//             b.iter(|| {
-//                 match sender.send(SimpleIpcChannelMessage::RequestTileData {}) {
-//                     Ok(_) => (),
-//                     Err(err) => {
-//                         child
-//                             .kill()
-//                             .expect("Failed to kill child process after send error");
-//                         panic!("Failed to send request to server: {}", err)
-//                     }
-//                 }
-//                 let resp = receiver
-//                     .recv()
-//                     .expect("Failed to receive or deserialise data");
-//                 std::hint::black_box(resp);
-//             });
-//         },
-//     );
-//     child.kill().expect("Failed to kill child process");
-// }
+fn ipc_channel_serde_process(c: &mut Criterion) {
+    // {{{{
+    let (mut child, sender, receiver) = spawn_ipc_server_proccess::<
+        SimpleIpcChannelMessage,
+        RasterTile2D<u8>,
+    >(SendType::Serde, false);
 
-// fn ipc_channel_serde_process_iter(c: &mut Criterion) {
-//     c.bench_function(
-//         "client-server roundtrip of ipc-channel (serde|process)",
-//         |b| {
-//             b.iter(|| {
-//                 let (mut child, sender, receiver) = spawn_ipc_server_proccess::<
-//                     SimpleIpcChannelMessage,
-//                     RasterTile2D<u8>,
-//                 >(SendType::Serde);
-//                 match sender.send(SimpleIpcChannelMessage::RequestTileData {}) {
-//                     Ok(_) => (),
-//                     Err(err) => {
-//                         child
-//                             .kill()
-//                             .expect("Failed to kill child process after send error");
-//                         panic!("Failed to send request to server: {}", err)
-//                     }
-//                 }
-//                 let resp = receiver
-//                     .recv()
-//                     .expect("Failed to receive or deserialise data");
-//                 child.kill().expect("Failed to kill child process");
-//                 std::hint::black_box(resp);
-//             });
-//         },
-//     );
-// }
-// }}}
+    c.bench_function(
+        "client-server roundtrip of ipc-channel (serde|process) (serialize_during_iteration=false)",
+        |b| {
+            b.iter(|| {
+                match sender.send(SimpleIpcChannelMessage::RequestTileData {}) {
+                    Ok(_) => (),
+                    Err(err) => {
+                        child
+                            .kill()
+                            .expect("Failed to kill child process after send error");
+                        panic!("Failed to send request to server: {}", err)
+                    }
+                }
+                let resp = receiver
+                    .recv()
+                    .expect("Failed to receive or deserialise data");
+                std::hint::black_box(resp);
+            });
+        },
+    );
+    child.kill().expect("Failed to kill child process");
+} // }}}}
+
+fn ipc_channel_serde_process_iter(c: &mut Criterion) {
+    // {{{{
+    c.bench_function(
+        "client-server roundtrip of ipc-channel (serde|process|iter)",
+        |b| {
+            b.iter(|| {
+                let (mut child, sender, receiver) = spawn_ipc_server_proccess::<
+                    SimpleIpcChannelMessage,
+                    RasterTile2D<u8>,
+                >(SendType::Serde, false);
+                match sender.send(SimpleIpcChannelMessage::RequestTileData {}) {
+                    Ok(_) => (),
+                    Err(err) => {
+                        child
+                            .kill()
+                            .expect("Failed to kill child process after send error");
+                        panic!("Failed to send request to server: {}", err)
+                    }
+                }
+                let resp = receiver
+                    .recv()
+                    .expect("Failed to receive or deserialise data");
+                child.kill().expect("Failed to kill child process");
+                std::hint::black_box(resp);
+            });
+        },
+    );
+} //}}}}
 
 fn ipc_channel_bytes_process_per_iter(c: &mut Criterion) {
     // {{{
@@ -253,7 +256,7 @@ fn ipc_channel_bytes_process(c: &mut Criterion) {
 }
 
 fn ipc_channel_bench_process_with_serialisation(c: &mut Criterion) {
-    bench_ipc_channel_process(c, true);
+    bench_ipc_channel_process(c, true, SendType::IpcArrow);
 }
 
 fn ipc_channel_bench_process_bytes_with_serialisation(c: &mut Criterion) {
@@ -261,18 +264,19 @@ fn ipc_channel_bench_process_bytes_with_serialisation(c: &mut Criterion) {
 }
 
 // fn ipc_channel_bench_process_bytes_serde_with_serialisation(c: &mut Criterion) {
-//     unimplemented!()
+//     bench_ipc_channel_process(c, true, SendType::Serde);
 // }
 
 criterion_group!(
     benches,
     ipc_channel_process,
     ipc_channel_process_start_per_iter,
-    // ipc_channel_serde_process,
-    // ipc_channel_serde_process_iter,
+    ipc_channel_serde_process,
+    ipc_channel_serde_process_iter,
     ipc_channel_bytes_process,
     ipc_channel_bytes_process_per_iter,
     ipc_channel_bench_process_with_serialisation,
     ipc_channel_bench_process_bytes_with_serialisation,
+    // ipc_channel_bench_process_bytes_serde_with_serialisation
 );
 criterion_main!(benches);

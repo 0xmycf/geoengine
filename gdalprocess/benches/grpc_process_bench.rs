@@ -1,7 +1,6 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use libgdalprocess::grpc_service::proto_service::RequestTileData;
 use libgdalprocess::grpc_service::proto_service::gdal_dataset_service_client::GdalDatasetServiceClient;
-use tonic::server::ServerStreamingService;
 use std::net::SocketAddr;
 use std::process;
 use std::sync::{Arc, Mutex};
@@ -66,23 +65,9 @@ fn grpc_bench_process_with_serialisation(c: &mut Criterion) {
     child.kill().expect("Failed to kill server process");
 }
 
-// fn grpc_bench_process_iter(c: &mut Criterion) {
-//     c.bench_function("client-server roundtrip of grpc (process|iter)", |b| {
-//         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-//         b.to_async(&rt).iter(|| async {
-//             let mut child = start_process_server();
-//             let mut client = setup_client().await;
-//             let resp = client.load_tile_data(RequestTileData {}).await.unwrap();
-//             std::hint::black_box(resp);
-//             child.kill().expect("Failed to kill server process");
-//         });
-//     });
-// }
-
 criterion_group!(
     benches,
     grpc_bench_process,
     grpc_bench_process_with_serialisation,
-    // grpc_bench_process_iter
 );
 criterion_main!(benches);
