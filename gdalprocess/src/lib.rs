@@ -133,6 +133,8 @@ pub mod ipc_channel_service {
 
 pub mod grpc_service {
 
+    use geoengine_datatypes::raster::{RasterTile2D, raster_tile_2d_to_arrow_ipc_file};
+    use geoengine_datatypes::spatial_reference::SpatialReferenceOption;
     use tonic::{Request, Response, Status};
 
     use crate::grpc_service::proto_service::gdal_dataset_service_server::GdalDatasetService;
@@ -140,6 +142,31 @@ pub mod grpc_service {
 
     pub mod proto_service {
         tonic::include_proto!("gdal_dataset_service_simple");
+    }
+
+    #[derive(Debug)]
+    pub struct TileServiceImplWithSerialization {
+        pub grid: RasterTile2D<u8>,
+    }
+
+    #[tonic::async_trait]
+    impl GdalDatasetService for TileServiceImplWithSerialization {
+        async fn load_tile_data(
+            &self,
+            _request: Request<RequestTileData>,
+        ) -> Result<Response<proto_service::TileDataReply>, Status> {
+            let data = std::hint::black_box(raster_tile_2d_to_arrow_ipc_file(
+                std::hint::black_box(self.grid.clone()),
+                SpatialReferenceOption::Unreferenced,
+            ));
+            match data {
+                Ok(v) => Ok(Response::new(TileDataReply { data: v })),
+                Err(err) => Err(Status::internal(format!(
+                    "Failed to convert tile to arrow ipc: {}",
+                    err
+                ))),
+            }
+        }
     }
 
     #[derive(Debug)]

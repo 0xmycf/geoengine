@@ -45,7 +45,11 @@ path = "src/ipc-server-main.rs"
 
 [[bin]] # Bin to run the ipc-channel server
 name = "gdalprocess-grpc-bench-server"
-path = "src/grpc_server_main.rs"
+path = "src/b_grpc_server_main.rs"
+
+[[bin]] # Bin to run the ipc-channel server; serialises data at each request
+name = "gdalprocess-grpc-bench-server-with-serialization"
+path = "src/b_grpc_server_main_with_serialization.rs"
 
 #######################################################################################
 

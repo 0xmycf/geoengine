@@ -4,11 +4,16 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use ipc_channel::ipc::{self, IpcBytesReceiver, IpcReceiver, IpcSender};
 use libgdalprocess::ipc_channel_service::{SendType, SimpleIpcChannelMessage};
 
+#[inline(always)]
 fn ensure_params(matches: bool, msg: &str) {
     assert!(matches, "{}", msg);
 }
 
-fn spawn_ipc_server_proccess_bytes<S>(t: SendType) -> (Child, IpcSender<S>, IpcBytesReceiver) {
+fn spawn_ipc_server_proccess_bytes<S>(
+    t: SendType,
+    serialize_during_iteration: bool,
+) -> (Child, IpcSender<S>, IpcBytesReceiver) {
+    // {{{
     ensure_params(
         matches!(t, SendType::Bytes),
         "only Bytes type supported in this function",
@@ -19,6 +24,7 @@ fn spawn_ipc_server_proccess_bytes<S>(t: SendType) -> (Child, IpcSender<S>, IpcB
     let child = Command::new(path)
         .arg(token)
         .arg(t.to_string())
+        .arg(serialize_during_iteration.to_string())
         .spawn()
         .expect("failed to spawn ipc server process");
 
@@ -33,9 +39,13 @@ fn spawn_ipc_server_proccess_bytes<S>(t: SendType) -> (Child, IpcSender<S>, IpcB
             SendType::Bytes => channels.1,
         },
     )
-}
+}//}}}
 
-fn spawn_ipc_server_proccess<S, C>(t: SendType) -> (Child, IpcSender<S>, IpcReceiver<C>) {
+fn spawn_ipc_server_proccess<S, C>(
+    t: SendType,
+    serialize_during_iteration: bool,
+) -> (Child, IpcSender<S>, IpcReceiver<C>) {
+    //{{{
     ensure_params(
         matches!(t, SendType::IpcArrow | SendType::Serde),
         "Only IpcArrow and Serde types supported in this function",
@@ -47,6 +57,7 @@ fn spawn_ipc_server_proccess<S, C>(t: SendType) -> (Child, IpcSender<S>, IpcRece
     let child = Command::new(path)
         .arg(token)
         .arg(t.to_string())
+        .arg(serialize_during_iteration.to_string())
         .spawn()
         .expect("failed to spawn ipc server process");
 
@@ -59,10 +70,11 @@ fn spawn_ipc_server_proccess<S, C>(t: SendType) -> (Child, IpcSender<S>, IpcRece
             SendType::Bytes => panic!("Bytes type not supported in this function"),
         },
     )
-}
+}//}}}
 
 // this one spawns a new process each benching process
-fn ipc_channel_process_per_iter(c: &mut Criterion) {
+fn ipc_channel_process_start_per_iter(c: &mut Criterion) {
+    // {{{
     c.bench_function(
         "client-server roundtrip of ipc-channel (process|iter)",
         |b| {
@@ -70,7 +82,7 @@ fn ipc_channel_process_per_iter(c: &mut Criterion) {
                 let (mut child, sender, receiver) = spawn_ipc_server_proccess::<
                     SimpleIpcChannelMessage,
                     SimpleIpcChannelMessage,
-                >(SendType::IpcArrow);
+                >(SendType::IpcArrow, false);
 
                 match sender.send(SimpleIpcChannelMessage::RequestTileData {}) {
                     Ok(_) => (),
@@ -87,33 +99,45 @@ fn ipc_channel_process_per_iter(c: &mut Criterion) {
             });
         },
     );
-}
+} //}}}
 
-// this one only requests / sends data
-fn ipc_channel_process(c: &mut Criterion) {
+fn bench_ipc_channel_process(c: &mut Criterion, serialize_during_iteration: bool) {
+    // {{{
     let (mut child, sender, receiver) = spawn_ipc_server_proccess::<
         SimpleIpcChannelMessage,
         SimpleIpcChannelMessage,
-    >(SendType::IpcArrow);
+    >(SendType::IpcArrow, serialize_during_iteration);
 
-    c.bench_function("client-server roundtrip of ipc-channel (process)", |b| {
-        b.iter(|| {
-            match sender.send(SimpleIpcChannelMessage::RequestTileData {}) {
-                Ok(_) => (),
-                Err(err) => {
-                    child
-                        .kill()
-                        .expect("Failed to kill child process after send error");
-                    panic!("Failed to send request to server: {}", err)
+    c.bench_function(
+        &format!(
+            "client-server roundtrip of ipc-channel (process) (serialize_during_iteration={})",
+            serialize_during_iteration
+        ),
+        |b| {
+            b.iter(|| {
+                match sender.send(SimpleIpcChannelMessage::RequestTileData {}) {
+                    Ok(_) => (),
+                    Err(err) => {
+                        child
+                            .kill()
+                            .expect("Failed to kill child process after send error");
+                        panic!("Failed to send request to server: {}", err)
+                    }
                 }
-            }
-            let resp = receiver.recv().unwrap();
-            std::hint::black_box(resp);
-        });
-    });
+                let resp = receiver.recv().unwrap();
+                std::hint::black_box(resp);
+            });
+        },
+    );
     child.kill().expect("Failed to kill child process");
+} //}}}
+
+// this one only requests / sends data
+fn ipc_channel_process(c: &mut Criterion) {
+    bench_ipc_channel_process(c, false);
 }
 
+// serde {{{
 // fn ipc_channel_serde_process(c: &mut Criterion) {
 //     let (mut child, sender, receiver) =
 //         spawn_ipc_server_proccess::<SimpleIpcChannelMessage, RasterTile2D<u8>>(SendType::Serde);
@@ -168,14 +192,16 @@ fn ipc_channel_process(c: &mut Criterion) {
 //         },
 //     );
 // }
+// }}}
 
 fn ipc_channel_bytes_process_per_iter(c: &mut Criterion) {
+    // {{{
     c.bench_function(
         "client-server roundtrip of ipc-channel (bytes|process|iter)",
         |b| {
             b.iter(|| {
                 let (mut child, sender, receiver) =
-                    spawn_ipc_server_proccess_bytes(SendType::Bytes);
+                    spawn_ipc_server_proccess_bytes(SendType::Bytes, false);
                 match sender.send(SimpleIpcChannelMessage::RequestTileData {}) {
                     Ok(_) => (),
                     Err(err) => {
@@ -191,13 +217,18 @@ fn ipc_channel_bytes_process_per_iter(c: &mut Criterion) {
             });
         },
     );
-}
+} // }}}
 
-fn ipc_channel_bytes_process(c: &mut Criterion) {
-    let (mut child, sender, receiver) = spawn_ipc_server_proccess_bytes(SendType::Bytes);
+fn bench_ipc_channel_process_bytes(c: &mut Criterion, serialize_during_iteration: bool) {
+    // {{{
+    let (mut child, sender, receiver) =
+        spawn_ipc_server_proccess_bytes(SendType::Bytes, serialize_during_iteration);
 
     c.bench_function(
-        "client-server roundtrip of ipc-channel (bytes|process)",
+        &format!(
+            "client-server roundtrip of ipc-channel (bytes|process) (serialize_during_iteration={})",
+            serialize_during_iteration
+        ),
         |b| {
             b.iter(|| {
                 match sender.send(SimpleIpcChannelMessage::RequestTileData {}) {
@@ -215,30 +246,33 @@ fn ipc_channel_bytes_process(c: &mut Criterion) {
         },
     );
     child.kill().expect("Failed to kill child process");
+} //}}}
+
+fn ipc_channel_bytes_process(c: &mut Criterion) {
+    bench_ipc_channel_process_bytes(c, false);
 }
 
-// #[test]
-// fn it_works(){
-//     assert!(false);
-// }
+fn ipc_channel_bench_process_with_serialisation(c: &mut Criterion) {
+    bench_ipc_channel_process(c, true);
+}
 
-// #[test]
-// fn serialize_test() {
-//     let d = libgdalprocess::random_data(100_000);
-//     let tile: RasterTile2D<u8> = libgdalprocess::construct_tile(d, [100, 1000].into());
-//     let (sender, receiver) = ipc::channel::<RasterTile2D<u8>>().unwrap();
-//     sender.send(tile.clone()).unwrap();
-//     let received_tile = receiver.recv().unwrap();
-//     assert_eq!(tile, received_tile);
+fn ipc_channel_bench_process_bytes_with_serialisation(c: &mut Criterion) {
+    bench_ipc_channel_process_bytes(c, true);
+}
+
+// fn ipc_channel_bench_process_bytes_serde_with_serialisation(c: &mut Criterion) {
+//     unimplemented!()
 // }
 
 criterion_group!(
     benches,
     ipc_channel_process,
-    ipc_channel_process_per_iter,
+    ipc_channel_process_start_per_iter,
     // ipc_channel_serde_process,
     // ipc_channel_serde_process_iter,
     ipc_channel_bytes_process,
-    ipc_channel_bytes_process_per_iter
+    ipc_channel_bytes_process_per_iter,
+    ipc_channel_bench_process_with_serialisation,
+    ipc_channel_bench_process_bytes_with_serialisation,
 );
 criterion_main!(benches);

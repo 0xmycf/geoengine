@@ -6,7 +6,6 @@ use tonic::{transport::Server};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // println!("Server listening on [::1]:50051");
     let addr = "[::1]:50051".parse()?;
     let tile =
         libgdalprocess::construct_tile(libgdalprocess::random_data(100_000), [100, 1000].into());
