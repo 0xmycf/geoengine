@@ -434,7 +434,7 @@ impl GdalRasterLoader {
                 let file_path = ds.file_path.clone();
 
                 async move {
-                    let load_tile_result = crate::util::spawn_blocking(move || {
+                    let load_tile_result = crate::util::spawn_blocking(move || { // here (arc? ipcreceiver has send)
                         Self::load_tile_data(&ds, tile_information, tile_time, cache_hint)
                     })
                     .await
@@ -754,7 +754,7 @@ where
 
         let source_stream = stream::iter(skipping_loading_info);
 
-        let source_stream =
+        let source_stream = // here
             GdalRasterLoader::loading_info_to_tile_stream(source_stream, &query, tiling_strategy);
 
         // use SparseTilesFillAdapter to fill all the gaps
