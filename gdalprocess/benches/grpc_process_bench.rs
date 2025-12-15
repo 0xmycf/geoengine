@@ -8,12 +8,18 @@ use std::sync::{Arc, Mutex};
 enum ServerType {
     SerializeOnStartup,
     SerializeOnEachRequest,
+    SerializeOnEachRequestWithBincode,
 }
 
 fn start_process_server(t: ServerType) -> process::Child {
     let cmd = match t {
         ServerType::SerializeOnStartup => env!("CARGO_BIN_EXE_gdalprocess-grpc-bench-server"),
-        ServerType::SerializeOnEachRequest => env!("CARGO_BIN_EXE_gdalprocess-grpc-bench-server-with-serialization")
+        ServerType::SerializeOnEachRequest => {
+            env!("CARGO_BIN_EXE_gdalprocess-grpc-bench-server-with-serialization")
+        }
+        ServerType::SerializeOnEachRequestWithBincode => {
+            env!("CARGO_BIN_EXE_gdalprocess-grpc-bench-server-with-serialization_bincode")
+        }
     };
     process::Command::new(cmd)
         .spawn()
@@ -52,7 +58,29 @@ fn grpc_bench_process_with_serialisation(c: &mut Criterion) {
     std::thread::sleep(std::time::Duration::from_secs(1));
     let client = Arc::new(Mutex::new(rt.block_on(async { setup_client().await })));
 
-    c.bench_function("client-server roundtrip of grpc (process) (serialisation_during_iteration=true)", |b| {
+    c.bench_function(
+        "client-server roundtrip of grpc (process) (serialisation_during_iteration=true)",
+        |b| {
+            let client = client.clone();
+            b.to_async(&rt).iter(|| async {
+                let client = client.clone();
+                let mut rc = client.lock().unwrap();
+                let resp = rc.load_tile_data(RequestTileData {}).await.unwrap();
+                std::hint::black_box(resp);
+            });
+        },
+    );
+
+    child.kill().expect("Failed to kill server process");
+}
+
+fn grpc_bench_process_with_serialisation_bincode(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+    let mut child = start_process_server(ServerType::SerializeOnEachRequestWithBincode);
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let client = Arc::new(Mutex::new(rt.block_on(async { setup_client().await })));
+
+    c.bench_function("grpc__serde__process__ser_per_iter=true", |b| {
         let client = client.clone();
         b.to_async(&rt).iter(|| async {
             let client = client.clone();
@@ -69,5 +97,6 @@ criterion_group!(
     benches,
     grpc_bench_process,
     grpc_bench_process_with_serialisation,
+    grpc_bench_process_with_serialisation_bincode
 );
 criterion_main!(benches);

@@ -51,6 +51,10 @@ path = "src/b_grpc_server_main.rs"
 name = "gdalprocess-grpc-bench-server-with-serialization"
 path = "src/b_grpc_server_main_with_serialization.rs"
 
+[[bin]] # Bin to run the ipc-channel server; serialises data at each request with bincode / serde
+name = "gdalprocess-grpc-bench-server-with-serialization_bincode"
+path = "src/b_grpc_server_main_with_serialization_bincode.rs"
+
 #######################################################################################
 
 [[bench]]
@@ -80,6 +84,8 @@ arrow = { workspace = true }
 arrow-flight = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
+
+bincode = { version = "2.0.1", features = ["derive", "serde"] }
 
 prost = { version = "0.14" }
 prost-types = { version = "0.14" }

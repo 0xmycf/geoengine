@@ -12,7 +12,7 @@ fn ensure_params(matches: bool, msg: &str) {
 
 fn spawn_ipc_server_proccess_bytes<S>(
     t: SendType,
-    serialize_during_iteration: bool,
+    ser_per_iter: bool,
 ) -> (Child, IpcSender<S>, IpcBytesReceiver) {
     // {{{
     ensure_params(
@@ -25,7 +25,7 @@ fn spawn_ipc_server_proccess_bytes<S>(
     let child = Command::new(path)
         .arg(token)
         .arg(t.to_string())
-        .arg(serialize_during_iteration.to_string())
+        .arg(ser_per_iter.to_string())
         .spawn()
         .expect("failed to spawn ipc server process");
 
@@ -44,7 +44,7 @@ fn spawn_ipc_server_proccess_bytes<S>(
 
 fn spawn_ipc_server_proccess<S, C>(
     t: SendType,
-    serialize_during_iteration: bool,
+    ser_per_iter: bool,
 ) -> (Child, IpcSender<S>, IpcReceiver<C>) {
     //{{{
     ensure_params(
@@ -58,7 +58,7 @@ fn spawn_ipc_server_proccess<S, C>(
     let child = Command::new(path)
         .arg(token)
         .arg(t.to_string())
-        .arg(serialize_during_iteration.to_string())
+        .arg(ser_per_iter.to_string())
         .spawn()
         .expect("failed to spawn ipc server process");
 
@@ -77,7 +77,7 @@ fn spawn_ipc_server_proccess<S, C>(
 fn ipc_channel_process_start_per_iter(c: &mut Criterion) {
     // {{{
     c.bench_function(
-        "client-server roundtrip of ipc-channel (process|iter)",
+        "ipc-channel_process_iter",
         |b| {
             b.iter(|| {
                 let (mut child, sender, receiver) = spawn_ipc_server_proccess::<
@@ -102,17 +102,17 @@ fn ipc_channel_process_start_per_iter(c: &mut Criterion) {
     );
 } //}}}
 
-fn bench_ipc_channel_process(c: &mut Criterion, serialize_during_iteration: bool, t: SendType) {
+fn bench_ipc_channel_process(c: &mut Criterion, ser_per_iter: bool, t: SendType) {
     // {{{
     let (mut child, sender, receiver) = spawn_ipc_server_proccess::<
         SimpleIpcChannelMessage,
         SimpleIpcChannelMessage,
-    >(t, serialize_during_iteration);
+    >(t, ser_per_iter);
 
     c.bench_function(
         &format!(
-            "client-server roundtrip of ipc-channel (process) (serialize_during_iteration={})",
-            serialize_during_iteration
+            "ipc-channel_process__ser_per_iter={}",
+            ser_per_iter
         ),
         |b| {
             b.iter(|| {
@@ -146,7 +146,7 @@ fn ipc_channel_serde_process(c: &mut Criterion) {
     >(SendType::Serde, false);
 
     c.bench_function(
-        "client-server roundtrip of ipc-channel (serde|process) (serialize_during_iteration=false)",
+        "ipc-channel_serde_process__ser_per_iter=false",
         |b| {
             b.iter(|| {
                 match sender.send(SimpleIpcChannelMessage::RequestTileData {}) {
@@ -171,7 +171,7 @@ fn ipc_channel_serde_process(c: &mut Criterion) {
 fn ipc_channel_serde_process_iter(c: &mut Criterion) {
     // {{{{
     c.bench_function(
-        "client-server roundtrip of ipc-channel (serde|process|iter)",
+        "ipc-channel_serde_process_iter",
         |b| {
             b.iter(|| {
                 let (mut child, sender, receiver) = spawn_ipc_server_proccess::<
@@ -200,7 +200,7 @@ fn ipc_channel_serde_process_iter(c: &mut Criterion) {
 fn ipc_channel_bytes_process_per_iter(c: &mut Criterion) {
     // {{{
     c.bench_function(
-        "client-server roundtrip of ipc-channel (bytes|process|iter)",
+        "ipc-channel_bytes_process_iter",
         |b| {
             b.iter(|| {
                 let (mut child, sender, receiver) =
@@ -222,15 +222,15 @@ fn ipc_channel_bytes_process_per_iter(c: &mut Criterion) {
     );
 } // }}}
 
-fn bench_ipc_channel_process_bytes(c: &mut Criterion, serialize_during_iteration: bool) {
+fn bench_ipc_channel_process_bytes(c: &mut Criterion, ser_per_iter: bool) {
     // {{{
     let (mut child, sender, receiver) =
-        spawn_ipc_server_proccess_bytes(SendType::Bytes, serialize_during_iteration);
+        spawn_ipc_server_proccess_bytes(SendType::Bytes, ser_per_iter);
 
     c.bench_function(
         &format!(
-            "client-server roundtrip of ipc-channel (bytes|process) (serialize_during_iteration={})",
-            serialize_during_iteration
+            "ipc-channel_bytes_process__ser_per_iter={}",
+            ser_per_iter
         ),
         |b| {
             b.iter(|| {

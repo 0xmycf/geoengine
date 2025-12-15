@@ -135,6 +135,7 @@ pub mod grpc_service {
 
     use geoengine_datatypes::raster::{RasterTile2D, raster_tile_2d_to_arrow_ipc_file};
     use geoengine_datatypes::spatial_reference::SpatialReferenceOption;
+    use serde::Serialize;
     use tonic::{Request, Response, Status};
 
     use crate::grpc_service::proto_service::gdal_dataset_service_server::GdalDatasetService;
@@ -145,8 +146,15 @@ pub mod grpc_service {
     }
 
     #[derive(Debug)]
+    pub enum SerilizationType {
+        IpcArrow,
+        Bincode,
+    }
+
+    #[derive(Debug)]
     pub struct TileServiceImplWithSerialization {
         pub grid: RasterTile2D<u8>,
+        pub t: SerilizationType,
     }
 
     #[tonic::async_trait]
@@ -155,17 +163,30 @@ pub mod grpc_service {
             &self,
             _request: Request<RequestTileData>,
         ) -> Result<Response<proto_service::TileDataReply>, Status> {
-            let data = std::hint::black_box(raster_tile_2d_to_arrow_ipc_file(
-                std::hint::black_box(self.grid.clone()),
-                SpatialReferenceOption::Unreferenced,
-            ));
-            match data {
-                Ok(v) => Ok(Response::new(TileDataReply { data: v })),
-                Err(err) => Err(Status::internal(format!(
-                    "Failed to convert tile to arrow ipc: {}",
-                    err
-                ))),
-            }
+            let data: Vec<u8> = if matches!(self.t, SerilizationType::Bincode) {
+                std::hint::black_box(
+                    bincode::serde::encode_to_vec(
+                        std::hint::black_box(&self.grid),
+                        bincode::config::standard(),
+                    )
+                    .map_err(|err| {
+                        Status::internal(format!(
+                            "Failed to convert tile to bincode serialized data: {}",
+                            err
+                        ))
+                    }),
+                )?
+                // bincode::serde::serialize(&self.grid)
+            } else {
+                std::hint::black_box(raster_tile_2d_to_arrow_ipc_file(
+                    std::hint::black_box(self.grid.clone()),
+                    SpatialReferenceOption::Unreferenced,
+                ))
+                .map_err(|err| {
+                    Status::internal(format!("Failed to convert tile to arrow ipc: {}", err))
+                })?
+            };
+            Ok(Response::new(TileDataReply { data }))
         }
     }
 
