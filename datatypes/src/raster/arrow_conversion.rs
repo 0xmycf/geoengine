@@ -35,7 +35,7 @@ pub fn arrow_ipc_file_to_raster_tile_2d<P>(
     tile: Vec<u8>,
     // passed to the FileReader
     projection: Option<Vec<usize>>,
-    // spatial_ref: SpatialReferenceOption,
+    // spatial_ref: SpatialReferenceOption, // TODO (high): how to convert between the two formats?
 ) -> Result<RasterTile2D<P>>
 where
     // TODO (high): tests for this

@@ -4,6 +4,8 @@ use crate::adapters::{
 use crate::engine::{
     CanonicOperatorName, MetaData, OperatorData, OperatorName, QueryProcessor, WorkflowOperatorPath,
 };
+use crate::error::{InvalidUTCTimestamp, Io};
+use crate::source::gdal_source::process::{IpcChannelMessage, spawn_ipc_server_process_bytes};
 use crate::util::TemporaryGdalThreadLocalConfigOptions;
 use crate::util::gdal::gdal_open_dataset_ex;
 use crate::util::input::float_option_with_nan;
@@ -34,18 +36,19 @@ use geoengine_datatypes::primitives::{
     SpatialPartition2D, SpatialPartitioned, TimeInstance,
 };
 use geoengine_datatypes::primitives::{BandSelection, CacheHint};
-use geoengine_datatypes::raster::TileInformation;
 use geoengine_datatypes::raster::{
     EmptyGrid, GeoTransform, GridIdx2D, GridOrEmpty, GridOrEmpty2D, GridShape2D, GridShapeAccess,
     MapElements, MaskedGrid, NoDataValueGrid, Pixel, RasterDataType, RasterProperties,
     RasterPropertiesEntry, RasterPropertiesEntryType, RasterPropertiesKey, RasterTile2D,
     TilingStrategy,
 };
+use geoengine_datatypes::raster::{TileInformation, arrow_ipc_file_to_raster_tile_2d};
 use geoengine_datatypes::util::test::TestDefault;
 use geoengine_datatypes::{
     primitives::TimeInterval,
     raster::{Grid, GridBlit, GridBoundingBox2D, GridIdx, GridSize, TilingSpecification},
 };
+use ipc_channel::ipc::{self, IpcBytesReceiver, IpcSender};
 use itertools::Itertools;
 pub use loading_info::{
     GdalLoadingInfo, GdalLoadingInfoTemporalSlice, GdalLoadingInfoTemporalSliceIterator,
@@ -60,12 +63,15 @@ use std::convert::TryFrom;
 use std::ffi::CString;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
+use std::thread;
 use std::time::Instant;
 use tracing::debug;
 
 mod db_types;
 mod error;
 mod loading_info;
+pub mod process;
 
 static GDAL_RETRY_INITIAL_BACKOFF_MS: u64 = 1000;
 static GDAL_RETRY_MAX_BACKOFF_MS: u64 = 60 * 60 * 1000;
@@ -396,19 +402,119 @@ where
     pub _phantom_data: PhantomData<T>,
 }
 
-// TODO (high): remove this again 
+// TODO (high): remove this again
 pub fn load_tile<T: Pixel + GdalType + FromPrimitive>(
-        dataset_params: &GdalDatasetParameters,
-        tile_information: TileInformation,
-        tile_time: TimeInterval,
-        cache_hint: CacheHint,
+    dataset_params: &GdalDatasetParameters,
+    tile_information: TileInformation,
+    tile_time: TimeInterval,
+    cache_hint: CacheHint,
 ) -> Result<RasterTile2D<T>> {
     GdalRasterLoader::load_tile_data(dataset_params, tile_information, tile_time, cache_hint)
 }
 
+// // TODO (high): remove this again ???? (How to read tile from new executable?)
+// pub fn load_tile_process<T: Pixel + GdalType + FromPrimitive>(
+//     dataset_params: GdalDatasetParameters,
+//     tile_information: TileInformation,
+//     tile_time: TimeInterval,
+//     cache_hint: CacheHint,
+// ) -> Result<RasterTile2D<T>> {
+//     GdalRasterLoader::load_tile_data_process(
+//         dataset_params,
+//         tile_information,
+//         tile_time,
+//         cache_hint,
+//     )
+// }
+
 struct GdalRasterLoader {}
 
 impl GdalRasterLoader {
+    pub fn load_tile_data_process<T: Pixel + GdalType + FromPrimitive>(
+        dataset_params: GdalDatasetParameters,
+        tile_information: TileInformation,
+        tile_time: TimeInterval,
+        cache_hint: CacheHint,
+    ) -> Result<RasterTile2D<T>> {
+        /*
+        1. Validate as in the load tile data thing
+        2. Spawn process
+        3. In the process, call load_tile_data
+        4. Return result via IPC-channel
+        5. In the main process, receive result and return it
+        6. Handle errors properly
+        [6.1 Consider timeouts and retries]
+        [6.2 Consider caching of results in the main process]
+        7. Clean up resources / kill the child
+        [8. Consider using a process pool instead of spawning a new process each time <- does that make sense?]
+        */
+
+        // TODO: detect usage of vsi curl properly, e.g. also check for `/vsicurl_streaming` and combinations with `/vsizip`
+        let is_vsi_curl = dataset_params.file_path.starts_with("/vsicurl/");
+
+        let ds = dataset_params.clone();
+        let file_path = ds.file_path.clone();
+
+        let (mut child, sender, receiver) = spawn_ipc_server_process_bytes::<IpcChannelMessage>();
+
+        // TODO is this really necessary?
+        thread::sleep(std::time::Duration::from_millis(500)); // give the process some time to start up properly
+
+        let projection = None; // TODO (high): figure out where to get this from
+
+        let () = sender
+            .send(IpcChannelMessage::RequestTileData {
+                cache_hint,
+                dataset_params,
+                tile_information,
+                tile_time,
+                spatial_ref: projection,
+            })
+            .map_err(|e| Error::Io {
+                source: std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to send request to gdal source process: {}", e),
+                ),
+            })?;
+
+        let load_tile_result = receiver
+            .recv()
+            .map(|msg| {
+                arrow_ipc_file_to_raster_tile_2d::<T>(
+                    msg,
+                    None, /* TODO figure out what goes in there / where&how I get this data */
+                )
+                .map_err(|e| Error::Io {
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to convert arrow ipc data to raster tile: {}", e),
+                    ),
+                })
+            })
+            .map_err(|e| Error::Io {
+                source: std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to receive response from gdal source process: {}", e),
+                ),
+            });
+
+        // kill the child
+        let _ = sender.send(IpcChannelMessage::EndConnection).ok();
+        child.kill().ok();
+        match load_tile_result {
+            Ok(Ok(r)) => Ok(r),
+            Ok(Err(e)) | Err(e) => {
+                if is_vsi_curl {
+                    // clear the VSICurl cache, to force GDAL to try to re-download the file
+                    // otherwise it will assume any observed error will happen again
+                    clear_gdal_vsi_cache_for_path(file_path.as_path());
+                }
+
+                Err(e)
+            }
+        }
+    }
+
     ///
     /// A method to async load single tiles from a GDAL dataset.
     ///
@@ -434,7 +540,8 @@ impl GdalRasterLoader {
                 let file_path = ds.file_path.clone();
 
                 async move {
-                    let load_tile_result = crate::util::spawn_blocking(move || { // here (arc? ipcreceiver has send)
+                    let load_tile_result = crate::util::spawn_blocking(move || {
+                        // here (arc? ipcreceiver has send)
                         Self::load_tile_data(&ds, tile_information, tile_time, cache_hint)
                     })
                     .await
@@ -1289,6 +1396,213 @@ mod tests {
             .await
     }
 
+    #[test]
+    fn test_sending_gdal_dataset_parameters() {
+        let msg = GdalDatasetParameters {
+            file_path: test_data!("raster/modis_ndvi/MOD13A2_M_NDVI_2014-01-01.TIFF").into(),
+            rasterband_channel: 1,
+            geo_transform: GdalDatasetGeoTransform {
+                origin_coordinate: (-180., 90.).into(),
+                x_pixel_size: 0.1,
+                y_pixel_size: -0.1,
+            },
+            width: 3600,
+            height: 1800,
+            file_not_found_handling: FileNotFoundHandling::NoData,
+            no_data_value: Some(0.),
+            properties_mapping: Some(vec![
+                GdalMetadataMapping {
+                    source_key: RasterPropertiesKey {
+                        domain: None,
+                        key: "AREA_OR_POINT".to_string(),
+                    },
+                    target_type: RasterPropertiesEntryType::String,
+                    target_key: RasterPropertiesKey {
+                        domain: None,
+                        key: "AREA_OR_POINT".to_string(),
+                    },
+                },
+                GdalMetadataMapping {
+                    source_key: RasterPropertiesKey {
+                        domain: Some("IMAGE_STRUCTURE".to_string()),
+                        key: "COMPRESSION".to_string(),
+                    },
+                    target_type: RasterPropertiesEntryType::String,
+                    target_key: RasterPropertiesKey {
+                        domain: Some("IMAGE_STRUCTURE_INFO".to_string()),
+                        key: "COMPRESSION".to_string(),
+                    },
+                },
+            ]),
+            gdal_open_options: None,
+            gdal_config_options: None,
+            allow_alphaband_as_mask: true,
+            retry: None,
+        };
+
+        let (sender, receiver) = ipc_channel::ipc::channel().unwrap();
+
+        sender.send(msg.clone()).unwrap();
+        let recv = receiver.recv().unwrap();
+        assert_eq!(msg, recv);
+    }
+
+    #[test]
+    fn test_sending_tile_information() {
+        let output_shape: GridShape2D = [8, 8].into();
+        let output_bounds =
+            SpatialPartition2D::new_unchecked((-180., 90.).into(), (180., -90.).into());
+
+        let msg = TileInformation::with_partition_and_shape(output_bounds, output_shape);
+
+        let (sender, receiver) = ipc_channel::ipc::channel().unwrap();
+
+        sender.send(msg.clone()).unwrap();
+        let recv = receiver.recv().unwrap();
+        assert_eq!(msg, recv);
+    }
+
+    #[test] // works
+    fn test_sending_time() {
+        let msg = TimeInstance::from_millis(10).unwrap();
+
+
+        let (sender, receiver) = ipc_channel::ipc::channel().unwrap();
+
+        sender.send(msg.clone()).unwrap();
+        let recv = receiver.recv().unwrap();
+        assert_eq!(msg, recv);
+    }
+
+    #[test] // works
+    fn test_sending_time_interval() {
+        let msg = TimeInterval::default();
+
+        let (sender, receiver) = ipc_channel::ipc::channel().unwrap();
+
+        sender.send(msg.clone()).unwrap();
+        let recv = receiver.recv().unwrap();
+        assert_eq!(msg, recv);
+    }
+
+    #[test] // does not work (the de-serialization of the nested time interval fails )
+    fn test_sending_request_tile_data() {
+        let output_shape: GridShape2D = [8, 8].into();
+        let output_bounds =
+            SpatialPartition2D::new_unchecked((-180., 90.).into(), (180., -90.).into());
+
+        let msg = IpcChannelMessage::RequestTileData {
+            dataset_params: GdalDatasetParameters {
+                file_path: test_data!("raster/modis_ndvi/MOD13A2_M_NDVI_2014-01-01.TIFF").into(),
+                rasterband_channel: 1,
+                geo_transform: GdalDatasetGeoTransform {
+                    origin_coordinate: (-180., 90.).into(),
+                    x_pixel_size: 0.1,
+                    y_pixel_size: -0.1,
+                },
+                width: 3600,
+                height: 1800,
+                file_not_found_handling: FileNotFoundHandling::NoData,
+                no_data_value: Some(0.),
+                properties_mapping: Some(vec![
+                    GdalMetadataMapping {
+                        source_key: RasterPropertiesKey {
+                            domain: None,
+                            key: "AREA_OR_POINT".to_string(),
+                        },
+                        target_type: RasterPropertiesEntryType::String,
+                        target_key: RasterPropertiesKey {
+                            domain: None,
+                            key: "AREA_OR_POINT".to_string(),
+                        },
+                    },
+                    GdalMetadataMapping {
+                        source_key: RasterPropertiesKey {
+                            domain: Some("IMAGE_STRUCTURE".to_string()),
+                            key: "COMPRESSION".to_string(),
+                        },
+                        target_type: RasterPropertiesEntryType::String,
+                        target_key: RasterPropertiesKey {
+                            domain: Some("IMAGE_STRUCTURE_INFO".to_string()),
+                            key: "COMPRESSION".to_string(),
+                        },
+                    },
+                ]),
+                gdal_open_options: None,
+                gdal_config_options: None,
+                allow_alphaband_as_mask: true,
+                retry: None,
+            },
+            tile_information: TileInformation::with_partition_and_shape(
+                output_bounds,
+                output_shape,
+            ),
+            tile_time: TimeInterval::default(),
+            cache_hint: CacheHint::default(),
+            spatial_ref: None,
+        };
+
+        let (sender, receiver) = ipc_channel::ipc::channel().unwrap();
+
+        sender.send(msg.clone()).unwrap();
+        let recv = receiver.recv().unwrap();
+
+        assert_eq!(msg, recv);
+    }
+
+    // TODO name / test
+    fn load_ndvi_jan_2014_by_process(
+        output_shape: GridShape2D,
+        output_bounds: SpatialPartition2D,
+    ) -> Result<RasterTile2D<u8>> {
+        GdalRasterLoader::load_tile_data_process::<u8>(
+            GdalDatasetParameters {
+                file_path: test_data!("raster/modis_ndvi/MOD13A2_M_NDVI_2014-01-01.TIFF").into(),
+                rasterband_channel: 1,
+                geo_transform: GdalDatasetGeoTransform {
+                    origin_coordinate: (-180., 90.).into(),
+                    x_pixel_size: 0.1,
+                    y_pixel_size: -0.1,
+                },
+                width: 3600,
+                height: 1800,
+                file_not_found_handling: FileNotFoundHandling::NoData,
+                no_data_value: Some(0.),
+                properties_mapping: Some(vec![
+                    GdalMetadataMapping {
+                        source_key: RasterPropertiesKey {
+                            domain: None,
+                            key: "AREA_OR_POINT".to_string(),
+                        },
+                        target_type: RasterPropertiesEntryType::String,
+                        target_key: RasterPropertiesKey {
+                            domain: None,
+                            key: "AREA_OR_POINT".to_string(),
+                        },
+                    },
+                    GdalMetadataMapping {
+                        source_key: RasterPropertiesKey {
+                            domain: Some("IMAGE_STRUCTURE".to_string()),
+                            key: "COMPRESSION".to_string(),
+                        },
+                        target_type: RasterPropertiesEntryType::String,
+                        target_key: RasterPropertiesKey {
+                            domain: Some("IMAGE_STRUCTURE_INFO".to_string()),
+                            key: "COMPRESSION".to_string(),
+                        },
+                    },
+                ]),
+                gdal_open_options: None,
+                gdal_config_options: None,
+                allow_alphaband_as_mask: true,
+                retry: None,
+            },
+            TileInformation::with_partition_and_shape(output_bounds, output_shape),
+            TimeInterval::default(),
+            CacheHint::default(),
+        )
+    }
+
     fn load_ndvi_jan_2014(
         output_shape: GridShape2D,
         output_bounds: SpatialPartition2D,
@@ -1568,7 +1882,17 @@ mod tests {
     }
 
     #[test]
-    fn test_load_tile_data() {
+    fn test_bincode() {
+        let time = TimeInterval::default();
+        let (sender, receiver) = ipc_channel::ipc::channel().unwrap();
+
+        sender.send(time).unwrap();
+        let msg = receiver.recv().unwrap();
+        assert_eq!(time, msg);
+    }
+
+    #[test]
+    fn test_load_tile_data_process() {
         let output_shape: GridShape2D = [8, 8].into();
         let output_bounds =
             SpatialPartition2D::new_unchecked((-180., 90.).into(), (180., -90.).into());
@@ -1579,6 +1903,58 @@ mod tests {
             tile_position: _,
             band: _,
             time: _,
+            properties,
+            cache_hint: _,
+        } = load_ndvi_jan_2014_by_process(output_shape, output_bounds).unwrap();
+
+        assert!(!grid.is_empty());
+
+        let grid = grid.into_materialized_masked_grid();
+
+        assert_eq!(grid.inner_grid.data.len(), 64);
+        assert_eq!(
+            grid.inner_grid.data,
+            &[
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 75, 37, 255, 44, 34, 39, 32, 255, 86,
+                255, 255, 255, 30, 96, 255, 255, 255, 255, 255, 90, 255, 255, 255, 255, 255, 202,
+                255, 193, 255, 255, 255, 255, 255, 89, 255, 111, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255
+            ]
+        );
+
+        assert_eq!(grid.validity_mask.data.len(), 64);
+        assert_eq!(grid.validity_mask.data, &[true; 64]);
+
+        assert!((properties.scale_option()).is_none());
+        assert!(properties.offset_option().is_none());
+        assert_eq!(
+            properties.get_property(&RasterPropertiesKey {
+                key: "AREA_OR_POINT".to_string(),
+                domain: None,
+            }),
+            Some(&RasterPropertiesEntry::String("Area".to_string()))
+        );
+        assert_eq!(
+            properties.get_property(&RasterPropertiesKey {
+                domain: Some("IMAGE_STRUCTURE_INFO".to_string()),
+                key: "COMPRESSION".to_string(),
+            }),
+            Some(&RasterPropertiesEntry::String("LZW".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_load_tile_data() {
+        let output_shape: GridShape2D = [8, 8].into();
+        let output_bounds =
+            SpatialPartition2D::new_unchecked((-180., 90.).into(), (180., -90.).into());
+
+        let RasterTile2D {
+            global_geo_transform: _,
+            grid_array: grid,
+            tile_position: _,
+            band: _,
+            time,
             properties,
             cache_hint: _,
         } = load_ndvi_jan_2014(output_shape, output_bounds).unwrap();

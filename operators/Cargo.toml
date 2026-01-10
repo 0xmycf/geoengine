@@ -25,6 +25,7 @@ geo = { workspace = true }
 geoengine-datatypes = { path = "../datatypes" }
 geoengine-expression = { path = "../expression" }
 itertools = { workspace = true }
+ipc-channel = { workspace = true }
 libloading = { workspace = true }
 tracing = { workspace = true }
 lru = { workspace = true }
