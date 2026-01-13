@@ -250,6 +250,10 @@ fn arrow_array_ref_to_values_and_validity<P: Pixel>(arr: &ArrayRef) -> (Vec<P>, 
     }
 }
 
+/*
+TODO (high): properties are missing! ?
+*/
+
 pub fn raster_tile_2d_to_arrow_ipc_file<P: Pixel>(
     tile: RasterTile2D<P>,
     spatial_ref: SpatialReferenceOption,

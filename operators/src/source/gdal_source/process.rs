@@ -1,9 +1,29 @@
 use std::process::{Child, Command};
 
-use geoengine_datatypes::{primitives::{CacheHint, TimeInterval}, raster::TileInformation, spatial_reference::SpatialReferenceOption};
+use geoengine_datatypes::{
+    primitives::{CacheHint, TimeInterval},
+    raster::TileInformation,
+    spatial_reference::SpatialReferenceOption,
+};
 use ipc_channel::ipc::{self, IpcBytesReceiver, IpcBytesSender, IpcReceiver, IpcSender};
 
 use crate::source::GdalDatasetParameters;
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct JsonPayload(String);
+
+impl JsonPayload {
+    pub fn new(message: &IpcChannelMessage) -> Self {
+        Self(serde_json::to_string(message).expect("Failed to serialize IpcChannelMessage to JSON"))
+    }
+
+    pub fn get(self) -> IpcChannelMessage {
+        let message: IpcChannelMessage = serde_json::from_str(&self.0)
+            .expect("Failed to deserialize IpcChannelMessage from JSON");
+        message
+    }
+
+}
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq)]
 pub enum IpcChannelMessage {
@@ -33,7 +53,7 @@ pub fn spawn_ipc_server_process_bytes<S>() -> (Child, IpcSender<S>, IpcBytesRece
     //     .join("gdalsource-process");
 
     let path = "/Users/mycf/Documents/work/arbeit-geoengine/geoengine-workflow-backend/target/debug/gdalsource-process";
-    
+
     dbg!(path);
 
     let child = Command::new(path)

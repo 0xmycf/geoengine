@@ -5,7 +5,7 @@ use crate::engine::{
     CanonicOperatorName, MetaData, OperatorData, OperatorName, QueryProcessor, WorkflowOperatorPath,
 };
 use crate::error::{InvalidUTCTimestamp, Io};
-use crate::source::gdal_source::process::{IpcChannelMessage, spawn_ipc_server_process_bytes};
+use crate::source::gdal_source::process::{IpcChannelMessage, JsonPayload, spawn_ipc_server_process_bytes};
 use crate::util::TemporaryGdalThreadLocalConfigOptions;
 use crate::util::gdal::gdal_open_dataset_ex;
 use crate::util::input::float_option_with_nan;
@@ -462,14 +462,17 @@ impl GdalRasterLoader {
 
         let projection = None; // TODO (high): figure out where to get this from
 
-        let () = sender
-            .send(IpcChannelMessage::RequestTileData {
+        let data = IpcChannelMessage::RequestTileData {
                 cache_hint,
                 dataset_params,
                 tile_information,
                 tile_time,
                 spatial_ref: projection,
-            })
+            };
+        let json_payload = JsonPayload::new(&data);
+
+        let () = sender
+            .send(json_payload)
             .map_err(|e| Error::Io {
                 source: std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -499,7 +502,7 @@ impl GdalRasterLoader {
             });
 
         // kill the child
-        let _ = sender.send(IpcChannelMessage::EndConnection).ok();
+        let _ = sender.send(JsonPayload::new(&IpcChannelMessage::EndConnection)).ok();
         child.kill().ok();
         match load_tile_result {
             Ok(Ok(r)) => Ok(r),
@@ -1929,8 +1932,8 @@ mod tests {
         assert!(properties.offset_option().is_none());
         assert_eq!(
             properties.get_property(&RasterPropertiesKey {
-                key: "AREA_OR_POINT".to_string(),
                 domain: None,
+                key: "AREA_OR_POINT".to_string(),
             }),
             Some(&RasterPropertiesEntry::String("Area".to_string()))
         );
