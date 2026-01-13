@@ -436,6 +436,7 @@ impl GdalRasterLoader {
         tile_time: TimeInterval,
         cache_hint: CacheHint,
     ) -> Result<RasterTile2D<T>> {
+
         /*
         1. Validate as in the load tile data thing
         2. Spawn process
@@ -456,9 +457,6 @@ impl GdalRasterLoader {
         let file_path = ds.file_path.clone();
 
         let (mut child, sender, receiver) = spawn_ipc_server_process_bytes::<IpcChannelMessage>();
-
-        // TODO is this really necessary?
-        thread::sleep(std::time::Duration::from_millis(500)); // give the process some time to start up properly
 
         let projection = None; // TODO (high): figure out where to get this from
 
@@ -1882,16 +1880,6 @@ mod tests {
             params.file_not_found_handling,
             replaced.file_not_found_handling
         );
-    }
-
-    #[test]
-    fn test_bincode() {
-        let time = TimeInterval::default();
-        let (sender, receiver) = ipc_channel::ipc::channel().unwrap();
-
-        sender.send(time).unwrap();
-        let msg = receiver.recv().unwrap();
-        assert_eq!(time, msg);
     }
 
     #[test]

@@ -3,7 +3,7 @@ use crate::{
     error,
     primitives::{CacheHint, TimeInterval},
     raster::{
-        FromPrimitive, GeoTransform, Grid, GridOrEmpty, GridShape, MaskedGrid, RasterDataType,
+        FromPrimitive, GeoTransform, Grid, GridOrEmpty, GridShape, MaskedGrid, RasterDataType, RasterProperties, RasterPropertiesKey,
     },
     spatial_reference::SpatialReferenceOption,
     util::Result,
@@ -42,7 +42,7 @@ where
     P: Pixel,
 {
     let cursor = Cursor::new(tile);
-    let reader = FileReader::try_new(cursor, projection)?;
+    let reader = FileReader::try_new(cursor, pojection)?;
 
     // the writer only writes one batch
     // => I could change this to be more clear on the intent here
@@ -297,6 +297,12 @@ fn raster_tile_2d_to_arrow_record_batch<P: Pixel>(
     ]
     .into();
 
+    // something like `.iter()` does not exist, the RasterProperites struct
+    // does not expose a way of iterating over all of the properties, unless you know their names
+    // for x in tile.properties.iter() {
+    //     dbg!(x);
+    // }
+
     let array = grid_2d_to_arrow_array(tile.grid_array);
 
     let schema = Arc::new(Schema::new_with_metadata(
@@ -311,6 +317,16 @@ fn raster_tile_2d_to_arrow_record_batch<P: Pixel>(
     let record_batch = RecordBatch::try_new(schema, vec![array])?;
 
     Ok(record_batch)
+}
+
+// TODO (mid): we need something like this.
+fn properties_to_metadata(mut metadata: HashMap<String, String>, props: RasterProperties, keys: &[RasterPropertiesKey]) -> HashMap<String, String> {
+    for key in keys {
+        if let Some(value) = props.get_property(&key) {
+            metadata.insert(key.to_string(), value.to_string()); // this is not correct
+        } 
+    }
+    metadata
 }
 
 fn grid_2d_to_arrow_array<P: Pixel>(grid: GridOrEmpty2D<P>) -> ArrayRef {
