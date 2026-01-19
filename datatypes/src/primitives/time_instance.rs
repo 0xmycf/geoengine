@@ -3,7 +3,6 @@ use super::{DateTime, Duration};
 use crate::primitives::error;
 use crate::util::Result;
 use bincode;
-use chrono::naive::serde::ts_microseconds_option::deserialize;
 use postgres_types::{FromSql, ToSql};
 use serde::{Deserialize, Serialize};
 use snafu::ensure;
