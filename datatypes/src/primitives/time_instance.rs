@@ -2,6 +2,7 @@ use super::datetime::DateTimeError;
 use super::{DateTime, Duration};
 use crate::primitives::error;
 use crate::util::Result;
+use bincode;
 use chrono::naive::serde::ts_microseconds_option::deserialize;
 use postgres_types::{FromSql, ToSql};
 use serde::{Deserialize, Serialize};
@@ -14,7 +15,19 @@ use std::{
     str::FromStr,
 };
 
-#[derive(Clone, Copy, /*  Serialize, */ PartialEq, Eq, PartialOrd, Ord, Debug, FromSql, ToSql)]
+#[derive(
+    Clone,
+    Copy,
+    /*  Serialize, */ PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Debug,
+    FromSql,
+    ToSql,
+    bincode::Encode,
+    bincode::Decode,
+)]
 #[repr(C)]
 #[postgres(transparent)]
 pub struct TimeInstance(i64);

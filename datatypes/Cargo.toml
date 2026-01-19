@@ -15,6 +15,7 @@ arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-ord = { workspace = true }
 arrow-schema = { workspace = true }
+bincode = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 fallible-iterator = { workspace = true }

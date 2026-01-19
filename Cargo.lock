@@ -2573,6 +2573,7 @@ dependencies = [
  "arrow-array",
  "arrow-ord",
  "arrow-schema",
+ "bincode 2.0.1",
  "bytes",
  "chrono",
  "criterion",

@@ -3,7 +3,6 @@ use std::process::{Child, Command};
 use geoengine_datatypes::{
     primitives::{CacheHint, TimeInterval},
     raster::TileInformation,
-    spatial_reference::SpatialReferenceOption,
 };
 use ipc_channel::ipc::{self, IpcBytesReceiver, IpcBytesSender, IpcReceiver, IpcSender};
 
@@ -22,7 +21,6 @@ impl JsonPayload {
             .expect("Failed to deserialize IpcChannelMessage from JSON");
         message
     }
-
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq)]
@@ -49,9 +47,14 @@ pub fn spawn_ipc_server_process_bytes<S>() -> (Child, IpcSender<S>, IpcBytesRece
     //     .expect("failed to get exe parent dir")
     //     .join("gdalsource-process");
 
-    let path = "/Users/mycf/Documents/work/arbeit-geoengine/geoengine-workflow-backend/target/debug/gdalsource-process";
+    // get the users home
+    let home = std::env::var("HOME").expect("failed to get HOME env var");
+    let path = format!(
+        "{}/Documents/work/arbeit-geoengine/geoengine-workflow-backend/target/debug/gdalsource-process",
+        home
+    );
 
-    dbg!(path);
+    // dbg!(path);
 
     let child = Command::new(path)
         .arg(token)
