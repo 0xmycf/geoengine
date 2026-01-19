@@ -4,8 +4,9 @@ use crate::adapters::{
 use crate::engine::{
     CanonicOperatorName, MetaData, OperatorData, OperatorName, QueryProcessor, WorkflowOperatorPath,
 };
-use crate::error::{InvalidUTCTimestamp, Io};
-use crate::source::gdal_source::process::{IpcChannelMessage, JsonPayload, spawn_ipc_server_process_bytes};
+use crate::source::gdal_source::process::{
+    IpcChannelMessage, JsonPayload, spawn_ipc_server_process_bytes,
+};
 use crate::util::TemporaryGdalThreadLocalConfigOptions;
 use crate::util::gdal::gdal_open_dataset_ex;
 use crate::util::input::float_option_with_nan;
@@ -436,7 +437,6 @@ impl GdalRasterLoader {
         tile_time: TimeInterval,
         cache_hint: CacheHint,
     ) -> Result<RasterTile2D<T>> {
-
         /*
         1. Validate as in the load tile data thing
         2. Spawn process
@@ -459,27 +459,24 @@ impl GdalRasterLoader {
         let (mut child, sender, receiver) = spawn_ipc_server_process_bytes::<IpcChannelMessage>();
 
         let data = IpcChannelMessage::RequestTileData {
-                cache_hint,
-                dataset_params,
-                tile_information,
-                tile_time,
-            };
+            cache_hint,
+            dataset_params,
+            tile_information,
+            tile_time,
+        };
         let json_payload = JsonPayload::new(&data);
 
-        let () = sender
-            .send(json_payload)
-            .map_err(|e| Error::Io {
-                source: std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to send request to gdal source process: {}", e),
-                ),
-            })?;
+        let () = sender.send(json_payload).map_err(|e| Error::Io {
+            source: std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to send request to gdal source process: {}", e),
+            ),
+        })?;
 
         let load_tile_result = receiver
             .recv()
             .map(|msg| {
-                arrow_ipc_file_to_raster_tile_2d::<T>(msg)
-                .map_err(|e| Error::Io {
+                arrow_ipc_file_to_raster_tile_2d::<T>(msg).map_err(|e| Error::Io {
                     source: std::io::Error::new(
                         std::io::ErrorKind::Other,
                         format!("Failed to convert arrow ipc data to raster tile: {}", e),
@@ -494,7 +491,9 @@ impl GdalRasterLoader {
             });
 
         // kill the child
-        let _ = sender.send(JsonPayload::new(&IpcChannelMessage::EndConnection)).ok();
+        let _ = sender
+            .send(JsonPayload::new(&IpcChannelMessage::EndConnection))
+            .ok();
         child.kill().ok();
         match load_tile_result {
             Ok(Ok(r)) => Ok(r),
@@ -508,6 +507,30 @@ impl GdalRasterLoader {
                 Err(e)
             }
         }
+    }
+
+    pub async fn load_tile_data_process_async<T: Pixel + GdalType + FromPrimitive>(
+        dataset_params: GdalDatasetParameters,
+        tile_information: TileInformation,
+        tile_time: TimeInterval,
+        cache_hint: CacheHint,
+    ) -> Result<RasterTile2D<T>> {
+        retry(
+            dataset_params
+                .retry
+                .map(|r| r.max_retries)
+                .unwrap_or_default(),
+            GDAL_RETRY_INITIAL_BACKOFF_MS,
+            GDAL_RETRY_EXPONENTIAL_BACKOFF_FACTOR,
+            Some(GDAL_RETRY_MAX_BACKOFF_MS),
+            move || {
+                let ds = dataset_params.clone();
+                async move {
+                Self::load_tile_data_process(ds, tile_information, tile_time, cache_hint)
+                }
+            },
+        )
+        .await
     }
 
     ///
@@ -558,6 +581,45 @@ impl GdalRasterLoader {
             },
         )
         .await
+    }
+
+    /// Copy "load_tile_async" but utilizing multiple processes
+    async fn load_tile_process_async<T: Pixel + GdalType + FromPrimitive>(
+        dataset_params: Option<GdalDatasetParameters>,
+        tile_information: TileInformation,
+        tile_time: TimeInterval,
+        cache_hint: CacheHint,
+    ) -> Result<RasterTile2D<T>> {
+        match dataset_params {
+            Some(ds)
+                if tile_information
+                    .spatial_partition()
+                    .intersects(&ds.spatial_partition()) =>
+            {
+                debug!(
+                    "Loading tile {:?}, from {}, band: {}",
+                    &tile_information,
+                    ds.file_path.display(),
+                    ds.rasterband_channel
+                );
+                Self::load_tile_data_process_async(ds, tile_information, tile_time, cache_hint)
+                    .await
+            }
+            Some(_) => {
+                debug!("Skipping tile not in query rect {:?}", &tile_information);
+
+                Ok(create_no_data_tile(tile_information, tile_time, cache_hint))
+            }
+
+            _ => {
+                debug!(
+                    "Skipping tile without GdalDatasetParameters {:?}",
+                    &tile_information
+                );
+
+                Ok(create_no_data_tile(tile_information, tile_time, cache_hint))
+            }
+        }
     }
 
     async fn load_tile_async<T: Pixel + GdalType + FromPrimitive>(
@@ -691,6 +753,25 @@ impl GdalRasterLoader {
         })
     }
 
+    ///
+    /// A stream of futures producing `RasterTile2D` for a single slice in time
+    /// Utilizing the mutliple processes
+    ///
+    fn temporal_slice_tile_future_stream_process<T: Pixel + GdalType + FromPrimitive>(
+        spatial_bounds: SpatialPartition2D,
+        info: GdalLoadingInfoTemporalSlice,
+        tiling_strategy: TilingStrategy,
+    ) -> impl Stream<Item = impl Future<Output = Result<RasterTile2D<T>>>> + use<T> {
+        stream::iter(tiling_strategy.tile_information_iterator(spatial_bounds)).map(move |tile| {
+            GdalRasterLoader::load_tile_process_async(
+                info.params.clone(),
+                tile,
+                info.time,
+                info.cache_ttl.into(),
+            )
+        })
+    }
+
     fn loading_info_to_tile_stream<
         T: Pixel + GdalType + FromPrimitive,
         S: Stream<Item = Result<GdalLoadingInfoTemporalSlice>>,
@@ -703,6 +784,29 @@ impl GdalRasterLoader {
         loading_info_stream
             .map_ok(move |info| {
                 GdalRasterLoader::temporal_slice_tile_future_stream(
+                    spatial_bounds,
+                    info,
+                    tiling_strategy,
+                )
+                .map(Result::Ok)
+            })
+            .try_flatten()
+            .try_buffered(16) // TODO: make this configurable
+    }
+
+    /// like "loading_info_to_tile_stream" but utilizing multiple processes
+    fn loading_info_to_tile_stream_process<
+        T: Pixel + GdalType + FromPrimitive,
+        S: Stream<Item = Result<GdalLoadingInfoTemporalSlice>>,
+    >(
+        loading_info_stream: S,
+        query: &RasterQueryRectangle,
+        tiling_strategy: TilingStrategy,
+    ) -> impl Stream<Item = Result<RasterTile2D<T>>> + use<S, T> {
+        let spatial_bounds = query.spatial_bounds;
+        loading_info_stream
+            .map_ok(move |info| {
+                GdalRasterLoader::temporal_slice_tile_future_stream_process(
                     spatial_bounds,
                     info,
                     tiling_strategy,
@@ -1460,7 +1564,6 @@ mod tests {
     #[test] // works
     fn test_sending_time() {
         let msg = TimeInstance::from_millis(10).unwrap();
-
 
         let (sender, receiver) = ipc_channel::ipc::channel().unwrap();
 
