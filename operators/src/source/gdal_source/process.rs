@@ -32,9 +32,6 @@ pub enum IpcChannelMessage {
         dataset_params: GdalDatasetParameters,
         tile_information: TileInformation,
         tile_time: TimeInterval,
-        ///  Used for the ipc_arrow serialization
-        /// if None, then Unreferenced is assumed
-        spatial_ref: Option<SpatialReferenceOption>,
     },
     EndConnection, // Till death does them part
                    // Data(Vec<u8>), // this can go, as the answer is send via byteschannel

@@ -458,14 +458,11 @@ impl GdalRasterLoader {
 
         let (mut child, sender, receiver) = spawn_ipc_server_process_bytes::<IpcChannelMessage>();
 
-        let projection = None; // TODO (high): figure out where to get this from
-
         let data = IpcChannelMessage::RequestTileData {
                 cache_hint,
                 dataset_params,
                 tile_information,
                 tile_time,
-                spatial_ref: projection,
             };
         let json_payload = JsonPayload::new(&data);
 
@@ -481,10 +478,7 @@ impl GdalRasterLoader {
         let load_tile_result = receiver
             .recv()
             .map(|msg| {
-                arrow_ipc_file_to_raster_tile_2d::<T>(
-                    msg,
-                    None, /* TODO figure out what goes in there / where&how I get this data */
-                )
+                arrow_ipc_file_to_raster_tile_2d::<T>(msg)
                 .map_err(|e| Error::Io {
                     source: std::io::Error::new(
                         std::io::ErrorKind::Other,
@@ -1540,7 +1534,6 @@ mod tests {
             ),
             tile_time: TimeInterval::default(),
             cache_hint: CacheHint::default(),
-            spatial_ref: None,
         };
 
         let (sender, receiver) = ipc_channel::ipc::channel().unwrap();

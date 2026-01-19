@@ -3,7 +3,8 @@ use crate::{
     error,
     primitives::{CacheHint, TimeInterval},
     raster::{
-        FromPrimitive, GeoTransform, Grid, GridOrEmpty, GridShape, MaskedGrid, RasterDataType, RasterProperties, RasterPropertiesKey,
+        FromPrimitive, GeoTransform, Grid, GridIdx2D, GridOrEmpty, GridShape, MaskedGrid,
+        RasterDataType, raster_properties,
     },
     spatial_reference::SpatialReferenceOption,
     util::Result,
@@ -30,19 +31,16 @@ pub const Y_SIZE_KEY: &str = "ySize";
 pub const TIME_KEY: &str = "time";
 pub const SPATIAL_REF_KEY: &str = "spatialReference";
 pub const BAND_KEY: &str = "band";
+pub const RASTER_PROPERTIES: &str = "rasterProperties";
+pub const TILE_POSITION: &str = "tilePosition";
 
-pub fn arrow_ipc_file_to_raster_tile_2d<P>(
-    tile: Vec<u8>,
-    // passed to the FileReader
-    projection: Option<Vec<usize>>,
-    // spatial_ref: SpatialReferenceOption, // TODO (high): how to convert between the two formats?
-) -> Result<RasterTile2D<P>>
+pub fn arrow_ipc_file_to_raster_tile_2d<P>(tile: Vec<u8>) -> Result<RasterTile2D<P>>
 where
     // TODO (high): tests for this
     P: Pixel,
 {
     let cursor = Cursor::new(tile);
-    let reader = FileReader::try_new(cursor, pojection)?;
+    let reader = FileReader::try_new(cursor, None)?;
 
     // the writer only writes one batch
     // => I could change this to be more clear on the intent here
@@ -60,10 +58,18 @@ where
             let y_size: usize =
                 serde_json::from_str(metadata[Y_SIZE_KEY].as_str()).expect("invalid y size");
 
-            // TODO (high): investigate this error / necessity
+            // // TODO (high): investigate this error / necessity
             // let spatial_ref: SpatialReferenceOption =
-            //     serde_json::from_str(metadata[SPATIAL_REF_KEY].as_str()).expect("invalid spatial ref");
-            // println!("spatial_ref {}:", spatial_ref);
+            //     serde_json::from_str(metadata[SPATIAL_REF_KEY].as_str())
+            //         .expect("invalid spatial ref");
+
+            // TODO (high): investigate this error / necessity
+            let tile_position: GridIdx2D = serde_json::from_str(metadata[TILE_POSITION].as_str())
+                .expect("invalid tile position");
+
+            let raster_properties: raster_properties::RasterProperties =
+                serde_json::from_str(metadata[RASTER_PROPERTIES].as_str())
+                    .expect("invalid raster properties");
 
             let band: usize =
                 serde_json::from_str(metadata[BAND_KEY].as_str()).expect("invalid band");
@@ -94,18 +100,15 @@ where
                         panic!("error converting arrow array to grid: {}", e)
                     }
                 };
-            // return Ok(BaseTile::new(time, todo!(), band as u32, geo_transform, grid, CacheHint::default()));
-            let raster_tile_2d = RasterTile2D::new_with_tile_info(
+            let raster_tile_2d = crate::raster::BaseTile {
                 time,
-                crate::raster::TileInformation {
-                    global_geo_transform: geo_transform,
-                    global_tile_position: [0, 0].into(), // TODO: get from metadata?
-                    tile_size_in_pixels: [y_size, x_size].into(),
-                },
-                band as u32,
-                grid,
-                CacheHint::default(), // TODO: get from metadata?
-            );
+                tile_position, // [0, 0].into(), // TODO: get from metadata?
+                band: band as u32,
+                global_geo_transform: geo_transform,
+                grid_array: grid,
+                properties: raster_properties,
+                cache_hint: CacheHint::default(), // TODO: get from metadata?
+            };
             return Ok(raster_tile_2d);
         }
     }
@@ -294,14 +297,17 @@ fn raster_tile_2d_to_arrow_record_batch<P: Pixel>(
         ),
         (SPATIAL_REF_KEY.to_string(), spatial_ref.to_string()),
         (BAND_KEY.to_string(), tile.band.to_string()),
+        (
+            RASTER_PROPERTIES.to_string(),
+            serde_json::to_string(&tile.properties).unwrap_or_default(),
+        ),
+        // TODO cache hint
+        (
+            TILE_POSITION.to_string(),
+            serde_json::to_string(&tile.tile_position).unwrap_or_default(),
+        ),
     ]
     .into();
-
-    // something like `.iter()` does not exist, the RasterProperites struct
-    // does not expose a way of iterating over all of the properties, unless you know their names
-    // for x in tile.properties.iter() {
-    //     dbg!(x);
-    // }
 
     let array = grid_2d_to_arrow_array(tile.grid_array);
 
@@ -317,16 +323,6 @@ fn raster_tile_2d_to_arrow_record_batch<P: Pixel>(
     let record_batch = RecordBatch::try_new(schema, vec![array])?;
 
     Ok(record_batch)
-}
-
-// TODO (mid): we need something like this.
-fn properties_to_metadata(mut metadata: HashMap<String, String>, props: RasterProperties, keys: &[RasterPropertiesKey]) -> HashMap<String, String> {
-    for key in keys {
-        if let Some(value) = props.get_property(&key) {
-            metadata.insert(key.to_string(), value.to_string()); // this is not correct
-        } 
-    }
-    metadata
 }
 
 fn grid_2d_to_arrow_array<P: Pixel>(grid: GridOrEmpty2D<P>) -> ArrayRef {
@@ -419,7 +415,9 @@ mod tests {
     use super::*;
     use crate::{
         primitives::{CacheHint, TimeInterval},
-        raster::{EmptyGrid2D, GridIndexAccessMut, MaskedGrid2D, TileInformation},
+        raster::{
+            EmptyGrid2D, GridIndexAccessMut, MaskedGrid2D, RasterProperties, TileInformation,
+        },
         spatial_reference::SpatialReference,
         util::test::TestDefault,
     };
@@ -512,11 +510,18 @@ mod tests {
         );
         assert_eq!(schema.metadata()[X_SIZE_KEY], "2");
         assert_eq!(schema.metadata()[Y_SIZE_KEY], "3");
+        // TODO (high): this fails now!?
         assert_eq!(
             schema.metadata()[TIME_KEY],
             "{\"start\":-8334601228800000,\"end\":8210266876799999}"
         );
         assert_eq!(schema.metadata()[SPATIAL_REF_KEY], "EPSG:4326");
+        assert_eq!(
+            serde_json::from_str::<RasterProperties>(&schema.metadata()[RASTER_PROPERTIES])
+                .unwrap(),
+            RasterProperties::default()
+        ); // new_with_tile_info  uses  RasterProperties.default()
+        assert_eq!(schema.metadata()[TILE_POSITION], "[0,0]");
 
         let data = reader.next().unwrap().unwrap();
 
@@ -561,11 +566,18 @@ mod tests {
         );
         assert_eq!(schema.metadata()[X_SIZE_KEY], "2");
         assert_eq!(schema.metadata()[Y_SIZE_KEY], "3");
+        // TODO (high): this fails now!?
         assert_eq!(
             schema.metadata()[TIME_KEY],
             "{\"start\":-8334601228800000,\"end\":8210266876799999}"
         );
         assert_eq!(schema.metadata()[SPATIAL_REF_KEY], "EPSG:4326"); // TODO (low): Does this also crash?
+        assert_eq!(
+            serde_json::from_str::<RasterProperties>(&schema.metadata()[RASTER_PROPERTIES])
+                .unwrap(),
+            RasterProperties::default()
+        ); // new_with_tile_info  uses  RasterProperties.default()
+        assert_eq!(schema.metadata()[TILE_POSITION], "[0,0]");
 
         let data = reader.next().unwrap().unwrap();
 
