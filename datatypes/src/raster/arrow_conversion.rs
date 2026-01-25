@@ -1,10 +1,10 @@
 use super::{Grid2D, GridOrEmpty2D, GridSize, Pixel, RasterTile2D, TypedGrid2D};
 use crate::{
-    error,
+    error::{self},
     primitives::{CacheHint, TimeInterval},
     raster::{
-        FromPrimitive, GeoTransform, Grid, GridIdx2D, GridOrEmpty, GridShape, MaskedGrid,
-        RasterDataType, raster_properties,
+        FromPrimitive, GeoTransform, Grid, GridOrEmpty, GridShape, MaskedGrid, RasterDataType,
+        raster_properties,
     },
     spatial_reference::SpatialReferenceOption,
     util::Result,
@@ -22,6 +22,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use arrow_array::PrimitiveArray;
+use arrow_schema::ArrowError;
 use std::{collections::HashMap, io::Cursor, sync::Arc};
 
 pub const RASTER_DATA_FIELD_NAME: &str = "data";
@@ -34,9 +35,40 @@ pub const BAND_KEY: &str = "band";
 pub const RASTER_PROPERTIES: &str = "rasterProperties";
 pub const TILE_POSITION: &str = "tilePosition";
 
+pub fn raster_tile_2d_to_arrow_ipc_file_for_ipc_channel<P: Pixel>(
+    tile: RasterTile2D<P>,
+) -> Result<Vec<u8>> {
+    let record_batch = raster_tile_2d_to_arrow_record_batch_for_ipc_channel(tile)?;
+
+    let mut file_writer = FileWriter::try_new_with_options(
+        Vec::new(),
+        &record_batch.schema(),
+        IpcWriteOptions::default(),
+    )?;
+    file_writer.write(&record_batch)?;
+    file_writer.finish()?;
+
+    Ok(file_writer.into_inner()?)
+}
+
 pub fn arrow_ipc_file_to_raster_tile_2d<P>(tile: Vec<u8>) -> Result<RasterTile2D<P>>
+// {{{
 where
     // TODO (high): tests for this
+    P: Pixel,
+{
+    arrow_ipc_file_to_raster_tile_2d_impl(tile)
+}
+
+pub fn arrow_ipc_file_to_raster_tile_2d_for_ipc_channel<P>(tile: Vec<u8>) -> Result<RasterTile2D<P>>
+where
+    P: Pixel,
+{
+    arrow_ipc_file_to_raster_tile_2d_impl(tile)
+}
+
+fn arrow_ipc_file_to_raster_tile_2d_impl<P>(tile: Vec<u8>) -> Result<RasterTile2D<P>>
+where
     P: Pixel,
 {
     let cursor = Cursor::new(tile);
@@ -44,81 +76,68 @@ where
 
     // the writer only writes one batch
     // => I could change this to be more clear on the intent here
-    for opt_batch in reader {
-        if let Ok(batch) = opt_batch {
-            let schema = batch.schema();
-            let metadata = schema.metadata();
-            let geo_transform: GeoTransform =
-                serde_json::from_str(metadata[GEO_TRANSFORM_KEY].as_str())
-                    .expect("invalid geo transform");
-            let time: TimeInterval =
-                serde_json::from_str(metadata[TIME_KEY].as_str()).expect("invalid time");
-            let x_size: usize =
-                serde_json::from_str(metadata[X_SIZE_KEY].as_str()).expect("invalid x size");
-            let y_size: usize =
-                serde_json::from_str(metadata[Y_SIZE_KEY].as_str()).expect("invalid y size");
+    if let Some(batch) = reader.flatten().next() {
+        let schema = batch.schema();
+        let metadata = schema.metadata();
+        let geo_transform: GeoTransform =
+            serde_json::from_str(metadata[GEO_TRANSFORM_KEY].as_str())
+                .expect("invalid geo transform");
+        let time: TimeInterval =
+            serde_json::from_str(metadata[TIME_KEY].as_str()).expect("invalid time");
+        let x_size: usize =
+            serde_json::from_str(metadata[X_SIZE_KEY].as_str()).expect("invalid x size");
+        let y_size: usize =
+            serde_json::from_str(metadata[Y_SIZE_KEY].as_str()).expect("invalid y size");
 
-            // // TODO (high): investigate this error / necessity
-            // let spatial_ref: SpatialReferenceOption =
-            //     serde_json::from_str(metadata[SPATIAL_REF_KEY].as_str())
-            //         .expect("invalid spatial ref");
+        // TODO (high): investigate this error / necessity
+        // let spatial_ref: SpatialReferenceOption =
+        //     serde_json::from_str(metadata[SPATIAL_REF_KEY].as_str()).expect("invalid spatial ref");
+        // println!("spatial_ref {}:", spatial_ref);
 
-            // TODO (high): investigate this error / necessity
-            let tile_position: GridIdx2D = serde_json::from_str(metadata[TILE_POSITION].as_str())
-                .expect("invalid tile position");
+        let band: usize = serde_json::from_str(metadata[BAND_KEY].as_str()).expect("invalid band");
 
-            let raster_properties: raster_properties::RasterProperties =
-                serde_json::from_str(metadata[RASTER_PROPERTIES].as_str())
-                    .expect("invalid raster properties");
+        // dbg!( band, geo_transform, time, x_size, y_size);
 
-            let band: usize =
-                serde_json::from_str(metadata[BAND_KEY].as_str()).expect("invalid band");
-            println!("band {}:", band);
+        let field_idx = schema
+            .fields()
+            .iter()
+            .position(|f| f.name() == RASTER_DATA_FIELD_NAME)
+            .expect("raster data field not found");
+        let arr = batch.column(field_idx);
+        let grid: GridOrEmpty2D<P> =
+            arrow_array_to_grid_2d::<P>(arr, [y_size, x_size].into())?;
 
-            println!(
-                // "geo_transform: {:?}, time: {:?}, x_size: {}, y_size: {}, spatial_ref: {:?}, band: {}",
-                "geo_transform: {:?}, time: {:?}, x_size: {}, y_size: {}",
-                // geo_transform, time, x_size, y_size, spatial_ref, band
-                geo_transform,
-                time,
-                x_size,
-                y_size
-            );
+        let tile_position = metadata
+            .get(TILE_POSITION)
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| [0, 0].into());
 
-            let field_idx = schema
-                .fields()
-                .iter()
-                .position(|f| f.name() == RASTER_DATA_FIELD_NAME)
-                .expect("raster data field not found");
-            let arr = batch.column(field_idx);
-            let grid: GridOrEmpty2D<P> =
-                match arrow_array_to_grid_2d::<P>(arr.clone(), [y_size, x_size].into()) {
-                    Ok(grid) => grid,
-                    Err(e) =>
-                    /* TODO fixme */
-                    {
-                        panic!("error converting arrow array to grid: {}", e)
-                    }
-                };
-            let raster_tile_2d = crate::raster::BaseTile {
-                time,
-                tile_position, // [0, 0].into(), // TODO: get from metadata?
-                band: band as u32,
-                global_geo_transform: geo_transform,
-                grid_array: grid,
-                properties: raster_properties,
-                cache_hint: CacheHint::default(), // TODO: get from metadata?
-            };
-            return Ok(raster_tile_2d);
-        }
+        let properties = metadata
+            .get(RASTER_PROPERTIES)
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(raster_properties::RasterProperties::default);
+
+        let cache_hint = CacheHint::default();
+
+        let raster_tile_2d = RasterTile2D::new_with_properties(
+            time,
+            tile_position,
+            band as u32,
+            geo_transform,
+            grid,
+            properties,
+            cache_hint,
+        );
+        return Ok(raster_tile_2d);
     }
-    // TODO proper error here
-    Err(error::Error::Plot {
-        details: "not implemented yet".to_string(),
-    })
-}
 
-fn arrow_array_to_grid_2d<P>(arr: ArrayRef, size: GridShape<[usize; 2]>) -> Result<GridOrEmpty2D<P>>
+    Err(error::Error::ArrowInternal {
+        source: ArrowError::IpcError("no record batch found in arrow ipc file".to_string()),
+    })
+} // }}}
+
+fn arrow_array_to_grid_2d<P>(arr: &ArrayRef, size: GridShape<[usize; 2]>) -> Result<GridOrEmpty2D<P>>
+// {{{
 where
     P: Pixel,
 {
@@ -127,14 +146,15 @@ where
         return Ok(GridOrEmpty::new_empty_shape(size));
     }
 
-    let (values, validity_mask) = arrow_array_ref_to_values_and_validity::<P>(&arr);
+    let (values, validity_mask) = arrow_array_ref_to_values_and_validity::<P>(arr);
 
     let data = Grid::new(size, values)?;
     let validity = Grid::new(size, validity_mask)?;
 
-    return Ok(GridOrEmpty::new_grid(MaskedGrid::new(data, validity)?));
+    Ok(GridOrEmpty::new_grid(MaskedGrid::new(data, validity)?))
 }
 
+#[allow(clippy::too_many_lines)]
 fn arrow_array_ref_to_values_and_validity<P: Pixel>(arr: &ArrayRef) -> (Vec<P>, Vec<bool>) {
     let validity = (0..arr.len()).map(|i| arr.is_valid(i)).collect();
     match arr.data_type() {
@@ -251,11 +271,7 @@ fn arrow_array_ref_to_values_and_validity<P: Pixel>(arr: &ArrayRef) -> (Vec<P>, 
         }
         _ => panic!("unsupported data type"), // remove panic and return some other type
     }
-}
-
-/*
-TODO (high): properties are missing! ?
-*/
+} // }}}
 
 pub fn raster_tile_2d_to_arrow_ipc_file<P: Pixel>(
     tile: RasterTile2D<P>,
@@ -278,7 +294,21 @@ fn raster_tile_2d_to_arrow_record_batch<P: Pixel>(
     tile: RasterTile2D<P>,
     spatial_ref: SpatialReferenceOption,
 ) -> Result<RecordBatch> {
-    let metadata: HashMap<String, String> = [
+    raster_tile_2d_to_arrow_record_batch_impl(tile, Some(spatial_ref), false)
+}
+
+fn raster_tile_2d_to_arrow_record_batch_for_ipc_channel<P: Pixel>(
+    tile: RasterTile2D<P>,
+) -> Result<RecordBatch> {
+    raster_tile_2d_to_arrow_record_batch_impl(tile, None, true)
+}
+
+fn raster_tile_2d_to_arrow_record_batch_impl<P: Pixel>(
+    tile: RasterTile2D<P>,
+    spatial_ref: Option<SpatialReferenceOption>,
+    include_ipc_metadata: bool,
+) -> Result<RecordBatch> {
+    let mut metadata: HashMap<String, String> = [
         (
             GEO_TRANSFORM_KEY.to_string(),
             serde_json::to_string(&tile.tile_geo_transform()).unwrap_or_default(),
@@ -295,19 +325,27 @@ fn raster_tile_2d_to_arrow_record_batch<P: Pixel>(
             TIME_KEY.to_string(),
             serde_json::to_string(&tile.time).unwrap_or_default(),
         ),
-        (SPATIAL_REF_KEY.to_string(), spatial_ref.to_string()),
         (BAND_KEY.to_string(), tile.band.to_string()),
-        (
-            RASTER_PROPERTIES.to_string(),
-            serde_json::to_string(&tile.properties).unwrap_or_default(),
-        ),
-        // TODO cache hint
-        (
-            TILE_POSITION.to_string(),
-            serde_json::to_string(&tile.tile_position).unwrap_or_default(),
-        ),
     ]
     .into();
+
+    if let Some(spatial_ref) = spatial_ref {
+        metadata.insert(
+            SPATIAL_REF_KEY.to_string(),
+            serde_json::to_string(&spatial_ref).unwrap_or_default(),
+        );
+    }
+
+    if include_ipc_metadata {
+        metadata.insert(
+            RASTER_PROPERTIES.to_string(),
+            serde_json::to_string(&tile.properties).unwrap_or_default(),
+        );
+        metadata.insert(
+            TILE_POSITION.to_string(),
+            serde_json::to_string(&tile.tile_position).unwrap_or_default(),
+        );
+    }
 
     let array = grid_2d_to_arrow_array(tile.grid_array);
 
@@ -415,9 +453,7 @@ mod tests {
     use super::*;
     use crate::{
         primitives::{CacheHint, TimeInterval},
-        raster::{
-            EmptyGrid2D, GridIndexAccessMut, MaskedGrid2D, RasterProperties, TileInformation,
-        },
+        raster::{EmptyGrid2D, GridIndexAccessMut, MaskedGrid2D, TileInformation},
         spatial_reference::SpatialReference,
         util::test::TestDefault,
     };
@@ -516,12 +552,6 @@ mod tests {
             "{\"start\":-8334601228800000,\"end\":8210266876799999}"
         );
         assert_eq!(schema.metadata()[SPATIAL_REF_KEY], "EPSG:4326");
-        assert_eq!(
-            serde_json::from_str::<RasterProperties>(&schema.metadata()[RASTER_PROPERTIES])
-                .unwrap(),
-            RasterProperties::default()
-        ); // new_with_tile_info  uses  RasterProperties.default()
-        assert_eq!(schema.metadata()[TILE_POSITION], "[0,0]");
 
         let data = reader.next().unwrap().unwrap();
 
@@ -572,12 +602,6 @@ mod tests {
             "{\"start\":-8334601228800000,\"end\":8210266876799999}"
         );
         assert_eq!(schema.metadata()[SPATIAL_REF_KEY], "EPSG:4326"); // TODO (low): Does this also crash?
-        assert_eq!(
-            serde_json::from_str::<RasterProperties>(&schema.metadata()[RASTER_PROPERTIES])
-                .unwrap(),
-            RasterProperties::default()
-        ); // new_with_tile_info  uses  RasterProperties.default()
-        assert_eq!(schema.metadata()[TILE_POSITION], "[0,0]");
 
         let data = reader.next().unwrap().unwrap();
 
