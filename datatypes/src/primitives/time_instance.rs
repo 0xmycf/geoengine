@@ -1,10 +1,14 @@
 use super::datetime::DateTimeError;
 use super::{DateTime, Duration};
-use crate::primitives::error;
-use crate::util::Result;
+use crate::error::Error;
+use crate::primitives::PrimitivesError;
+use crate::{
+    primitives::error::{self},
+    util::Result,
+};
 use bincode;
 use postgres_types::{FromSql, ToSql};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use snafu::ensure;
 use std::ops::AddAssign;
 use std::{
@@ -17,7 +21,9 @@ use std::{
 #[derive(
     Clone,
     Copy,
-    /*  Serialize, */ PartialEq,
+    Serialize,
+    Deserialize,
+    PartialEq,
     Eq,
     PartialOrd,
     Ord,
@@ -95,10 +101,37 @@ impl TimeInstance {
         self == Self::MAX
     }
 
+    /// Deserializes a `TimeInstance` from either RFC 3339 timestamp string or Unix timestamp integer.
+    pub fn deserialize(input: &str) -> Result<Self> {
+        if let Ok(millis) = input.parse::<i64>() {
+            Self::from_millis(millis)
+        } else if let Ok(dt) = input.parse::<u64>() {
+            Self::from_millis(dt as i64)
+        } else {
+            Self::from_str(input).map_err(|e| {
+                let err = PrimitivesError::NoDateTimeParse {
+                    datetime: input.to_string(),
+                    source: e,
+                };
+                Error::Primitives { source: err }
+            })
+        }
+    }
+
     pub const MIN: Self = TimeInstance::from_millis_unchecked(-8_334_601_228_800_000);
     pub const MAX: Self = TimeInstance::from_millis_unchecked(8_210_266_876_799_999);
 
     pub const EPOCH_START: Self = TimeInstance::from_millis_unchecked(0);
+}
+
+pub fn deserialize_time_interval<'de, D>(
+    deserializer: D,
+) -> Result<TimeInstance, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: &str = Deserialize::deserialize(deserializer).map_err(serde::de::Error::custom)?;
+    TimeInstance::deserialize(s).map_err(serde::de::Error::custom)
 }
 
 impl std::fmt::Display for TimeInstance {
@@ -193,73 +226,6 @@ impl FromStr for TimeInstance {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let date_time = DateTime::from_str(s)?;
         Ok(date_time.into())
-    }
-}
-
-impl Serialize for TimeInstance {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        if serializer.is_human_readable() {
-            let s = self
-                .as_date_time()
-                .map(|dt| dt.to_datetime_string_with_millis())
-                .unwrap_or_else(|| format!("Invalid TimeInstance({})", self.0));
-            serializer.serialize_str(&s)
-        } else {
-            dbg!(self.0);
-            serializer.serialize_i64(self.0)
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for TimeInstance {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct IsoStringOrUnixTimestamp;
-
-        impl serde::de::Visitor<'_> for IsoStringOrUnixTimestamp {
-            type Value = TimeInstance;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("RFC 3339 timestamp string or Unix timestamp integer")
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                TimeInstance::from_str(value).map_err(E::custom)
-            }
-
-            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                TimeInstance::from_millis(v).map_err(E::custom)
-            }
-
-            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Self::visit_i64(self, v as i64)
-            }
-        }
-
-        if deserializer.is_human_readable() {
-            deserializer.deserialize_any(IsoStringOrUnixTimestamp)
-            // Err(serde::de::Error::custom(
-            //     "Deserializing TimeInstance from human readable format is not supported",
-            // ))
-        } else {
-            let millis = i64::deserialize(deserializer)?;
-            dbg!(millis);
-            TimeInstance::from_millis(millis).map_err(serde::de::Error::custom)
-        }
     }
 }
 
