@@ -453,7 +453,7 @@ mod tests {
     use super::*;
     use crate::{
         primitives::{CacheHint, TimeInterval},
-        raster::{EmptyGrid2D, GridIndexAccessMut, MaskedGrid2D, TileInformation},
+        raster::{EmptyGrid2D, GridIndexAccessMut, GridShapeAccess, MaskedGrid2D, TileInformation},
         spatial_reference::SpatialReference,
         util::test::TestDefault,
     };
@@ -616,4 +616,53 @@ mod tests {
 
         assert!(reader.next().is_none()); // only one batch
     }
+
+    #[test]
+    fn test_arrow_ipc_file_to_raster_tile_2d_empty() {
+        let original = RasterTile2D::new_with_tile_info(
+            TimeInterval::default(),
+            TileInformation {
+                global_geo_transform: TestDefault::test_default(),
+                global_tile_position: [0, 0].into(),
+                tile_size_in_pixels: [3, 2].into(),
+            },
+            0,
+            EmptyGrid2D::<f32>::new([3, 2].into()).into(),
+            CacheHint::default(),
+        );
+
+        let bytes = raster_tile_2d_to_arrow_ipc_file(original.clone(), SpatialReference::epsg_4326().into()).unwrap();
+        let restored: RasterTile2D<f32> = arrow_ipc_file_to_raster_tile_2d(bytes).unwrap();
+
+        assert!(restored.grid_array.is_empty());
+        assert_eq!(original.grid_array, restored.grid_array);
+        assert_eq!(original.properties, restored.properties);
+        assert_eq!(original.tile_position, restored.tile_position);
+    }
+
+    #[test]
+    fn test_arrow_ipc_file_to_raster_tile_2d_for_ipc_channel() {
+        let original = RasterTile2D::new_with_tile_info(
+            TimeInterval::default(),
+            TileInformation {
+                global_geo_transform: TestDefault::test_default(),
+                global_tile_position: [1, 2].into(),
+                tile_size_in_pixels: [3, 2].into(),
+            },
+            5,
+            Grid2D::new([3, 2].into(), vec![10_u8, 20, 30, 40, 50, 60]).unwrap().into(),
+            CacheHint::default(),
+        );
+
+        let bytes = raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(original.clone()).unwrap();
+        let restored: RasterTile2D<u8> = arrow_ipc_file_to_raster_tile_2d_for_ipc_channel(bytes).unwrap();
+
+        assert_eq!(original.time, restored.time);
+        assert_eq!(original.band, restored.band);
+        assert_eq!(original.grid_array, restored.grid_array);
+
+        assert_eq!(original.properties, restored.properties);
+        assert_eq!(original.tile_position, restored.tile_position);
+    }
+
 }
