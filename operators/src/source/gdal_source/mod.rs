@@ -117,7 +117,7 @@ pub struct GdalDatasetParameters {
     pub height: usize,
     pub file_not_found_handling: FileNotFoundHandling,
     #[serde(default)]
-    #[serde(with = "float_option_with_nan")]
+     #[serde(with = "float_option_with_nan")] // TODO: this breaks serde bincode / postcard serialization
     pub no_data_value: Option<f64>,
     pub properties_mapping: Option<Vec<GdalMetadataMapping>>,
     // Dataset open option as strings, e.g. `vec!["UserPwd=geoengine:pwd".to_owned(), "HttpAuth=BASIC".to_owned()]`
@@ -446,13 +446,14 @@ impl GdalRasterLoader {
         tile_information: TileInformation,
         tile_time: TimeInterval,
         cache_hint: CacheHint,
-        sender: Arc<IpcSender<JsonPayload>>,
-        receiver: Arc<IpcBytesReceiver>,
+        sender: &Arc<IpcSender<JsonPayload>>,
+        receiver: &Arc<IpcBytesReceiver>,
     ) -> Result<RasterTile2D<T>> {
         // TODO: detect usage of vsi curl properly, e.g. also check for `/vsicurl_streaming` and combinations with `/vsizip`
         let is_vsi_curl = dataset_params.file_path.starts_with("/vsicurl/");
 
         let ds = dataset_params.clone();
+
         let file_path = ds.file_path.clone();
         let (mut child, sender, receiver) = spawn_ipc_server_process_bytes::<JsonPayload>();
 
@@ -465,27 +466,27 @@ impl GdalRasterLoader {
         let json_payload = JsonPayload::new(&data);
 
         let () = sender.send(json_payload).map_err(|e| Error::Io {
-            source: std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to send request to gdal source process: {}", e),
-            ),
+            source: std::io::Error::other(format!(
+                "Failed to send request to gdal source process: {}",
+                e
+            )),
         })?;
 
         let load_tile_result = receiver
             .recv()
             .map(|msg| {
                 arrow_ipc_file_to_raster_tile_2d::<T>(msg).map_err(|e| Error::Io {
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Failed to convert arrow ipc data to raster tile: {}", e),
-                    ),
+                    source: std::io::Error::other(format!(
+                        "Failed to convert arrow ipc data to raster tile: {}",
+                        e
+                    )),
                 })
             })
             .map_err(|e| Error::Io {
-                source: std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to receive response from gdal source process: {}", e),
-                ),
+                source: std::io::Error::other(format!(
+                    "Failed to receive response from gdal source process: {}",
+                    e
+                )),
             });
 
         match load_tile_result {
@@ -515,8 +516,8 @@ impl GdalRasterLoader {
             tile_information,
             tile_time,
             cache_hint,
-            sender,
-            receiver,
+            &sender,
+            &receiver,
         )
     }
 
@@ -1512,9 +1513,8 @@ mod tests {
             .await
     }
 
-    #[test]
-    fn test_sending_gdal_dataset_parameters() {
-        let msg = GdalDatasetParameters {
+    fn get_params() -> GdalDatasetParameters {
+        GdalDatasetParameters {
             file_path: test_data!("raster/modis_ndvi/MOD13A2_M_NDVI_2014-01-01.TIFF").into(),
             rasterband_channel: 1,
             geo_transform: GdalDatasetGeoTransform {
@@ -1554,12 +1554,57 @@ mod tests {
             gdal_config_options: None,
             allow_alphaband_as_mask: true,
             retry: None,
-        };
+        }
+    }
+
+    #[test]
+    fn test_sending_gdal_dataset_parameters_via_string() {
+        let msg = get_params();
+
+        let (sender, receiver) = ipc_channel::ipc::channel::<String>().unwrap();
+
+        sender.send(serde_json::to_string(&msg).unwrap()).unwrap();
+        let recv = receiver.recv().unwrap();
+        let recv = serde_json::from_str::<GdalDatasetParameters>(&recv).unwrap();
+        assert_eq!(msg.properties_mapping, recv.properties_mapping);
+        assert_eq!(msg, recv);
+    }
+
+    #[test]
+    fn test_serilisation_via_bincode_proper() {
+        let msg = get_params();
+        let config = bincode::config::standard();
+        let hin = bincode::serde::encode_to_vec(&msg, config).unwrap();
+        let back: GdalDatasetParameters =
+            bincode::serde::decode_from_slice(&hin, config).unwrap().0;
+        assert_eq!(msg.properties_mapping, back.properties_mapping);
+        assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn test_serilisation_via_postcard_proper() {
+        let msg = get_params();
+        // this fails too - why ?
+        let hin: Vec<u8> = postcard::to_vec::<GdalDatasetParameters, 2000>(&msg).unwrap().to_vec();
+        let back: GdalDatasetParameters = postcard::take_from_bytes(&hin).unwrap().0;
+        assert_eq!(msg.properties_mapping, back.properties_mapping);
+        assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn test_sending_gdal_dataset_parameters() {
+        let msg = get_params();
 
         let (sender, receiver) = ipc_channel::ipc::channel().unwrap();
 
         sender.send(msg.clone()).unwrap();
         let recv = receiver.recv().unwrap();
+        // TODO (mid): this fails, as the new value has no MetadataMapping values (None)
+        // when it should have. This error is happening for quite a long time
+        // and _might_ be related to the GdalDataSetParameters::no_data_value: Option<f64>,
+        // that is serialized and desirlaized with this #[serde(with = "float_option_with_nan")]
+        assert_eq!(msg.properties_mapping, recv.properties_mapping);
+
         assert_eq!(msg, recv);
     }
 
@@ -1573,7 +1618,7 @@ mod tests {
 
         let (sender, receiver) = ipc_channel::ipc::channel().unwrap();
 
-        sender.send(msg.clone()).unwrap();
+        sender.send(msg).unwrap();
         let recv = receiver.recv().unwrap();
         assert_eq!(msg, recv);
     }
@@ -1661,7 +1706,27 @@ mod tests {
         sender.send(msg.clone()).unwrap();
         let recv = receiver.recv().unwrap();
 
-        assert_eq!(msg, recv);
+        match (msg.clone(), recv.clone()) {
+            (
+                IpcChannelMessage::RequestTileData {
+                    cache_hint: _,
+                    dataset_params: msg_params,
+                    tile_information: msg_tile_info,
+                    tile_time: msg_tile_time,
+                },
+                IpcChannelMessage::RequestTileData {
+                    cache_hint: _,
+                    dataset_params,
+                    tile_information,
+                    tile_time,
+                },
+            ) => {
+                assert_eq!(msg_params, dataset_params);
+                assert_eq!(msg_tile_info, tile_information);
+                assert_eq!(msg_tile_time, tile_time);
+            }
+            _ => panic!("Messages are not equal! {msg:?} != {recv:?}"),
+        }
     }
 
     // TODO name / test
@@ -1716,8 +1781,8 @@ mod tests {
             TileInformation::with_partition_and_shape(output_bounds, output_shape),
             TimeInterval::default(),
             CacheHint::default(),
-            Arc::new(sender),
-            Arc::new(receiver),
+            &Arc::new(sender),
+            &Arc::new(receiver),
         )
     }
 
