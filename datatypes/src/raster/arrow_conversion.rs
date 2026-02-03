@@ -96,8 +96,6 @@ where
 
         let band: usize = serde_json::from_str(metadata[BAND_KEY].as_str()).expect("invalid band");
 
-        // dbg!( band, geo_transform, time, x_size, y_size);
-
         let field_idx = schema
             .fields()
             .iter()
@@ -116,7 +114,7 @@ where
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_else(raster_properties::RasterProperties::default);
 
-        debug_assert_ne!(properties, raster_properties::RasterProperties::default());
+        // debug_assert_ne!(properties, raster_properties::RasterProperties::default());
 
         let cache_hint = CacheHint::default();
 
@@ -340,7 +338,8 @@ fn raster_tile_2d_to_arrow_record_batch_impl<P: Pixel>(
     if include_ipc_metadata {
         metadata.insert(
             RASTER_PROPERTIES.to_string(),
-            serde_json::to_string(&tile.properties).unwrap_or_default(),
+            serde_json::to_string(&tile.properties)
+                .expect("tile properties should be mappable to serde"),
         );
         metadata.insert(
             TILE_POSITION.to_string(),

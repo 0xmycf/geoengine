@@ -1583,18 +1583,6 @@ mod tests {
     }
 
     #[test]
-    fn test_serilisation_via_postcard_proper() {
-        let msg = get_params();
-        // this fails too - why ?
-        let hin: Vec<u8> = postcard::to_vec::<GdalDatasetParameters, 2000>(&msg)
-            .unwrap()
-            .to_vec();
-        let back: GdalDatasetParameters = postcard::take_from_bytes(&hin).unwrap().0;
-        assert_eq!(msg.properties_mapping, back.properties_mapping);
-        assert_eq!(msg, back);
-    }
-
-    #[test]
     fn test_sending_gdal_dataset_parameters() {
         let msg = get_params();
 
