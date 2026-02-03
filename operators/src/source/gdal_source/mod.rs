@@ -1590,10 +1590,6 @@ mod tests {
 
         sender.send(msg.clone()).unwrap();
         let recv = receiver.recv().unwrap();
-        // TODO (mid): this fails, as the new value has no MetadataMapping values (None)
-        // when it should have. This error is happening for quite a long time
-        // and _might_ be related to the GdalDataSetParameters::no_data_value: Option<f64>,
-        // that is serialized and desirlaized with this #[serde(with = "float_option_with_nan")]
         assert_eq!(msg.properties_mapping, recv.properties_mapping);
 
         assert_eq!(msg, recv);
