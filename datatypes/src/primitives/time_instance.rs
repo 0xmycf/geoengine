@@ -1,10 +1,14 @@
 use super::datetime::DateTimeError;
 use super::{DateTime, Duration};
-use crate::primitives::error;
-use crate::util::Result;
+use crate::error::Error;
+use crate::primitives::PrimitivesError;
+use crate::{
+    primitives::error::{self},
+    util::Result,
+};
 use bincode;
 use postgres_types::{FromSql, ToSql};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use snafu::ensure;
 use std::ops::AddAssign;
 use std::{
@@ -17,7 +21,8 @@ use std::{
 #[derive(
     Clone,
     Copy,
-    Serialize, PartialEq,
+    Serialize,
+    PartialEq,
     Eq,
     PartialOrd,
     Ord,
@@ -95,10 +100,35 @@ impl TimeInstance {
         self == Self::MAX
     }
 
+    /// Deserializes a `TimeInstance` from either RFC 3339 timestamp string or Unix timestamp integer.
+    pub fn deserialize(input: &str) -> Result<Self> {
+        if let Ok(millis) = input.parse::<i64>() {
+            Self::from_millis(millis)
+        } else if let Ok(dt) = input.parse::<u64>() {
+            Self::from_millis(dt as i64)
+        } else {
+            Self::from_str(input).map_err(|e| {
+                let err = PrimitivesError::NoDateTimeParse {
+                    datetime: input.to_string(),
+                    source: e,
+                };
+                Error::Primitives { source: err }
+            })
+        }
+    }
+
     pub const MIN: Self = TimeInstance::from_millis_unchecked(-8_334_601_228_800_000);
     pub const MAX: Self = TimeInstance::from_millis_unchecked(8_210_266_876_799_999);
 
     pub const EPOCH_START: Self = TimeInstance::from_millis_unchecked(0);
+}
+
+pub fn deserialize_time_interval<'de, D>(deserializer: D) -> Result<TimeInstance, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: &str = Deserialize::deserialize(deserializer).map_err(serde::de::Error::custom)?;
+    TimeInstance::deserialize(s).map_err(serde::de::Error::custom)
 }
 
 impl std::fmt::Display for TimeInstance {

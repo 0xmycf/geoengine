@@ -26,7 +26,7 @@ impl JsonPayload {
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq)]
 pub enum IpcChannelMessage {
     RequestTileData {
-        cache_hint: CacheHint,
+        cache_hint: CacheHint, // TODO does it even need this?
         dataset_params: GdalDatasetParameters,
         tile_information: TileInformation,
         tile_time: TimeInterval,
@@ -49,9 +49,13 @@ pub fn spawn_ipc_server_process_bytes<S>() -> (Child, IpcSender<S>, IpcBytesRece
 
     // get the users home
     let home = std::env::var("HOME").expect("failed to get HOME env var");
+    let location = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
     let path = format!(
-        "{}/Documents/work/arbeit-geoengine/geoengine-workflow-backend/target/debug/gdalsource-process",
-        home
+        "{home}/Documents/work/arbeit-geoengine/geoengine-workflow-backend/target/{location}/gdalsource-process",
     );
 
     // dbg!(path);

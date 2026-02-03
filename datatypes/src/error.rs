@@ -1,6 +1,6 @@
 use crate::{
     collections::FeatureCollectionError,
-    primitives::{BoundingBox2D, Coordinate2D, PrimitivesError, TimeInstance, TimeInterval},
+    primitives::{BoundingBox2D, Coordinate2D, DateTimeError, PrimitivesError, TimeInstance, TimeInterval},
     raster::RasterDataType,
     spatial_reference::SpatialReference,
 };
@@ -363,6 +363,7 @@ pub enum Error {
         expected: usize,
         found: usize,
     },
+
 }
 
 impl From<arrow::error::ArrowError> for Error {

@@ -104,8 +104,7 @@ where
             .position(|f| f.name() == RASTER_DATA_FIELD_NAME)
             .expect("raster data field not found");
         let arr = batch.column(field_idx);
-        let grid: GridOrEmpty2D<P> =
-            arrow_array_to_grid_2d::<P>(arr, [y_size, x_size].into())?;
+        let grid: GridOrEmpty2D<P> = arrow_array_to_grid_2d::<P>(arr, [y_size, x_size].into())?;
 
         let tile_position = metadata
             .get(TILE_POSITION)
@@ -116,6 +115,8 @@ where
             .get(RASTER_PROPERTIES)
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_else(raster_properties::RasterProperties::default);
+
+        debug_assert_ne!(properties, raster_properties::RasterProperties::default());
 
         let cache_hint = CacheHint::default();
 
@@ -136,7 +137,10 @@ where
     })
 } // }}}
 
-fn arrow_array_to_grid_2d<P>(arr: &ArrayRef, size: GridShape<[usize; 2]>) -> Result<GridOrEmpty2D<P>>
+fn arrow_array_to_grid_2d<P>(
+    arr: &ArrayRef,
+    size: GridShape<[usize; 2]>,
+) -> Result<GridOrEmpty2D<P>>
 // {{{
 where
     P: Pixel,
@@ -330,10 +334,7 @@ fn raster_tile_2d_to_arrow_record_batch_impl<P: Pixel>(
     .into();
 
     if let Some(spatial_ref) = spatial_ref {
-        metadata.insert(
-            SPATIAL_REF_KEY.to_string(),
-            serde_json::to_string(&spatial_ref).unwrap_or_default(),
-        );
+        metadata.insert(SPATIAL_REF_KEY.to_string(), spatial_ref.to_string());
     }
 
     if include_ipc_metadata {
@@ -453,7 +454,7 @@ mod tests {
     use super::*;
     use crate::{
         primitives::{CacheHint, TimeInterval},
-        raster::{EmptyGrid2D, GridIndexAccessMut, GridShapeAccess, MaskedGrid2D, TileInformation},
+        raster::{EmptyGrid2D, GridIndexAccessMut, MaskedGrid2D, TileInformation},
         spatial_reference::SpatialReference,
         util::test::TestDefault,
     };
@@ -631,7 +632,11 @@ mod tests {
             CacheHint::default(),
         );
 
-        let bytes = raster_tile_2d_to_arrow_ipc_file(original.clone(), SpatialReference::epsg_4326().into()).unwrap();
+        let bytes = raster_tile_2d_to_arrow_ipc_file(
+            original.clone(),
+            SpatialReference::epsg_4326().into(),
+        )
+        .unwrap();
         let restored: RasterTile2D<f32> = arrow_ipc_file_to_raster_tile_2d(bytes).unwrap();
 
         assert!(restored.grid_array.is_empty());
@@ -650,12 +655,15 @@ mod tests {
                 tile_size_in_pixels: [3, 2].into(),
             },
             5,
-            Grid2D::new([3, 2].into(), vec![10_u8, 20, 30, 40, 50, 60]).unwrap().into(),
+            Grid2D::new([3, 2].into(), vec![10_u8, 20, 30, 40, 50, 60])
+                .unwrap()
+                .into(),
             CacheHint::default(),
         );
 
         let bytes = raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(original.clone()).unwrap();
-        let restored: RasterTile2D<u8> = arrow_ipc_file_to_raster_tile_2d_for_ipc_channel(bytes).unwrap();
+        let restored: RasterTile2D<u8> =
+            arrow_ipc_file_to_raster_tile_2d_for_ipc_channel(bytes).unwrap();
 
         assert_eq!(original.time, restored.time);
         assert_eq!(original.band, restored.band);
@@ -664,5 +672,4 @@ mod tests {
         assert_eq!(original.properties, restored.properties);
         assert_eq!(original.tile_position, restored.tile_position);
     }
-
 }

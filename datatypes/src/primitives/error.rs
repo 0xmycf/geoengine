@@ -1,4 +1,4 @@
-use crate::error::Error;
+use crate::{error::Error, primitives::DateTimeError};
 use arrow::error::ArrowError;
 use snafu::prelude::*;
 
@@ -25,6 +25,18 @@ pub enum PrimitivesError {
         max: TimeInstance,
         is: i64,
     },
+
+    #[snafu(display("The datetime string {datetime} is not a RFC timestamp. DateTimeError: {source}"))]
+    NoDateTimeParse {
+        datetime: String,
+        source: DateTimeError,
+    },
+
+    #[snafu(display("Expect RFC 3339 timestamp string or Unix timestamp integer"))]
+    InvalidStringOrTimeStamp {
+        // source: Box<dyn std::error::Error>, // TODO (mid): make this nice
+    },
+
 }
 
 impl From<PrimitivesError> for Error {
