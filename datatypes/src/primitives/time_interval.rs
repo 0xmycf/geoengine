@@ -772,4 +772,12 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn serialize_time_interval_with_serde() {
+        let time_interval = TimeInterval::new(1, 2).expect("time interval was created succesfully");
+        let hin = serde_json::to_string(&time_interval).expect("serilization works");
+        let back: TimeInterval = serde_json::from_str(&hin).expect("deserialization works");
+        assert_eq!(time_interval, back);
+    }
 }
