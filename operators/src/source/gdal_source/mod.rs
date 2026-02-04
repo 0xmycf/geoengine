@@ -439,6 +439,21 @@ pub async fn load_tile_async<T: Pixel + GdalType + FromPrimitive>(
 //     )
 // }
 
+/// A simple, single-entry cache for an open GDAL dataset.
+pub struct GdalDatasetCache {
+    dataset_params: Option<GdalDatasetParameters>,
+    dataset: Option<GdalDataset>,
+}
+
+impl GdalDatasetCache {
+    pub fn new() -> Self {
+        Self {
+            dataset_params: None,
+            dataset: None,
+        }
+    }
+}
+
 struct GdalRasterLoader {}
 
 impl GdalRasterLoader {
@@ -834,6 +849,147 @@ impl GdalRasterLoader {
             .try_flatten()
             .try_buffered(16) // TODO: make this configurable
     }
+}
+
+/// A method to load single tiles from a GDAL dataset using a single-entry dataset cache.
+pub fn load_tile_data_cached<T: Pixel + GdalType + FromPrimitive>(
+    cache: &mut GdalDatasetCache,
+    dataset_params: GdalDatasetParameters,
+    tile_information: TileInformation,
+    tile_time: TimeInterval,
+    cache_hint: CacheHint,
+) -> Result<RasterTile2D<T>> {
+    let start = Instant::now();
+
+    debug!(
+        "GridOrEmpty2D<{:?}> requested for {:?}.",
+        T::TYPE,
+        &tile_information.spatial_partition()
+    );
+
+    let options = dataset_params
+        .gdal_open_options
+        .as_ref()
+        .map(|o| o.iter().map(String::as_str).collect::<Vec<_>>());
+
+    // reverts the thread local configs on drop
+    let _thread_local_configs = dataset_params
+        .gdal_config_options
+        .as_ref()
+        .map(|config_options| TemporaryGdalThreadLocalConfigOptions::new(config_options));
+
+    let dataset = if cache.dataset_params.as_ref() == Some(&dataset_params) {
+        cache
+            .dataset
+            .as_ref()
+            .expect("cache params set without dataset")
+    } else {
+        cache.dataset = None;
+        cache.dataset_params = None;
+
+        let dataset_result = gdal_open_dataset_ex(
+            &dataset_params.file_path,
+            DatasetOptions {
+                open_flags: GdalOpenFlags::GDAL_OF_RASTER,
+                open_options: options.as_deref(),
+                ..DatasetOptions::default()
+            },
+        );
+
+        if let Err(error) = &dataset_result {
+            let is_file_not_found = error_is_gdal_file_not_found(error);
+
+            let err_result = match dataset_params.file_not_found_handling {
+                FileNotFoundHandling::NoData if is_file_not_found => {
+                    Ok(create_no_data_tile(tile_information, tile_time, cache_hint))
+                }
+                _ => Err(crate::error::Error::CouldNotOpenGdalDataset {
+                    file_path: dataset_params.file_path.to_string_lossy().to_string(),
+                }),
+            };
+            let elapsed = start.elapsed();
+            debug!(
+                "error opening dataset: {:?} -> returning error = {}, took: {:?}, file: {}",
+                error,
+                err_result.is_err(),
+                elapsed,
+                dataset_params.file_path.display()
+            );
+            return err_result;
+        }
+
+        cache.dataset = Some(dataset_result.expect("checked"));
+        cache.dataset_params = Some(dataset_params.clone());
+
+        cache
+            .dataset
+            .as_ref()
+            .expect("cache dataset missing after open")
+    };
+
+    let result_tile = read_raster_tile_with_properties(
+        dataset,
+        &dataset_params,
+        tile_information,
+        tile_time,
+        cache_hint,
+    )?;
+
+    let elapsed = start.elapsed();
+    debug!("data loaded -> returning data grid, took {elapsed:?}");
+
+    Ok(result_tile)
+}
+
+/// A method to load single tiles from a GDAL dataset using a single-entry dataset cache with retry.
+pub async fn load_tile_data_cached_async<T: Pixel + GdalType + FromPrimitive>(
+    cache: Arc<tokio::sync::Mutex<GdalDatasetCache>>,
+    dataset_params: GdalDatasetParameters,
+    tile_information: TileInformation,
+    tile_time: TimeInterval,
+    cache_hint: CacheHint,
+) -> Result<RasterTile2D<T>> {
+    // TODO: detect usage of vsi curl properly, e.g. also check for `/vsicurl_streaming` and combinations with `/vsizip`
+    let is_vsi_curl = dataset_params.file_path.starts_with("/vsicurl/");
+
+    retry(
+        dataset_params
+            .retry
+            .map(|r| r.max_retries)
+            .unwrap_or_default(),
+        GDAL_RETRY_INITIAL_BACKOFF_MS,
+        GDAL_RETRY_EXPONENTIAL_BACKOFF_FACTOR,
+        Some(GDAL_RETRY_MAX_BACKOFF_MS),
+        || {
+            let dataset_params = dataset_params.clone();
+            let cache = Arc::clone(&cache);
+
+            async move {
+                let mut cache_guard = cache.lock().await;
+                let load_tile_result = load_tile_data_cached(
+                    &mut cache_guard,
+                    dataset_params.clone(),
+                    tile_information,
+                    tile_time,
+                    cache_hint,
+                );
+
+                match load_tile_result {
+                    Ok(r) => Ok(r),
+                    Err(e) => {
+                        if is_vsi_curl {
+                            // clear the VSICurl cache, to force GDAL to try to re-download the file
+                            // otherwise it will assume any observed error will happen again
+                            clear_gdal_vsi_cache_for_path(dataset_params.file_path.as_path());
+                        }
+
+                        Err(e)
+                    }
+                }
+            }
+        },
+    )
+    .await
 }
 
 fn error_is_gdal_file_not_found(error: &Error) -> bool {

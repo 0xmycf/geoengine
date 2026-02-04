@@ -5,8 +5,11 @@ use geoengine_datatypes::{
 use geoengine_operators::source::gdal_source::{
     self,
     process::{IpcChannelMessage, JsonPayload, setup_client_for_bytes},
+    GdalDatasetCache,
 };
 use ipc_channel::ipc::IpcError;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,6 +26,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     dbg!(token.clone());
 
     let (sender, receiver) = setup_client_for_bytes::<JsonPayload>(token);
+
+    let dataset_cache = Arc::new(Mutex::new(GdalDatasetCache::new()));
 
     loop {
         let message = receiver.recv().map(JsonPayload::get).map_err(|e| {
@@ -46,7 +51,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // dbg!("Received request for tile data");
                 // TODO: make more general for the other pixel types... how (Phantom Data?)?
                 // dbg!(tile_time);
-                let tile: RasterTile2D<u8> = gdal_source::load_tile_async(
+                let tile: RasterTile2D<u8> = gdal_source::load_tile_data_cached_async(
+                    Arc::clone(&dataset_cache),
                     dataset_params,
                     tile_information,
                     tile_time,

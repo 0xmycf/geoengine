@@ -177,7 +177,7 @@ fn standard_reading(c: &mut Criterion) {
 
     let runtime =
         tokio::runtime::Runtime::new().expect("It should be possible to create a runtime");
-    c.bench_function("request_tile_from_process_no_start", |b| {
+    c.bench_function("request_tile_data_async_no_process", |b| {
         b.to_async(&runtime).iter(async || {
             let (dataset_params, tile_information, tile_time, cache_hint) =
                 make_stuff_for_other_benchmark(output_shape, output_bounds);
