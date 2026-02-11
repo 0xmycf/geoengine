@@ -9,6 +9,11 @@ documentation.workspace = true
 repository.workspace = true
 
 [features]
+default = ["gdalsource-default"]
+
+gdalsource-default = []
+# uses the new process thing instead of the default execution model
+gdalsource-process = []
 
 [dependencies]
 arrow = { workspace = true }

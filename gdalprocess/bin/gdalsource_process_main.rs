@@ -1,11 +1,7 @@
-use geoengine_datatypes::{
-    raster::{RasterTile2D, raster_tile_2d_to_arrow_ipc_file_for_ipc_channel},
-    spatial_reference::SpatialReferenceOption,
-};
+use geoengine_datatypes::raster::{RasterTile2D, raster_tile_2d_to_arrow_ipc_file_for_ipc_channel};
 use geoengine_operators::source::gdal_source::{
-    self,
+    self, GdalDatasetCache,
     process::{IpcChannelMessage, JsonPayload, setup_client_for_bytes},
-    GdalDatasetCache,
 };
 use ipc_channel::ipc::IpcError;
 use std::sync::Arc;
@@ -59,9 +55,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     cache_hint,
                 )
                 .await?;
-                let ipc_data = raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(
-                    tile,
-                )?;
+                let ipc_data = raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(tile)?;
 
                 sender.send(&ipc_data)?;
                 // dbg!("Sent tile data to client");

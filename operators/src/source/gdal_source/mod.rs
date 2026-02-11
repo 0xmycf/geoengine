@@ -118,7 +118,6 @@ pub struct GdalDatasetParameters {
     pub file_not_found_handling: FileNotFoundHandling,
     #[serde(default)]
     #[serde(with = "float_option_with_nan")]
-    // TODO: this breaks serde bincode / postcard serialization
     pub no_data_value: Option<f64>,
     pub properties_mapping: Option<Vec<GdalMetadataMapping>>,
     // Dataset open option as strings, e.g. `vec!["UserPwd=geoengine:pwd".to_owned(), "HttpAuth=BASIC".to_owned()]`
@@ -587,7 +586,7 @@ impl GdalRasterLoader {
         .await
     }
 
-    /// Copy "load_tile_async" but utilizing multiple processes
+    /// Copy `load_tile_async` but utilizing multiple processes
     async fn load_tile_process_async<T: Pixel + GdalType + FromPrimitive>(
         dataset_params: Option<GdalDatasetParameters>,
         tile_information: TileInformation,
@@ -852,6 +851,9 @@ impl GdalRasterLoader {
 }
 
 /// A method to load single tiles from a GDAL dataset using a single-entry dataset cache.
+///
+/// # Panics
+/// Panics when cache params set without dataset (should not happen I think)
 pub fn load_tile_data_cached<T: Pixel + GdalType + FromPrimitive>(
     cache: &mut GdalDatasetCache,
     dataset_params: GdalDatasetParameters,
@@ -1134,8 +1136,25 @@ where
 
         let source_stream = stream::iter(skipping_loading_info);
 
-        let source_stream = // here
-            GdalRasterLoader::loading_info_to_tile_stream(source_stream, &query, tiling_strategy);
+        let source_stream = {
+            // here
+            #[cfg(feature = "gdalsource-default")]
+            {
+                GdalRasterLoader::loading_info_to_tile_stream(
+                    source_stream,
+                    &query,
+                    tiling_strategy,
+                )
+            }
+            #[cfg(feature = "gdalsource-process")]
+            {
+                GdalRasterLoader::loading_info_to_tile_stream_process(
+                    source_stream,
+                    &query,
+                    tiling_strategy,
+                )
+            }
+        };
 
         // use SparseTilesFillAdapter to fill all the gaps
         let filled_stream = SparseTilesFillAdapter::new(
