@@ -84,13 +84,13 @@ mod default_impl {
         let _ = ThreadPoolBuilder::new().build_global();
     }
 
-    pub fn bench(c: &mut Criterion) {
+    fn bench_with_shape(c: &mut Criterion, bench_name: &str, output_shape: GridShape2D) {
         ensure_global_rayon_pool();
-        let output_shape: GridShape2D = [8, 8].into();
         let meta = create_ndvi_meta_data();
         let params = meta.params.clone();
         let time_interval = meta.data_time;
-        let query_rectangles = make_query_rectangles(1024, output_shape, &params, time_interval, 0);
+        let query_rectangles =
+            make_query_rectangles(512, output_shape, &params, time_interval, 0);
         let query_idx = Cell::new(0);
 
         let mut exe_ctx = MockExecutionContext::test_default();
@@ -117,7 +117,7 @@ mod default_impl {
                 .expect("ndvi should be u8")
         });
 
-        c.bench_function("gdal_source_operator_default", |b| {
+        c.bench_function(bench_name, |b| {
             b.to_async(&runtime).iter(|| {
                 let idx = query_idx.get();
                 query_idx.set((idx + 1) % query_rectangles.len());
@@ -133,6 +133,11 @@ mod default_impl {
                 }
             });
         });
+    }
+
+    pub fn bench(c: &mut Criterion) {
+        bench_with_shape(c, "gdal_source_operator_default_small", [8, 8].into());
+        bench_with_shape(c, "gdal_source_operator_default_large", [256, 256].into());
     }
 }
 
