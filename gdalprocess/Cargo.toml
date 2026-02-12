@@ -89,6 +89,7 @@ harness = false
 [dependencies]
 
 geoengine-operators = { path = "../operators" }
+# geoengine-operators-new = { path = "../operators", package = "geoengine-operators" , features = ["gdalsource-process"] }
 
 arrow = { workspace = true }
 arrow-flight = { workspace = true }

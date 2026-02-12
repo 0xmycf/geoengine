@@ -880,7 +880,14 @@ pub fn load_tile_data_cached<T: Pixel + GdalType + FromPrimitive>(
         .as_ref()
         .map(|config_options| TemporaryGdalThreadLocalConfigOptions::new(config_options));
 
-    let dataset = if cache.dataset_params.as_ref() == Some(&dataset_params) {
+    // tests if cache.filepath = request.filepath
+    let are_file_paths_same = cache
+        .dataset_params
+        .as_ref()
+        .map(|params| params.file_path.clone())
+        == Some(dataset_params.file_path.clone());
+
+    let dataset = if are_file_paths_same {
         cache
             .dataset
             .as_ref()
