@@ -11,6 +11,7 @@ use geoengine_datatypes::{
 };
 use rand::{Rng, SeedableRng};
 use rand::rngs::SmallRng;
+use rayon::ThreadPoolBuilder;
 
 mod default_impl {
     use super::*;
@@ -79,7 +80,12 @@ mod default_impl {
             .collect()
     }
 
+    fn ensure_global_rayon_pool() {
+        let _ = ThreadPoolBuilder::new().build_global();
+    }
+
     pub fn bench(c: &mut Criterion) {
+        ensure_global_rayon_pool();
         let output_shape: GridShape2D = [8, 8].into();
         let meta = create_ndvi_meta_data();
         let params = meta.params.clone();

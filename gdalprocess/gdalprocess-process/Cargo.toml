@@ -19,6 +19,7 @@ criterion = { workspace = true }
 rand = { workspace = true, features = ["small_rng"] }
 futures = { workspace = true }
 tokio = { workspace = true }
+rayon = { workspace = true }
 
 [lints]
 workspace = true

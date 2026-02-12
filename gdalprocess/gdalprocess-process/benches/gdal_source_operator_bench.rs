@@ -11,6 +11,7 @@ use geoengine_datatypes::{
 };
 use rand::{Rng, SeedableRng};
 use rand::rngs::SmallRng;
+use rayon::ThreadPoolBuilder;
 
 use geoengine_datatypes::util::test::TestDefault;
 use geoengine_operators::{
@@ -78,6 +79,7 @@ fn make_query_rectangles(
 }
 
 fn gdal_source_operator_process(c: &mut Criterion) {
+    let _ = ThreadPoolBuilder::new().build_global();
     let output_shape: GridShape2D = [8, 8].into();
     let meta = create_ndvi_meta_data();
     let params = meta.params.clone();
