@@ -33,7 +33,7 @@ use gdal::{Dataset as GdalDataset, DatasetOptions, GdalOpenFlags, Metadata as Gd
 use gdal_sys::VSICurlPartialClearCache;
 use geoengine_datatypes::dataset::NamedData;
 use geoengine_datatypes::primitives::{
-    AxisAlignedRectangle, Coordinate2D, DateTimeParseFormat, RasterQueryRectangle,
+    AxisAlignedRectangle, Coordinate2D, DateTimeParseFormat, QueryRectangle, RasterQueryRectangle,
     SpatialPartition2D, SpatialPartitioned, TimeInstance,
 };
 use geoengine_datatypes::primitives::{BandSelection, CacheHint};
@@ -400,6 +400,8 @@ where
     pub tiling_specification: TilingSpecification,
     pub meta_data: GdalMetaData,
     pub _phantom_data: PhantomData<T>,
+    #[cfg(feature = "gdalsource-process")]
+    pub process_data: Arc<ProcessData>,
 }
 
 // TODO (high): remove this again
@@ -798,16 +800,15 @@ impl GdalRasterLoader {
         loading_info_stream: S,
         query: &RasterQueryRectangle,
         tiling_strategy: TilingStrategy,
+        process_data: Arc<ProcessData>,
     ) -> impl Stream<Item = Result<RasterTile2D<T>>> + use<S, T> {
-     //  impl Stream<Item = Result<RasterTile2D<T>>> + use<S, T> 
+        //  impl Stream<Item = Result<RasterTile2D<T>>> + use<S, T>
         let spatial_bounds = query.spatial_bounds;
 
-        let (mut child, sx, rx) = spawn_ipc_server_process_bytes::<JsonPayload>();
+        let sender = Arc::clone(&process_data.sender);
+        let receiver = Arc::clone(&process_data.receiver);
 
-        let sender = Arc::new(sx);
-        let receiver = Arc::new(Mutex::new(rx));
-
-        let value = sender.clone(); // ???
+        let value = sender.clone();
         let res = loading_info_stream
             .map_ok(move |info| {
                 GdalRasterLoader::temporal_slice_tile_future_stream_process(
@@ -822,11 +823,6 @@ impl GdalRasterLoader {
             .try_flatten()
             .try_buffered(16); // TODO: make this configurable
 
-        // kill the child
-        let _ = sender
-            .send(JsonPayload::new(&IpcChannelMessage::EndConnection))
-            .ok();
-        child.kill().ok();
         res
     }
 
@@ -1146,8 +1142,18 @@ where
 
         let source_stream = stream::iter(skipping_loading_info);
 
+        // changed through feature
+        #[cfg(feature = "gdalsource-default")]
         let loaded_source_stream =
             load_source_stream::<P, _>(source_stream, &query, tiling_strategy);
+
+        #[cfg(feature = "gdalsource-process")]
+        let loaded_source_stream = load_source_stream::<P, _>(
+            source_stream,
+            &query,
+            tiling_strategy,
+            Arc::clone(&self.process_data),
+        );
 
         // use SparseTilesFillAdapter to fill all the gaps
         let filled_stream = SparseTilesFillAdapter::new(
@@ -1192,12 +1198,18 @@ fn load_source_stream<P, S>(
     source_stream: S,
     query: &RasterQueryRectangle,
     tiling_strategy: TilingStrategy,
+    process_data: Arc<ProcessData>,
 ) -> impl Stream<Item = Result<RasterTile2D<P>>> + use<P, S>
 where
     P: Pixel + GdalType + FromPrimitive,
     S: Stream<Item = Result<GdalLoadingInfoTemporalSlice>>,
 {
-    GdalRasterLoader::loading_info_to_tile_stream_process(source_stream, query, tiling_strategy)
+    GdalRasterLoader::loading_info_to_tile_stream_process(
+        source_stream,
+        query,
+        tiling_strategy,
+        process_data,
+    )
 }
 
 #[cfg(not(any(feature = "gdalsource-default", feature = "gdalsource-process")))]
@@ -1217,6 +1229,12 @@ impl RasterOperator for GdalSource {
         debug!("Initializing GdalSource for {:?}.", &self.params.data);
         debug!("GdalSource path: {:?}", path);
 
+        #[cfg(feature = "gdalsource-process")]
+        let process_data = {
+            let (child, sender, receiver) = spawn_ipc_server_process_bytes::<JsonPayload>();
+            Arc::new(ProcessData::new(child, sender, receiver))
+        };
+
         let op = InitializedGdalSourceOperator {
             name: CanonicOperatorName::from(&self),
             path,
@@ -1224,12 +1242,45 @@ impl RasterOperator for GdalSource {
             result_descriptor: meta_data.result_descriptor().await?,
             meta_data,
             tiling_specification: context.tiling_specification(),
+            #[cfg(feature = "gdalsource-process")]
+            process_data,
         };
 
         Ok(op.boxed())
     }
 
     span_fn!(GdalSource);
+}
+
+struct ProcessData {
+    child: Mutex<std::process::Child>,
+    sender: Arc<IpcSender<JsonPayload>>,
+    receiver: Arc<Mutex<IpcBytesReceiver>>,
+}
+
+impl ProcessData {
+    fn new(
+        child: std::process::Child,
+        sender: IpcSender<JsonPayload>,
+        receiver: IpcBytesReceiver,
+    ) -> Self {
+        Self {
+            child: Mutex::new(child),
+            sender: Arc::new(sender),
+            receiver: Arc::new(Mutex::new(receiver)),
+        }
+    }
+}
+
+impl Drop for ProcessData {
+    fn drop(&mut self) {
+        let _ = self
+            .sender
+            .send(JsonPayload::new(&IpcChannelMessage::EndConnection));
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+        }
+    }
 }
 
 pub struct InitializedGdalSourceOperator {
@@ -1239,6 +1290,8 @@ pub struct InitializedGdalSourceOperator {
     pub meta_data: GdalMetaData,
     pub result_descriptor: RasterResultDescriptor,
     pub tiling_specification: TilingSpecification,
+    #[cfg(feature = "gdalsource-process")]
+    pub process_data: Arc<ProcessData>,
 }
 
 impl InitializedRasterOperator for InitializedGdalSourceOperator {
@@ -1254,6 +1307,8 @@ impl InitializedRasterOperator for InitializedGdalSourceOperator {
                     tiling_specification: self.tiling_specification,
                     meta_data: self.meta_data.clone(),
                     _phantom_data: PhantomData,
+                    #[cfg(feature = "gdalsource-process")]
+                    process_data: Arc::clone(&self.process_data),
                 }
                 .boxed(),
             ),
@@ -1263,6 +1318,8 @@ impl InitializedRasterOperator for InitializedGdalSourceOperator {
                     tiling_specification: self.tiling_specification,
                     meta_data: self.meta_data.clone(),
                     _phantom_data: PhantomData,
+                    #[cfg(feature = "gdalsource-process")]
+                    process_data: Arc::clone(&self.process_data),
                 }
                 .boxed(),
             ),
@@ -1272,6 +1329,8 @@ impl InitializedRasterOperator for InitializedGdalSourceOperator {
                     tiling_specification: self.tiling_specification,
                     meta_data: self.meta_data.clone(),
                     _phantom_data: PhantomData,
+                    #[cfg(feature = "gdalsource-process")]
+                    process_data: Arc::clone(&self.process_data),
                 }
                 .boxed(),
             ),
@@ -1291,6 +1350,8 @@ impl InitializedRasterOperator for InitializedGdalSourceOperator {
                     tiling_specification: self.tiling_specification,
                     meta_data: self.meta_data.clone(),
                     _phantom_data: PhantomData,
+                    #[cfg(feature = "gdalsource-process")]
+                    process_data: Arc::clone(&self.process_data),
                 }
                 .boxed(),
             ),
@@ -1300,6 +1361,8 @@ impl InitializedRasterOperator for InitializedGdalSourceOperator {
                     tiling_specification: self.tiling_specification,
                     meta_data: self.meta_data.clone(),
                     _phantom_data: PhantomData,
+                    #[cfg(feature = "gdalsource-process")]
+                    process_data: Arc::clone(&self.process_data),
                 }
                 .boxed(),
             ),
@@ -1314,6 +1377,8 @@ impl InitializedRasterOperator for InitializedGdalSourceOperator {
                     tiling_specification: self.tiling_specification,
                     meta_data: self.meta_data.clone(),
                     _phantom_data: PhantomData,
+                    #[cfg(feature = "gdalsource-process")]
+                    process_data: Arc::clone(&self.process_data),
                 }
                 .boxed(),
             ),
@@ -1323,6 +1388,8 @@ impl InitializedRasterOperator for InitializedGdalSourceOperator {
                     tiling_specification: self.tiling_specification,
                     meta_data: self.meta_data.clone(),
                     _phantom_data: PhantomData,
+                    #[cfg(feature = "gdalsource-process")]
+                    process_data: Arc::clone(&self.process_data),
                 }
                 .boxed(),
             ),
