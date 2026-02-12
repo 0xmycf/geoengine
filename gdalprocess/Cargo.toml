@@ -9,75 +9,15 @@ license-file.workspace = true
 documentation.workspace = true
 repository.workspace = true
 
-# [lib] # some lib that is currently empty
-# name = "libgdalprocess"
-# path = "src/lib.rs"
-#
-# [[bin]] # Bin to run the gRPC server
-# name = "gdalprocess"
-# path = "src/main.rs"
-#
-# [[bin]] # Bin to run the gRPC client
-# name = "gdalprocess-client"
-# path = "src/client.rs"
-#
-# #######################################################################################
-#
-# [[bin]] # Bin to run the arrow-flight-client
-# name = "gdalprocess-arrow-client"
-# path = "src/arrow_client.rs"
-#
-# [[bin]] # Bin to run the arrow-flight-server
-# name = "gdalprocess-arrow-server"
-# path = "src/arrow_server.rs"
-#
-# #######################################################################################
-#
-# [[bin]] # Bin to run the ipc-channel client
-# name = "gdalprocess-ipc-channel-client"
-# path = "src/ipc-client-main.rs"
-#
-# [[bin]] # Bin to run the ipc-channel server
-# name = "gdalprocess-ipc-channel-server"
-# path = "src/ipc-server-main.rs"
+#### bins -- for benchmarks ###########################################################
 
-#### for benchmarks ###################################################################
-
-# [[bin]] # Bin to run the ipc-channel server
-# name = "gdalprocess-grpc-bench-server"
-# path = "src/b_grpc_server_main.rs"
-#
-# [[bin]] # Bin to run the ipc-channel server; serialises data at each request
-# name = "gdalprocess-grpc-bench-server-with-serialization"
-# path = "src/b_grpc_server_main_with_serialization.rs"
-#
-# [[bin]] # Bin to run the ipc-channel server; serialises data at each request with bincode / serde
-# name = "gdalprocess-grpc-bench-server-with-serialization_bincode"
-# path = "src/b_grpc_server_main_with_serialization_bincode.rs"
-
-#### for actual reading ###############################################################
+#### bins -- for actual reading #######################################################
 
 [[bin]] # Bin to run the ipc-channel server; serialises data at each request with bincode / serde
 name = "gdalsource-process"
 path = "bin/gdalsource_process_main.rs"
 
-#######################################################################################
-
-# [[bench]]
-# name = "ipc_channel_bench"
-# harness = false
-#
-# [[bench]]
-# name = "ipc_channel_process_bench"
-# harness = false
-#
-# [[bench]]
-# name = "grpc_process_bench"
-# harness = false
-#
-# [[bench]]
-# name = "grpc_bench"
-# harness = false
+#### -- bneches #######################################################################
 
 [[bench]]
 name = "gdal_source_process_bench"
@@ -86,10 +26,15 @@ harness = false
  ######################################################################################
 
 # copied from operators ( then modified )
+# TODO go over those and remove what we dont need
 [dependencies]
 
 geoengine-operators = { path = "../operators" }
-# geoengine-operators-new = { path = "../operators", package = "geoengine-operators" , features = ["gdalsource-process"] }
+# geoengine-operators-new = { 
+#    path = "../operators",
+#    package = "geoengine-operators" ,
+#    features = ["gdalsource-process"] 
+# }
 
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
