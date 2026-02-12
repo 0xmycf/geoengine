@@ -2529,6 +2529,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gdalprocess-process"
+version = "0.8.0"
+dependencies = [
+ "criterion",
+ "futures",
+ "geoengine-datatypes",
+ "geoengine-operators",
+ "rand 0.9.2",
+ "tokio",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

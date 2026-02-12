@@ -5,8 +5,6 @@ use std::fmt;
 /// Serialize and deserialize floats with special treatment of NaN
 pub mod float {
 
-    use num::Float;
-
     use super::*;
 
     pub(super) struct FloatOrStringVisitor;

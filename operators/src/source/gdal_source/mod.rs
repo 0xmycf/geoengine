@@ -64,7 +64,7 @@ use std::convert::TryFrom;
 use std::ffi::CString;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::debug;
 
@@ -462,7 +462,7 @@ impl GdalRasterLoader {
         tile_time: TimeInterval,
         cache_hint: CacheHint,
         sender: &Arc<IpcSender<JsonPayload>>,
-        receiver: &Arc<IpcBytesReceiver>,
+        receiver: &Arc<Mutex<IpcBytesReceiver>>,
     ) -> Result<RasterTile2D<T>> {
         // TODO: detect usage of vsi curl properly, e.g. also check for `/vsicurl_streaming` and combinations with `/vsizip`
         let is_vsi_curl = dataset_params.file_path.starts_with("/vsicurl/");
@@ -488,6 +488,8 @@ impl GdalRasterLoader {
         })?;
 
         let load_tile_result = receiver
+            .lock()
+            .expect("ipc receiver lock should not be poisoned")
             .recv()
             .map(|msg| {
                 arrow_ipc_file_to_raster_tile_2d::<T>(msg).map_err(|e| Error::Io {
@@ -524,7 +526,7 @@ impl GdalRasterLoader {
         tile_time: TimeInterval,
         cache_hint: CacheHint,
         sender: Arc<IpcSender<JsonPayload>>,
-        receiver: Arc<IpcBytesReceiver>,
+        receiver: Arc<Mutex<IpcBytesReceiver>>,
     ) -> Result<RasterTile2D<T>> {
         Self::load_tile_data_process(
             dataset_params,
@@ -593,7 +595,7 @@ impl GdalRasterLoader {
         tile_time: TimeInterval,
         cache_hint: CacheHint,
         sender: Arc<IpcSender<JsonPayload>>,
-        receiver: Arc<IpcBytesReceiver>,
+        receiver: Arc<Mutex<IpcBytesReceiver>>,
     ) -> Result<RasterTile2D<T>> {
         match dataset_params {
             Some(ds)
@@ -774,7 +776,7 @@ impl GdalRasterLoader {
         info: GdalLoadingInfoTemporalSlice,
         tiling_strategy: TilingStrategy,
         sender: Arc<IpcSender<JsonPayload>>,
-        receiver: Arc<IpcBytesReceiver>,
+        receiver: Arc<Mutex<IpcBytesReceiver>>,
     ) -> impl Stream<Item = impl Future<Output = Result<RasterTile2D<T>>>> + use<T> {
         stream::iter(tiling_strategy.tile_information_iterator(spatial_bounds)).map(move |tile| {
             GdalRasterLoader::load_tile_process_async(
@@ -797,12 +799,13 @@ impl GdalRasterLoader {
         query: &RasterQueryRectangle,
         tiling_strategy: TilingStrategy,
     ) -> impl Stream<Item = Result<RasterTile2D<T>>> + use<S, T> {
+     //  impl Stream<Item = Result<RasterTile2D<T>>> + use<S, T> 
         let spatial_bounds = query.spatial_bounds;
 
         let (mut child, sx, rx) = spawn_ipc_server_process_bytes::<JsonPayload>();
 
         let sender = Arc::new(sx);
-        let receiver = Arc::new(rx);
+        let receiver = Arc::new(Mutex::new(rx));
 
         let value = sender.clone(); // ???
         let res = loading_info_stream
@@ -1143,29 +1146,12 @@ where
 
         let source_stream = stream::iter(skipping_loading_info);
 
-        let source_stream = {
-            // here
-            #[cfg(feature = "gdalsource-default")]
-            {
-                GdalRasterLoader::loading_info_to_tile_stream(
-                    source_stream,
-                    &query,
-                    tiling_strategy,
-                )
-            }
-            #[cfg(feature = "gdalsource-process")]
-            {
-                GdalRasterLoader::loading_info_to_tile_stream_process(
-                    source_stream,
-                    &query,
-                    tiling_strategy,
-                )
-            }
-        };
+        let loaded_source_stream =
+            load_source_stream::<P, _>(source_stream, &query, tiling_strategy);
 
         // use SparseTilesFillAdapter to fill all the gaps
         let filled_stream = SparseTilesFillAdapter::new(
-            source_stream,
+            loaded_source_stream,
             tiling_strategy.tile_grid_box(query.spatial_partition()),
             query.attributes.count(),
             tiling_strategy.geo_transform,
@@ -1187,6 +1173,35 @@ pub type GdalSource = SourceOperator<GdalSourceParameters>;
 impl OperatorName for GdalSource {
     const TYPE_NAME: &'static str = "GdalSource";
 }
+
+#[cfg(all(feature = "gdalsource-default", not(feature = "gdalsource-process")))]
+fn load_source_stream<P, S>(
+    source_stream: S,
+    query: &RasterQueryRectangle,
+    tiling_strategy: TilingStrategy,
+) -> impl Stream<Item = Result<RasterTile2D<P>>> + use<P, S>
+where
+    P: Pixel + GdalType + FromPrimitive,
+    S: Stream<Item = Result<GdalLoadingInfoTemporalSlice>>,
+{
+    GdalRasterLoader::loading_info_to_tile_stream::<P, _>(source_stream, query, tiling_strategy)
+}
+
+#[cfg(feature = "gdalsource-process")]
+fn load_source_stream<P, S>(
+    source_stream: S,
+    query: &RasterQueryRectangle,
+    tiling_strategy: TilingStrategy,
+) -> impl Stream<Item = Result<RasterTile2D<P>>> + use<P, S>
+where
+    P: Pixel + GdalType + FromPrimitive,
+    S: Stream<Item = Result<GdalLoadingInfoTemporalSlice>>,
+{
+    GdalRasterLoader::loading_info_to_tile_stream_process(source_stream, query, tiling_strategy)
+}
+
+#[cfg(not(any(feature = "gdalsource-default", feature = "gdalsource-process")))]
+compile_error!("Enable one of gdalsource-default or gdalsource-process.");
 
 #[typetag::serde]
 #[async_trait]
@@ -1905,6 +1920,8 @@ mod tests {
         sender: IpcSender<JsonPayload>,
         receiver: IpcBytesReceiver,
     ) -> Result<RasterTile2D<u8>> {
+        let receiver = Arc::new(Mutex::new(receiver));
+        let sender = Arc::new(sender);
         GdalRasterLoader::load_tile_data_process::<u8>(
             GdalDatasetParameters {
                 file_path: test_data!("raster/modis_ndvi/MOD13A2_M_NDVI_2014-01-01.TIFF").into(),
@@ -1950,8 +1967,8 @@ mod tests {
             TileInformation::with_partition_and_shape(output_bounds, output_shape),
             TimeInterval::default(),
             CacheHint::default(),
-            &Arc::new(sender),
-            &Arc::new(receiver),
+            &sender,
+            &receiver,
         )
     }
 

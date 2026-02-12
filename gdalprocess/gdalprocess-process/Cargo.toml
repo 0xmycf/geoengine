@@ -1,0 +1,24 @@
+[package]
+name = "gdalprocess-process"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+publish.workspace = true
+license-file.workspace = true
+documentation.workspace = true
+repository.workspace = true
+
+[[bench]]
+name = "gdal_source_operator_bench"
+harness = false
+
+[dependencies]
+geoengine-operators = { path = "../../operators", default-features = false, features = ["gdalsource-process"] }
+geoengine-datatypes = { path = "../../datatypes" }
+criterion = { workspace = true }
+rand = { workspace = true, features = ["small_rng"] }
+futures = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

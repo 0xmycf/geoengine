@@ -4,8 +4,8 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use geoengine_datatypes::{
     primitives::{CacheHint, SpatialPartition2D, TimeInterval},
     raster::{
-        GridShape2D, RasterPropertiesEntryType, RasterPropertiesKey, RasterTile2D, TileInformation,
-        arrow_ipc_file_to_raster_tile_2d,
+        GridShape2D, GridSize, RasterPropertiesEntryType, RasterPropertiesKey, RasterTile2D,
+        TileInformation, arrow_ipc_file_to_raster_tile_2d,
     },
     test_data,
 };
@@ -107,8 +107,8 @@ fn random_output_bounds(
 
     let max_start_x = params.width - tile_x;
     let max_start_y = params.height - tile_y;
-    let start_x = rng.gen_range(0..=max_start_x);
-    let start_y = rng.gen_range(0..=max_start_y);
+    let start_x = rng.random_range(0..=max_start_x);
+    let start_y = rng.random_range(0..=max_start_y);
 
     let geo_transform = params.geo_transform;
     let origin = geo_transform.origin_coordinate;
@@ -198,6 +198,7 @@ fn standard_reading(c: &mut Criterion) {
         b.to_async(&runtime).iter(|| {
             let output_bounds = bounds[bounds_idx.get()];
             bounds_idx.set((bounds_idx.get() + 1) % bounds.len());
+            let params = params.clone();
             async move {
                 let (dataset_params, tile_information, tile_time, cache_hint) =
                     make_stuff_for_other_benchmark(&params, output_shape, output_bounds);

@@ -22,8 +22,12 @@ path = "bin/gdalsource_process_main.rs"
 [[bench]]
 name = "gdal_source_process_bench"
 harness = false
+
+[[bench]]
+name = "gdal_source_operator_bench"
+harness = false
  
- ######################################################################################
+######################################################################################
 
 # copied from operators ( then modified )
 # TODO go over those and remove what we dont need
@@ -107,4 +111,3 @@ rand = { workspace = true, features = ["small_rng"] }
 
 [lints]
 workspace = true
-

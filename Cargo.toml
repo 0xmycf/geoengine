@@ -1,5 +1,13 @@
 [workspace]
-members = ["datatypes", "expression", "gdalprocess", "macros", "operators", "services"]
+members = [
+    "datatypes",
+    "expression",
+    "gdalprocess",
+    "gdalprocess/gdalprocess-process",
+    "macros",
+    "operators",
+    "services",
+]
 exclude = [
     "expression/deps-workspace", # Buggy, cf. https://github.com/rust-lang/cargo/issues/6745
     ".scripts",
