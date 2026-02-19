@@ -6,7 +6,6 @@ use crate::{
     primitives::error::{self},
     util::Result,
 };
-use bincode;
 use postgres_types::{FromSql, ToSql};
 use serde::{Deserialize, Deserializer, Serialize};
 use snafu::ensure;
@@ -18,20 +17,7 @@ use std::{
     str::FromStr,
 };
 
-#[derive(
-    Clone,
-    Copy,
-    Serialize,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Debug,
-    FromSql,
-    ToSql,
-    bincode::Encode,
-    bincode::Decode,
-)]
+#[derive(Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord, Debug, FromSql, ToSql, Hash)]
 #[repr(C)]
 #[postgres(transparent)]
 pub struct TimeInstance(i64);

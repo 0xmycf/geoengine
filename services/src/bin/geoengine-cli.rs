@@ -1,7 +1,8 @@
 use clap::{Parser, Subcommand};
 use geoengine_services::cli::{
-    CheckSuccessfulStartup, Heartbeat, OpenAPIGenerate, check_heartbeat, check_successful_startup,
-    output_openapi_json,
+    CheckSuccessfulStartup, ExpressionToolchainFile, Heartbeat, OpenAPIGenerate, TileImport,
+    check_heartbeat, check_successful_startup, output_openapi_json, output_toolchain_file,
+    tile_import,
 };
 
 /// CLI for Geo Engine Utilities
@@ -23,6 +24,12 @@ enum Commands {
     /// Outputs OpenAPI JSON
     #[command(name = "openapi")]
     OpenAPI(OpenAPIGenerate),
+
+    // Imports a tiled dataset
+    TileImport(TileImport),
+    /// Generates an rustup toolchain file for compiling expressions
+    /// and outputs it to STDOUT
+    ExpressionToolchainFile(ExpressionToolchainFile),
 }
 
 impl Commands {
@@ -31,6 +38,8 @@ impl Commands {
             Commands::CheckSuccessfulStartup(params) => check_successful_startup(params).await,
             Commands::Heartbeat(params) => check_heartbeat(params).await,
             Commands::OpenAPI(params) => output_openapi_json(params).await,
+            Commands::TileImport(params) => tile_import(params).await,
+            Commands::ExpressionToolchainFile(params) => output_toolchain_file(params).await,
         }
     }
 }

@@ -1,5 +1,6 @@
 mod csv;
-pub mod gdal_source; // TOOD (high): make this private again after this hacking thing is done 
+pub mod gdal_source; // TOOD (high): make this private again after this hacking thing is done
+mod multi_band_gdal_source;
 mod ogr_source;
 
 pub use self::csv::{
@@ -11,6 +12,11 @@ pub use self::gdal_source::{
     GdalMetaDataRegular, GdalMetaDataStatic, GdalMetadataMapping, GdalMetadataNetCdfCf,
     GdalRetryOptions, GdalSource, GdalSourceError, GdalSourceParameters, GdalSourceProcessor,
     GdalSourceTimePlaceholder, TimeReference,
+};
+pub use self::multi_band_gdal_source::{
+    GdalMultiBand, GdalSourceError as MultiBandGdalSourceError,
+    GdalSourceParameters as MultiBandGdalSourceParameters, MultiBandGdalLoadingInfo,
+    MultiBandGdalLoadingInfoQueryRectangle, MultiBandGdalSource, TileFile,
 };
 pub use self::ogr_source::{
     AttributeFilter, CsvHeader, FormatSpecifics, OgrSource, OgrSourceColumnSpec, OgrSourceDataset,

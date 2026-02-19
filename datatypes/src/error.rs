@@ -1,6 +1,6 @@
 use crate::{
     collections::FeatureCollectionError,
-    primitives::{BoundingBox2D, Coordinate2D, DateTimeError, PrimitivesError, TimeInstance, TimeInterval},
+    primitives::{BoundingBox2D, Coordinate2D, PrimitivesError, TimeInstance, TimeInterval},
     raster::RasterDataType,
     spatial_reference::SpatialReference,
 };
@@ -102,6 +102,11 @@ pub enum Error {
     TimeIntervalUnmatchedIntervals {
         i1: TimeInterval,
         i2: TimeInterval,
+    },
+
+    #[snafu(display("Time step must be greater than zero, got: {}", step))]
+    TimeStepStepMustBeGreaterThanZero {
+        step: u32,
     },
 
     #[snafu(display(
@@ -294,7 +299,7 @@ pub enum Error {
     WrongMetadataType,
 
     #[snafu(display(
-        "The conditions ul.x < lr.x && ul.y < lr.y are not met by ul:{} lr:{}",
+        "The conditions ul.x < lr.x && ul.y > lr.y are not met by ul:{} lr:{}",
         upper_left_coordinate,
         lower_right_coordinate
     ))]
@@ -345,6 +350,8 @@ pub enum Error {
     DuplicateBandInQueryBandSelection,
     QueryBandSelectionMustNotBeEmpty,
 
+    TilingGeoTransformOriginCoordinateMismatch,
+    TilingGeoTransformResolutionMissmatch,
     #[snafu(display("Invalid number of suffixes, expected {} found {}", expected, found))]
     InvalidNumberOfSuffixes {
         expected: usize,
@@ -364,6 +371,11 @@ pub enum Error {
         found: usize,
     },
 
+    NoIntersectionWithTargetProjection {
+        srs_in: SpatialReference,
+        srs_out: SpatialReference,
+        bounds: BoundingBox2D,
+    },
 }
 
 impl From<arrow::error::ArrowError> for Error {
