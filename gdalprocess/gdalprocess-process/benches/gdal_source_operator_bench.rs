@@ -3,31 +3,28 @@ use std::cell::Cell;
 use criterion::{Criterion, criterion_group, criterion_main};
 use futures::StreamExt;
 use geoengine_datatypes::{
-    primitives::{
-        AxisAlignedRectangle, BandSelection, RasterQueryRectangle, SpatialPartition2D,
-        SpatialResolution, TimeInterval,
-    },
-    raster::{GridShape2D, GridSize},
+    primitives::{BandSelection, RasterQueryRectangle, TimeInterval},
+    raster::{GridBoundingBox2D, GridShape2D, GridSize},
 };
-use rand::{Rng, SeedableRng};
 use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use rayon::ThreadPoolBuilder;
 
 use geoengine_datatypes::util::test::TestDefault;
 use geoengine_operators::{
     engine::{
-        MockExecutionContext, MockQueryContext, RasterOperator, RasterQueryProcessor,
+        MockExecutionContext, RasterOperator, RasterQueryProcessor,
         WorkflowOperatorPath,
     },
     source::{GdalDatasetParameters, GdalSource, GdalSourceParameters},
     util::gdal::create_ndvi_meta_data,
 };
 
-fn random_output_bounds(
+fn random_grid_bounds(
     output_shape: GridShape2D,
     params: &GdalDatasetParameters,
     rng: &mut impl Rng,
-) -> SpatialPartition2D {
+) -> GridBoundingBox2D {
     let tile_x = output_shape.axis_size_x();
     let tile_y = output_shape.axis_size_y();
 
@@ -36,20 +33,13 @@ fn random_output_bounds(
     let start_x = rng.random_range(0..=max_start_x);
     let start_y = rng.random_range(0..=max_start_y);
 
-    let geo_transform = params.geo_transform;
-    let origin = geo_transform.origin_coordinate;
-    let x_pixel = geo_transform.x_pixel_size;
-    let y_pixel = geo_transform.y_pixel_size;
-
-    let x0 = origin.x + x_pixel * start_x as f64;
-    let y0 = origin.y + y_pixel * start_y as f64;
-    let x1 = x0 + x_pixel * tile_x as f64;
-    let y1 = y0 + y_pixel * tile_y as f64;
-
-    let (left_x, right_x) = if x0 <= x1 { (x0, x1) } else { (x1, x0) };
-    let (upper_y, lower_y) = if y0 >= y1 { (y0, y1) } else { (y1, y0) };
-
-    SpatialPartition2D::new_unchecked((left_x, upper_y).into(), (right_x, lower_y).into())
+    GridBoundingBox2D::new_unchecked(
+        [start_y as isize, start_x as isize],
+        [
+            (start_y + tile_y - 1) as isize,
+            (start_x + tile_x - 1) as isize,
+        ],
+    )
 }
 
 fn make_query_rectangles(
@@ -62,18 +52,8 @@ fn make_query_rectangles(
     let mut rng = SmallRng::seed_from_u64(seed);
     (0..count)
         .map(|_| {
-            let output_bounds = random_output_bounds(output_shape, params, &mut rng);
-            let spatial_resolution = SpatialResolution::new_unchecked(
-                output_bounds.size_x() / output_shape.axis_size_x() as f64,
-                output_bounds.size_y() / output_shape.axis_size_y() as f64,
-            );
-
-            RasterQueryRectangle {
-                spatial_bounds: output_bounds,
-                time_interval,
-                spatial_resolution,
-                attributes: BandSelection::first(),
-            }
+            let grid_bounds = random_grid_bounds(output_shape, params, &mut rng);
+            RasterQueryRectangle::new(grid_bounds, time_interval, BandSelection::first())
         })
         .collect()
 }
@@ -87,14 +67,17 @@ fn bench_with_shape(c: &mut Criterion, bench_name: &str, output_shape: GridShape
     let query_idx = Cell::new(0);
 
     let mut exe_ctx = MockExecutionContext::test_default();
-    let query_ctx = MockQueryContext::test_default();
+    let query_ctx = exe_ctx.mock_query_context(TestDefault::test_default());
 
     let ndvi_id = geoengine_operators::util::gdal::add_ndvi_dataset(&mut exe_ctx);
 
     let runtime = tokio::runtime::Runtime::new().expect("runtime creation should work");
     let processor = runtime.block_on(async {
         let op = GdalSource {
-            params: GdalSourceParameters { data: ndvi_id.clone() },
+            params: GdalSourceParameters {
+                data: ndvi_id.clone(),
+                overview_level: None,
+            },
         }
         .boxed();
 

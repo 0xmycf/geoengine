@@ -1091,6 +1091,7 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
+            process_data: None
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1144,6 +1145,7 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
+            process_data: None,
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1192,6 +1194,7 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
+            process_data: None,
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1245,6 +1248,7 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
+            process_data: None,
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1300,6 +1304,8 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
+            process_data: None,
+
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1355,6 +1361,7 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
+            process_data: None,
         };
 
         let mut bytes = raster_stream_to_geotiff_bytes(
@@ -1430,6 +1437,7 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
+            process_data:None
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1473,6 +1481,7 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
+            process_data:None
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1526,6 +1535,7 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
+            process_data: None
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1747,6 +1757,7 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
+            process_data: None
         };
 
         let (mut bytes, _) = raster_stream_to_multiband_geotiff_bytes(

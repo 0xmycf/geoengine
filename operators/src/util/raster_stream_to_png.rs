@@ -383,6 +383,7 @@ mod tests {
             meta_data: Box::new(meta_data),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
+            process_data: None
         };
 
         let query = RasterQueryRectangle::new(

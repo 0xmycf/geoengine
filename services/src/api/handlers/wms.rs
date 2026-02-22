@@ -111,15 +111,15 @@ impl IntoParams for WmsQueryParams {
     responses(
         (status = 200, description = "OK", content_type = "text/xml", body = String,
             // TODO: add example when utoipa supports more than just json examples
-            // example = r#"<WMS_Capabilities 
-            // xmlns="http://www.opengis.net/wms" 
-            // xmlns:sld="http://www.opengis.net/sld" 
-            // xmlns:xlink="http://www.w3.org/1999/xlink" 
+            // example = r#"<WMS_Capabilities
+            // xmlns="http://www.opengis.net/wms"
+            // xmlns:sld="http://www.opengis.net/sld"
+            // xmlns:xlink="http://www.w3.org/1999/xlink"
             // xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.3.0" xsi:schemaLocation="http://www.opengis.net/wms http://schemas.opengis.net/wms/1.3.0/capabilities_1_3_0.xsd http://www.opengis.net/sld http://schemas.opengis.net/sld/1.1.0/sld_capabilities.xsd">
             // <Service>
             //   <Name>WMS</Name>
             //   <Title>Geo Engine WMS</Title>
-            //   <OnlineResource 
+            //   <OnlineResource
             //     xmlns:xlink="http://www.w3.org/1999/xlink" xlink:href="http://127.0.0.1:3030/api/wms/b709b27b-dea5-5a27-a074-ae3366c49498"/>
             //   </Service>
             //   <Capability>
@@ -702,6 +702,7 @@ mod tests {
             meta_data: Box::new(meta_data),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
+            process_data: None,
         };
 
         let (image_bytes, _) = raster_stream_to_png_bytes(

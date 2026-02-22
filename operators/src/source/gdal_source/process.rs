@@ -6,7 +6,7 @@ use geoengine_datatypes::{
 };
 use ipc_channel::ipc::{self, IpcBytesReceiver, IpcBytesSender, IpcReceiver, IpcSender};
 
-use crate::source::GdalDatasetParameters;
+use crate::source::{GdalDatasetParameters, gdal_source::reader::GdalReadAdvise};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct JsonPayload(String);
@@ -24,15 +24,25 @@ impl JsonPayload {
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq)]
+pub struct IpcChannelMessagePayload {
+    pub cache_hint: CacheHint,
+    pub dataset_params: GdalDatasetParameters,
+    pub tile_information: TileInformation,
+    pub tile_time: TimeInterval,
+    pub read_advise: GdalReadAdvise,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq)]
 pub enum IpcChannelMessage {
-    RequestTileData {
-        cache_hint: CacheHint, // TODO does it even need this?
-        dataset_params: GdalDatasetParameters,
-        tile_information: TileInformation,
-        tile_time: TimeInterval,
-    },
-    EndConnection, // Till death does them part
-                   // Data(Vec<u8>), // this can go, as the answer is send via byteschannel
+    // TODO (high): make sure we send the right data over
+    RequestTileData(Box<IpcChannelMessagePayload>),
+    EndConnection,
+}
+
+impl IpcChannelMessage {
+    pub fn new_request_tile_message(data: IpcChannelMessagePayload) -> Self {
+        Self::RequestTileData(Box::new(data))
+    }
 }
 
 pub fn spawn_ipc_server_process_bytes<S>() -> (Child, IpcSender<S>, IpcBytesReceiver) {

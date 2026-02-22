@@ -7,7 +7,7 @@ use crate::{
     util::Result,
 };
 use postgres_types::{FromSql, ToSql};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use snafu::ensure;
 use std::ops::AddAssign;
 use std::{
@@ -107,14 +107,6 @@ impl TimeInstance {
     pub const MAX: Self = TimeInstance::from_millis_unchecked(8_210_266_876_799_999);
 
     pub const EPOCH_START: Self = TimeInstance::from_millis_unchecked(0);
-}
-
-pub fn deserialize_time_interval<'de, D>(deserializer: D) -> Result<TimeInstance, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s: &str = Deserialize::deserialize(deserializer).map_err(serde::de::Error::custom)?;
-    TimeInstance::deserialize(s).map_err(serde::de::Error::custom)
 }
 
 impl std::fmt::Display for TimeInstance {

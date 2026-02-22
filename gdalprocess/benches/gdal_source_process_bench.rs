@@ -2,22 +2,26 @@ use std::{cell::Cell, rc::Rc};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use geoengine_datatypes::{
-    primitives::{CacheHint, SpatialPartition2D, TimeInterval},
+    primitives::{AxisAlignedRectangle, CacheHint, SpatialPartition2D, TimeInterval},
     raster::{
-        GridShape2D, GridSize, RasterPropertiesEntryType, RasterPropertiesKey, RasterTile2D,
-        TileInformation, arrow_ipc_file_to_raster_tile_2d,
+        GeoTransform, GridIdx, GridIdx2D, GridShape2D, GridSize, RasterPropertiesEntryType,
+        RasterPropertiesKey, RasterTile2D, TileInformation,
+        arrow_ipc_file_to_raster_tile_2d,
     },
     test_data,
 };
 use geoengine_operators::source::{
     FileNotFoundHandling, GdalDatasetGeoTransform, GdalDatasetParameters, GdalMetadataMapping,
     gdal_source::{
-        load_tile_async,
-        process::{IpcChannelMessage, JsonPayload, spawn_ipc_server_process_bytes},
+        GdalReadAdvise, ReaderState, load_tile_async,
+        process::{
+            IpcChannelMessage, IpcChannelMessagePayload, JsonPayload,
+            spawn_ipc_server_process_bytes,
+        },
     },
 };
-use rand::{Rng, SeedableRng};
 use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 
 fn get_params() -> GdalDatasetParameters {
     GdalDatasetParameters {
@@ -63,21 +67,46 @@ fn get_params() -> GdalDatasetParameters {
     }
 }
 
+fn tile_info_from_bounds(
+    params: &GdalDatasetParameters,
+    output_shape: GridShape2D,
+    output_bounds: SpatialPartition2D,
+) -> TileInformation {
+    let geo_transform = GeoTransform::new(
+        params.geo_transform.origin_coordinate,
+        params.geo_transform.x_pixel_size,
+        params.geo_transform.y_pixel_size,
+    );
+    let upper_left_pixel = geo_transform.coordinate_to_grid_idx_2d(output_bounds.upper_left());
+    let [tile_size_y, tile_size_x] = output_shape.axis_size();
+    let GridIdx([pix_y, pix_x]) = upper_left_pixel;
+    let tile_position: GridIdx2D =
+        [pix_y / tile_size_y as isize, pix_x / tile_size_x as isize].into();
+    TileInformation::new(tile_position, output_shape, geo_transform)
+}
+
+fn read_advise_from_bounds(
+    params: &GdalDatasetParameters,
+    output_shape: GridShape2D,
+    output_bounds: SpatialPartition2D,
+) -> Option<GdalReadAdvise> {
+    let tile_info = tile_info_from_bounds(params, output_shape, output_bounds);
+    let ds_spatial_grid = params.spatial_grid_definition();
+    let tile_spatial_grid = tile_info.spatial_grid_definition();
+    let reader_state = ReaderState {
+        dataset_spatial_grid: ds_spatial_grid,
+    };
+    reader_state.tiling_to_dataset_read_advise(&ds_spatial_grid, &tile_spatial_grid)
+}
+
 fn make_stuff_for_other_benchmark(
     params: &GdalDatasetParameters,
     output_shape: GridShape2D,
     output_bounds: SpatialPartition2D,
-) -> (
-    GdalDatasetParameters,
-    TileInformation,
-    TimeInterval,
-    CacheHint,
-) {
-    let tile_info = TileInformation::with_partition_and_shape(output_bounds, output_shape);
-    let time_interval = TimeInterval::default();
-    let cache_hint = CacheHint::default();
-
-    (params.clone(), tile_info, time_interval, cache_hint)
+) -> (GdalDatasetParameters, GdalReadAdvise) {
+    let read_advise = read_advise_from_bounds(params, output_shape, output_bounds)
+        .expect("tile should intersect dataset");
+    (params.clone(), read_advise)
 }
 
 fn make_request(
@@ -85,15 +114,18 @@ fn make_request(
     output_shape: GridShape2D,
     output_bounds: SpatialPartition2D,
 ) -> IpcChannelMessage {
-    let tile_info = TileInformation::with_partition_and_shape(output_bounds, output_shape);
+    let tile_info = tile_info_from_bounds(params, output_shape, output_bounds);
+    let read_advise = read_advise_from_bounds(params, output_shape, output_bounds)
+        .expect("tile should intersect dataset");
     let time_interval = TimeInterval::default();
     let cache_hint = CacheHint::default();
-    IpcChannelMessage::RequestTileData {
+    IpcChannelMessage::new_request_tile_message(IpcChannelMessagePayload {
         cache_hint,
         dataset_params: params.clone(),
         tile_information: tile_info,
         tile_time: time_interval,
-    }
+        read_advise,
+    })
 }
 
 fn random_output_bounds(
@@ -200,11 +232,9 @@ fn standard_reading(c: &mut Criterion) {
             bounds_idx.set((bounds_idx.get() + 1) % bounds.len());
             let params = params.clone();
             async move {
-                let (dataset_params, tile_information, tile_time, cache_hint) =
+                let (dataset_params, read_advise) =
                     make_stuff_for_other_benchmark(&params, output_shape, output_bounds);
-                let tile =
-                    load_tile_async::<u8>(dataset_params, tile_information, tile_time, cache_hint)
-                        .await;
+                let tile = load_tile_async::<u8>(dataset_params, read_advise).await;
                 std::hint::black_box(tile)
             }
         });

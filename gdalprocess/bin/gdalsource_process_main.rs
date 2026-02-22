@@ -1,7 +1,7 @@
-use geoengine_datatypes::raster::{RasterTile2D, raster_tile_2d_to_arrow_ipc_file_for_ipc_channel};
+use geoengine_datatypes::raster::{raster_tile_2d_to_arrow_ipc_file_for_ipc_channel};
 use geoengine_operators::source::gdal_source::{
-    self, GdalDatasetCache,
-    process::{IpcChannelMessage, JsonPayload, setup_client_for_bytes},
+    self, GdalDatasetCache, GridAndProperties,
+    process::{IpcChannelMessage, IpcChannelMessagePayload, JsonPayload, setup_client_for_bytes},
 };
 use ipc_channel::ipc::IpcError;
 use std::sync::Arc;
@@ -17,6 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[allow(unused)]
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let token = setup();
     dbg!(token.clone());
@@ -38,24 +39,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         })?;
 
         match message {
-            IpcChannelMessage::RequestTileData {
-                dataset_params,
-                tile_information,
-                tile_time,
-                cache_hint,
-            } => {
-                // dbg!("Received request for tile data");
-                // TODO: make more general for the other pixel types... how (Phantom Data?)?
-                // dbg!(tile_time);
-                let tile: RasterTile2D<u8> = gdal_source::load_tile_data_cached_async(
-                    Arc::clone(&dataset_cache),
+            IpcChannelMessage::RequestTileData(b) => {
+                let IpcChannelMessagePayload {
                     dataset_params,
                     tile_information,
                     tile_time,
                     cache_hint,
+                    read_advise,
+                } = *b;
+                // dbg!("Received request for tile data");
+                // TODO: make more general for the other pixel types... how (Phantom Data?)?
+                // dbg!(tile_time);
+                let tile: Option<GridAndProperties<u8>> = gdal_source::load_tile_data_cached_async(
+                    Arc::clone(&dataset_cache),
+                    &dataset_params,
+                    read_advise,
                 )
                 .await?;
-                let ipc_data = raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(tile)?;
+                if let None = tile {
+                    // TODO (high) make this fault tolerant
+                    panic!("tile is none => something went wrong");
+                }
+                let ipc_data = raster_tile_2d_to_arrow_ipc_file_for_ipc_channel::<u8>(todo!("wip")/*tile.unwrap().grid*/)?;
 
                 sender.send(&ipc_data)?;
                 // dbg!("Sent tile data to client");

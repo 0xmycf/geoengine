@@ -26,7 +26,7 @@ harness = false
 [[bench]]
 name = "gdal_source_operator_bench"
 harness = false
- 
+
 ######################################################################################
 
 # copied from operators ( then modified )
@@ -34,10 +34,10 @@ harness = false
 [dependencies]
 
 geoengine-operators = { path = "../operators" }
-# geoengine-operators-new = { 
+# geoengine-operators-new = {
 #    path = "../operators",
 #    package = "geoengine-operators" ,
-#    features = ["gdalsource-process"] 
+#    features = ["gdalsource-process"]
 # }
 
 arrow = { workspace = true }
@@ -46,11 +46,6 @@ arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
 
 bincode = { version = "2.0.1", features = ["derive", "serde"] }
-
-prost = { version = "0.14" }
-prost-types = { version = "0.14" }
-tonic = { version = "0.14" }
-tonic-prost = { version = "0.14" }
 
 ipc-channel = { workspace = true }
 criterion = { workspace = true }
@@ -96,11 +91,7 @@ typetag = { workspace = true }
 uuid = { workspace = true }
 strum = { workspace = true }
 
-[build-dependencies]
-tonic-prost-build = "*" # TODO (low): fix version
-
 [dev-dependencies]
-
 async-stream = { workspace = true }
 
 approx = { workspace = true }

@@ -100,8 +100,7 @@ nix = { version = "0.30", features = ["socket"] }
 assert_cmd = { workspace = true }
 httptest = { workspace = true }
 pretty_assertions = { workspace = true }
-# prost = { workspace = true }             # must be compatbile with aruna-rust-api
-prost = { version = "0.11" }             # must be compatbile with aruna-rust-api
+prost = { workspace = true }             # must be compatbile with aruna-rust-api
 serial_test = { workspace = true }
 xml = { workspace = true }
 
