@@ -1,4 +1,4 @@
-use geoengine_datatypes::raster::{raster_tile_2d_to_arrow_ipc_file_for_ipc_channel};
+use geoengine_datatypes::raster::{RasterTile2D, raster_tile_2d_to_arrow_ipc_file_for_ipc_channel};
 use geoengine_operators::source::gdal_source::{
     self, GdalDatasetCache, GridAndProperties,
     process::{IpcChannelMessage, IpcChannelMessagePayload, JsonPayload, setup_client_for_bytes},
@@ -17,7 +17,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[allow(unused)]
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let token = setup();
     dbg!(token.clone());

@@ -8,6 +8,11 @@ license-file.workspace = true
 documentation.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "gdalsource-process"
+path = "src/bin/gdalsource_process_main.rs"
+required-features = ["gdalsource-process"]
+
 [features]
 default = ["gdalsource-default"]
 
@@ -63,6 +68,7 @@ strum = { workspace = true }
 [dev-dependencies]
 async-stream = { workspace = true }
 approx = { workspace = true }
+criterion = { workspace = true }
 geo-rand = { workspace = true }
 httptest = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["json"] }
@@ -95,6 +101,14 @@ harness = false
 [[bench]]
 name = "query_chunks"
 harness = false
+
+[[bench]]
+name = "gdal_source_operator_bench"
+harness = false
+required-features = ["gdalsource-default"]
+
+# the bench for the gdalsource-process feature is located
+# in a sub-crate: <roo>/operators/gdalsource_process_bench/benches
 
 [lints]
 workspace = true

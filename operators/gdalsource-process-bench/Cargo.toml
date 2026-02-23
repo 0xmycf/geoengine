@@ -1,5 +1,5 @@
 [package]
-name = "gdalprocess-process"
+name = "gdalsource-process-bench"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -13,7 +13,7 @@ name = "gdal_source_operator_bench"
 harness = false
 
 [dependencies]
-geoengine-operators = { path = "../../operators", default-features = false, features = ["gdalsource-process"] }
+geoengine-operators = { path = "..", default-features = false, features = ["gdalsource-process"] }
 geoengine-datatypes = { path = "../../datatypes" }
 criterion = { workspace = true }
 rand = { workspace = true, features = ["small_rng"] }

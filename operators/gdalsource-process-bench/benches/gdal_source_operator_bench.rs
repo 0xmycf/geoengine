@@ -13,7 +13,7 @@ use rayon::ThreadPoolBuilder;
 use geoengine_datatypes::util::test::TestDefault;
 use geoengine_operators::{
     engine::{
-        MockExecutionContext, RasterOperator, RasterQueryProcessor,
+        MockExecutionContext, MockQueryContext, RasterOperator, RasterQueryProcessor,
         WorkflowOperatorPath,
     },
     source::{GdalDatasetParameters, GdalSource, GdalSourceParameters},

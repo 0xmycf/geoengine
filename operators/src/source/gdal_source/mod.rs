@@ -579,7 +579,6 @@ impl GdalRasterLoader {
         }
     }
 
-    #[cfg(feature = "gdalsource-process")]
     async fn load_tile_async<T: Pixel + GdalType + FromPrimitive>(
         dataset_params: Option<GdalDatasetParameters>,
         reader_mode: GdalReaderMode,
@@ -737,7 +736,6 @@ impl GdalRasterLoader {
     ///
     /// A stream of futures producing `RasterTile2D` for a single slice in time
     ///
-    #[cfg(feature = "gdalsource-process")]
     fn temporal_slice_tile_future_stream<T: Pixel + GdalType + FromPrimitive>(
         spatial_query: GridBoundingBox2D,
         info: GdalLoadingInfoTemporalSlice,
@@ -763,6 +761,7 @@ impl GdalRasterLoader {
     /// A stream of futures producing `RasterTile2D` for a single slice in time
     /// Utilizing mutliple processes.
     ///
+    #[cfg(feature = "gdalsource-process")]
     fn temporal_slice_tile_future_stream_process<T: Pixel + GdalType + FromPrimitive>(
         spatial_bounds: GridBoundingBox2D,
         info: GdalLoadingInfoTemporalSlice,
@@ -818,7 +817,6 @@ impl GdalRasterLoader {
         res
     }
 
-    #[cfg(feature = "gdalsource-process")]
     fn loading_info_to_tile_stream<
         T: Pixel + GdalType + FromPrimitive,
         S: Stream<Item = Result<GdalLoadingInfoTemporalSlice>>,
@@ -1965,90 +1963,90 @@ mod tests {
 
     #[test] // does not work (the de-serialization of the nested time interval fails )
     fn test_sending_request_tile_data() {
-            use process::{IpcChannelMessage, IpcChannelMessagePayload};
+        use process::{IpcChannelMessage, IpcChannelMessagePayload};
 
-            let output_shape: GridShape2D = [8, 8].into();
-            let output_bounds =
-                SpatialPartition2D::new_unchecked((-180., 90.).into(), (180., -90.).into());
+        let output_shape: GridShape2D = [8, 8].into();
+        let output_bounds =
+            SpatialPartition2D::new_unchecked((-180., 90.).into(), (180., -90.).into());
 
-            let read_advise = GdalReadAdvise {
-                gdal_read_widow: GdalReadWindow::new([0, 0].into(), output_shape),
-                read_window_bounds: GridBoundingBox2D::new([0, 0], [7, 7]).unwrap(),
-                bounds_of_target: GridBoundingBox2D::new([0, 0], [7, 7]).unwrap(),
-                flip_y: false,
-            };
+        let read_advise = GdalReadAdvise {
+            gdal_read_widow: GdalReadWindow::new([0, 0].into(), output_shape),
+            read_window_bounds: GridBoundingBox2D::new([0, 0], [7, 7]).unwrap(),
+            bounds_of_target: GridBoundingBox2D::new([0, 0], [7, 7]).unwrap(),
+            flip_y: false,
+        };
 
-            let payload = IpcChannelMessagePayload {
-                dataset_params: GdalDatasetParameters {
-                    file_path: test_data!("raster/modis_ndvi/MOD13A2_M_NDVI_2014-01-01.TIFF").into(),
-                    rasterband_channel: 1,
-                    geo_transform: GdalDatasetGeoTransform {
-                        origin_coordinate: (-180., 90.).into(),
-                        x_pixel_size: 0.1,
-                        y_pixel_size: -0.1,
-                    },
-                    width: 3600,
-                    height: 1800,
-                    file_not_found_handling: FileNotFoundHandling::NoData,
-                    no_data_value: Some(0.),
-                    properties_mapping: Some(vec![
-                        GdalMetadataMapping {
-                            source_key: RasterPropertiesKey {
-                                domain: None,
-                                key: "AREA_OR_POINT".to_string(),
-                            },
-                            target_type: RasterPropertiesEntryType::String,
-                            target_key: RasterPropertiesKey {
-                                domain: None,
-                                key: "AREA_OR_POINT".to_string(),
-                            },
-                        },
-                        GdalMetadataMapping {
-                            source_key: RasterPropertiesKey {
-                                domain: Some("IMAGE_STRUCTURE".to_string()),
-                                key: "COMPRESSION".to_string(),
-                            },
-                            target_type: RasterPropertiesEntryType::String,
-                            target_key: RasterPropertiesKey {
-                                domain: Some("IMAGE_STRUCTURE_INFO".to_string()),
-                                key: "COMPRESSION".to_string(),
-                            },
-                        },
-                    ]),
-                    gdal_open_options: None,
-                    gdal_config_options: None,
-                    allow_alphaband_as_mask: true,
-                    retry: None,
+        let payload = IpcChannelMessagePayload {
+            dataset_params: GdalDatasetParameters {
+                file_path: test_data!("raster/modis_ndvi/MOD13A2_M_NDVI_2014-01-01.TIFF").into(),
+                rasterband_channel: 1,
+                geo_transform: GdalDatasetGeoTransform {
+                    origin_coordinate: (-180., 90.).into(),
+                    x_pixel_size: 0.1,
+                    y_pixel_size: -0.1,
                 },
-                tile_information: tile_information_with_partition_and_shape(
-                    output_bounds,
-                    output_shape,
-                ),
-                tile_time: TimeInterval::default(),
-                cache_hint: CacheHint::default(),
-                read_advise,
-            };
+                width: 3600,
+                height: 1800,
+                file_not_found_handling: FileNotFoundHandling::NoData,
+                no_data_value: Some(0.),
+                properties_mapping: Some(vec![
+                    GdalMetadataMapping {
+                        source_key: RasterPropertiesKey {
+                            domain: None,
+                            key: "AREA_OR_POINT".to_string(),
+                        },
+                        target_type: RasterPropertiesEntryType::String,
+                        target_key: RasterPropertiesKey {
+                            domain: None,
+                            key: "AREA_OR_POINT".to_string(),
+                        },
+                    },
+                    GdalMetadataMapping {
+                        source_key: RasterPropertiesKey {
+                            domain: Some("IMAGE_STRUCTURE".to_string()),
+                            key: "COMPRESSION".to_string(),
+                        },
+                        target_type: RasterPropertiesEntryType::String,
+                        target_key: RasterPropertiesKey {
+                            domain: Some("IMAGE_STRUCTURE_INFO".to_string()),
+                            key: "COMPRESSION".to_string(),
+                        },
+                    },
+                ]),
+                gdal_open_options: None,
+                gdal_config_options: None,
+                allow_alphaband_as_mask: true,
+                retry: None,
+            },
+            tile_information: tile_information_with_partition_and_shape(
+                output_bounds,
+                output_shape,
+            ),
+            tile_time: TimeInterval::default(),
+            cache_hint: CacheHint::default(),
+            read_advise,
+        };
 
-            let msg = IpcChannelMessage::new_request_tile_message(payload);
+        let msg = IpcChannelMessage::new_request_tile_message(payload);
 
-            let (sender, receiver) = ipc_channel::ipc::channel().unwrap();
+        let (sender, receiver) = ipc_channel::ipc::channel().unwrap();
 
-            sender.send(msg.clone()).unwrap();
-            let recv = receiver.recv().unwrap();
+        sender.send(msg.clone()).unwrap();
+        let recv = receiver.recv().unwrap();
 
-            match (msg.clone(), recv.clone()) {
-                (
-                    IpcChannelMessage::RequestTileData(msg_payload),
-                    IpcChannelMessage::RequestTileData(recv_payload),
-                ) => {
-                    assert_eq!(msg_payload.dataset_params, recv_payload.dataset_params);
-                    assert_eq!(msg_payload.tile_information, recv_payload.tile_information);
-                    assert_eq!(msg_payload.tile_time, recv_payload.tile_time);
-                    assert_eq!(msg_payload.read_advise, recv_payload.read_advise);
-                }
-                _ => panic!("Messages are not equal! {msg:?} != {recv:?}"),
+        match (msg.clone(), recv.clone()) {
+            (
+                IpcChannelMessage::RequestTileData(msg_payload),
+                IpcChannelMessage::RequestTileData(recv_payload),
+            ) => {
+                assert_eq!(msg_payload.dataset_params, recv_payload.dataset_params);
+                assert_eq!(msg_payload.tile_information, recv_payload.tile_information);
+                assert_eq!(msg_payload.tile_time, recv_payload.tile_time);
+                assert_eq!(msg_payload.read_advise, recv_payload.read_advise);
             }
+            _ => panic!("Messages are not equal! {msg:?} != {recv:?}"),
         }
+    }
 
     // TODO name / test
     fn load_ndvi_jan_2014_by_process(

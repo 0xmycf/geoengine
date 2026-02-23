@@ -2,10 +2,9 @@
 members = [
     "datatypes",
     "expression",
-    "gdalprocess",
-    "gdalprocess/gdalprocess-process",
     "macros",
     "operators",
+    "operators/gdalsource-process-bench",
     "services",
 ]
 exclude = [
