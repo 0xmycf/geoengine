@@ -3,12 +3,11 @@ use crate::engine::{
     SpatialGridDescriptor, WorkflowOperatorPath,
 };
 use crate::optimization::{OptimizableOperator, OptimizationError, SourcesMustNotUseOverviews};
-use crate::source::gdal_source::process::{
-    IpcChannelMessage, IpcChannelMessagePayload, JsonPayload,
-};
-
+use crate::source::gdal_source::process::ProcessManager;
 #[cfg(feature = "gdalsource-process")]
-use crate::source::gdal_source::process::spawn_ipc_server_process_bytes;
+use crate::source::gdal_source::process::{
+    IpcChannelMessage, IpcChannelMessagePayload, ProcessData,
+};
 
 use crate::util::TemporaryGdalThreadLocalConfigOptions;
 use crate::util::gdal::gdal_open_dataset_ex;
@@ -40,15 +39,17 @@ use geoengine_datatypes::primitives::{
     SpatialResolution, TimeInterval, TryIrregularTimeFillIterExt, TryRegularTimeFillIterExt,
     find_next_best_overview_level,
 };
+
+#[cfg(feature = "gdalsource-process")]
+use geoengine_datatypes::raster::arrow_ipc_file_to_raster_tile_2d;
 use geoengine_datatypes::raster::{
     ChangeGridBounds, EmptyGrid, GeoTransform, Grid, GridBlit, GridBoundingBox2D, GridOrEmpty,
     GridOrEmpty2D, GridShapeAccess, GridSize, MapElements, MaskedGrid, NoDataValueGrid, Pixel,
     RasterDataType, RasterProperties, RasterPropertiesEntry, RasterPropertiesEntryType,
     RasterPropertiesKey, RasterTile2D, SpatialGridDefinition, TileInformation, TilingSpecification,
-    TilingStrategy, arrow_ipc_file_to_raster_tile_2d,
+    TilingStrategy,
 };
 use geoengine_datatypes::util::test::TestDefault;
-use ipc_channel::ipc::{IpcBytesReceiver, IpcSender};
 use itertools::Itertools;
 pub use loading_info::{
     GdalLoadingInfo, GdalLoadingInfoTemporalSlice, GdalLoadingInfoTemporalSliceIterator,
@@ -65,8 +66,10 @@ use std::convert::TryFrom;
 use std::ffi::CString;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
+#[cfg(feature = "gdalsource-process")]
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 mod db_types;
@@ -81,6 +84,9 @@ pub use reader::{GdalReadAdvise, GridAndProperties, ReaderState};
 static GDAL_RETRY_INITIAL_BACKOFF_MS: u64 = 1000;
 static GDAL_RETRY_MAX_BACKOFF_MS: u64 = 60 * 60 * 1000;
 static GDAL_RETRY_EXPONENTIAL_BACKOFF_FACTOR: f64 = 2.;
+
+#[cfg(feature = "gdalsource-process")]
+const DEFAULT_PROCESS_WORKER_POOL_SIZE: usize = 4;
 
 /// Parameters for the GDAL Source Operator
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
@@ -324,19 +330,64 @@ where
     pub overview_level: u32,
     pub original_resolution_spatial_grid: Option<SpatialGridDefinition>,
     pub _phantom_data: PhantomData<T>,
-    #[cfg(feature = "gdalsource-process")]
-    pub process_data: Option<Arc<ProcessData>>,
+    pub process_manager: Option<Arc<tokio::sync::Mutex<ProcessManager>>>,
 }
 
-// TODO (high): remove this again
-pub fn load_tile<T: Pixel + GdalType + FromPrimitive>(
-    dataset_params: &GdalDatasetParameters,
-    gdal_read_advice: GdalReadAdvise,
-) -> Result<Option<GridAndProperties<T>>> {
-    GdalRasterLoader::load_tile_data(dataset_params, gdal_read_advice)
+/*
+    We need to expose this function to the binary located at `operators/src/bin/gdalsource_process_main.rs`
+    but keep it private for everyone else.
+
+    A common way for this is to make a public module that exposes the internal functions,
+    but mark it both as #[doc(hidden)] and optionally as #[deprectaed].
+
+    #[doc(hidden)] will make sure that the module will not show up in documentations
+    <https://doc.rust-lang.org/rustdoc/write-documentation/the-doc-attribute.html#hidden>.
+
+    See also:
+
+    <https://stackoverflow.com/questions/73544273/having-both-public-and-private-code-shared-between-multiple-binaries-rust>
+*/
+#[doc(hidden)]
+#[deprecated(
+    note = "Do not use this directly. This is meant for use in `operators/src/bin/gdalsource_process_main.rs` only."
+)]
+pub mod __private {
+    use super::*;
+    use crate::source::gdal_source::GdalRasterLoader;
+
+    pub async fn load_tile_async<T: Pixel + GdalType + FromPrimitive>(
+        dataset_params: GdalDatasetParameters,
+        gdal_read_advise: GdalReadAdvise,
+        tile_information: TileInformation,
+        tile_time: TimeInterval,
+        cache_hint: CacheHint,
+    ) -> Result<RasterTile2D<T>> {
+
+
+        debug!(
+            "Loading tile {:?}, from {}, band: {}",
+            &tile_information,
+            dataset_params.file_path.display(),
+            dataset_params.rasterband_channel
+        );
+
+        let grid = GdalRasterLoader::load_tile_data_async(dataset_params, gdal_read_advise).await?;
+
+        match grid {
+            Some(grid) => Ok(RasterTile2D::new_with_properties(
+                tile_time,
+                tile_information.global_tile_position,
+                0,
+                tile_information.global_geo_transform,
+                grid.grid,
+                grid.properties,
+                cache_hint,
+            )),
+            None => Ok(create_no_data_tile(tile_information, tile_time, cache_hint)),
+        }
+    }
 }
 
-// TODO (high): remove this again
 pub async fn load_tile_async<T: Pixel + GdalType + FromPrimitive>(
     dataset_params: GdalDatasetParameters,
     gdal_read_advice: GdalReadAdvise,
@@ -344,47 +395,17 @@ pub async fn load_tile_async<T: Pixel + GdalType + FromPrimitive>(
     GdalRasterLoader::load_tile_data_async(dataset_params, gdal_read_advice).await
 }
 
-// // TODO (high): remove this again ???? (How to read tile from new executable?)
-// pub fn load_tile_process<T: Pixel + GdalType + FromPrimitive>(
-//     dataset_params: GdalDatasetParameters,
-//     tile_information: TileInformation,
-//     tile_time: TimeInterval,
-//     cache_hint: CacheHint,
-// ) -> Result<RasterTile2D<T>> {
-//     GdalRasterLoader::load_tile_data_process(
-//         dataset_params,
-//         tile_information,
-//         tile_time,
-//         cache_hint,
-//     )
-// }
-
-/// A simple, single-entry cache for an open GDAL dataset.
-pub struct GdalDatasetCache<T: Pixel + GdalType + FromPrimitive> {
-    dataset_params: Option<GdalDatasetParameters>,
-    dataset: Option<GridAndProperties<T>>,
-}
-
-impl<T: Pixel + GdalType + FromPrimitive> GdalDatasetCache<T> {
-    pub fn new() -> Self {
-        Self {
-            dataset_params: None,
-            dataset: None,
-        }
-    }
-}
-
 struct GdalRasterLoader {}
 
 impl GdalRasterLoader {
+    #[cfg(feature = "gdalsource-process")]
     pub fn load_tile_data_process<T: Pixel + GdalType + FromPrimitive>(
         dataset_params: GdalDatasetParameters,
         tile_information: TileInformation,
         tile_time: TimeInterval,
         read_advise: GdalReadAdvise,
         cache_hint: CacheHint,
-        sender: &Arc<IpcSender<JsonPayload>>,
-        receiver: &Arc<Mutex<IpcBytesReceiver>>,
+        process_data: &ProcessData,
     ) -> Result<RasterTile2D<T>> {
         // TODO: detect usage of vsi curl properly, e.g. also check for `/vsicurl_streaming` and combinations with `/vsizip`
         let is_vsi_curl = dataset_params.file_path.starts_with("/vsicurl/");
@@ -401,33 +422,21 @@ impl GdalRasterLoader {
             tile_time,
             read_advise,
         });
-        let json_payload = JsonPayload::new(&data);
-
-        let () = sender.send(json_payload).map_err(|e| Error::Io {
+        process_data.send(data).map_err(|e| Error::Io {
             source: std::io::Error::other(format!(
                 "Failed to send request to gdal source process: {}",
                 e
             )),
         })?;
 
-        let load_tile_result = receiver
-            .lock()
-            .expect("ipc receiver lock should not be poisoned")
-            .recv()
-            .map(|msg| {
-                arrow_ipc_file_to_raster_tile_2d::<T>(msg).map_err(|e| Error::Io {
-                    source: std::io::Error::other(format!(
-                        "Failed to convert arrow ipc data to raster tile: {}",
-                        e
-                    )),
-                })
-            })
-            .map_err(|e| Error::Io {
+        let load_tile_result = process_data.recv().map(|msg| {
+            arrow_ipc_file_to_raster_tile_2d::<T>(msg).map_err(|e| Error::Io {
                 source: std::io::Error::other(format!(
-                    "Failed to receive response from gdal source process: {}",
+                    "Failed to convert arrow ipc data to raster tile: {}",
                     e
                 )),
-            });
+            })
+        });
 
         match load_tile_result {
             Ok(Ok(r)) => Ok(r),
@@ -441,26 +450,6 @@ impl GdalRasterLoader {
                 Err(e)
             }
         }
-    }
-
-    pub async fn load_tile_data_process_async<T: Pixel + GdalType + FromPrimitive>(
-        dataset_params: GdalDatasetParameters,
-        tile_information: TileInformation,
-        tile_time: TimeInterval,
-        read_advise: GdalReadAdvise,
-        cache_hint: CacheHint,
-        sender: Arc<IpcSender<JsonPayload>>,
-        receiver: Arc<Mutex<IpcBytesReceiver>>,
-    ) -> Result<RasterTile2D<T>> {
-        Self::load_tile_data_process(
-            dataset_params,
-            tile_information,
-            tile_time,
-            read_advise,
-            cache_hint,
-            &sender,
-            &receiver,
-        )
     }
 
     ///
@@ -524,14 +513,14 @@ impl GdalRasterLoader {
     }
 
     /// Copy `load_tile_async` but utilizing multiple processes
+    #[cfg(feature = "gdalsource-process")]
     async fn load_tile_process_async<T: Pixel + GdalType + FromPrimitive>(
         dataset_params: Option<GdalDatasetParameters>,
         reader_mode: GdalReaderMode,
         tile_information: TileInformation,
         tile_time: TimeInterval,
         cache_hint: CacheHint,
-        sender: Arc<IpcSender<JsonPayload>>,
-        receiver: Arc<Mutex<IpcBytesReceiver>>,
+        process_manager: Arc<tokio::sync::Mutex<ProcessManager>>,
     ) -> Result<RasterTile2D<T>> {
         let tile_spatial_grid = tile_information.spatial_grid_definition();
 
@@ -557,16 +546,21 @@ impl GdalRasterLoader {
                     return Ok(create_no_data_tile(tile_information, tile_time, cache_hint));
                 };
 
-                Self::load_tile_data_process_async(
+                let process_data = {
+                    let mut manager = process_manager.lock().await;
+                    // TODO (high): verify that the file_path is resolved
+                    // to the correct time_slice file at this point
+                    manager.acquire(&ds.file_path)
+                };
+
+                Self::load_tile_data_process(
                     ds,
                     tile_information,
                     tile_time,
                     gdal_read_advise,
                     cache_hint,
-                    sender,
-                    receiver,
+                    &process_data,
                 )
-                .await
             }
             _ => {
                 debug!(
@@ -579,6 +573,10 @@ impl GdalRasterLoader {
         }
     }
 
+    // this is used if the gdalsource-process feature is disabled, but
+    // if we do #[cfg(not(feature = "..."))] then there will be errors at many places (which are fixable by annotating those too)
+    // but since, the long-term goal is to completely move to the proecess feature, we just ignore those warnings for now.
+    #[allow(unused)]
     async fn load_tile_async<T: Pixel + GdalType + FromPrimitive>(
         dataset_params: Option<GdalDatasetParameters>,
         reader_mode: GdalReaderMode,
@@ -767,8 +765,7 @@ impl GdalRasterLoader {
         info: GdalLoadingInfoTemporalSlice,
         tiling_strategy: TilingStrategy,
         reader_mode: GdalReaderMode,
-        sender: Arc<IpcSender<JsonPayload>>,
-        receiver: Arc<Mutex<IpcBytesReceiver>>,
+        process_manager: Arc<Mutex<ProcessManager>>,
     ) -> impl Stream<Item = impl Future<Output = Result<RasterTile2D<T>>>> + use<T> {
         stream::iter(tiling_strategy.tile_information_iterator_from_pixel_bounds(spatial_bounds))
             .map(move |tile| {
@@ -778,13 +775,13 @@ impl GdalRasterLoader {
                     tile,
                     info.time,
                     info.cache_ttl.into(),
-                    Arc::clone(&sender),
-                    Arc::clone(&receiver),
+                    Arc::clone(&process_manager),
                 )
             })
     }
 
     // Creates a seperate process which handles the loading info to tile stream
+    #[cfg(feature = "gdalsource-process")]
     fn loading_info_to_tile_stream_process<
         T: Pixel + GdalType + FromPrimitive,
         S: Stream<Item = Result<GdalLoadingInfoTemporalSlice>>,
@@ -792,31 +789,29 @@ impl GdalRasterLoader {
         loading_info_stream: S,
         spatial_query: GridBoundingBox2D,
         tiling_strategy: TilingStrategy,
-        process_data: Arc<ProcessData>,
-        reader_mode: GdalReaderMode, // TODO figure out where this belongs now
+        process_manager: Arc<Mutex<ProcessManager>>,
+        reader_mode: GdalReaderMode,
     ) -> impl Stream<Item = Result<RasterTile2D<T>>> + use<S, T> {
-        let sender = Arc::clone(&process_data.sender);
-        let receiver = Arc::clone(&process_data.receiver);
-
-        let value = sender.clone();
-        let res = loading_info_stream
+        let m = Arc::new(process_manager);
+        loading_info_stream
             .map_ok(move |info| {
                 GdalRasterLoader::temporal_slice_tile_future_stream_process(
                     spatial_query,
                     info,
                     tiling_strategy,
                     reader_mode,
-                    Arc::clone(&value),
-                    Arc::clone(&receiver),
+                    Arc::clone(&m),
                 )
                 .map(Result::Ok)
             })
             .try_flatten()
-            .try_buffered(16); // TODO: make this configurable
-
-        res
+            .try_buffered(16) // TODO: make this configurable
     }
 
+    // this is used if the gdalsource-process feature is disabled, but
+    // if we do #[cfg(not(feature = "..."))] then there will be errors at many places (which are fixable by annotating those too)
+    // but since, the long-term goal is to completely move to the proecess feature, we just ignore those warnings for now.
+    #[allow(unused)]
     fn loading_info_to_tile_stream<
         T: Pixel + GdalType + FromPrimitive,
         S: Stream<Item = Result<GdalLoadingInfoTemporalSlice>>,
@@ -839,78 +834,6 @@ impl GdalRasterLoader {
             .try_flatten()
             .try_buffered(16) // TODO: make this configurable
     }
-}
-
-/// A method to load single tiles from a GDAL dataset using a single-entry dataset cache.
-///
-/// # Panics
-/// Panics when cache params set without dataset (should not happen I think)
-pub fn load_tile_data_cached<T: Pixel + GdalType + FromPrimitive>(
-    cache: &mut GdalDatasetCache<T>,
-    dataset_params: &GdalDatasetParameters,
-    read_advise: GdalReadAdvise,
-) -> Result<Option<GridAndProperties<T>>> {
-    // tests if cache.filepath = request.filepath
-    let are_file_paths_same = cache
-        .dataset_params
-        .as_ref()
-        .map(|params| params.file_path.clone())
-        == Some(dataset_params.file_path.clone());
-
-    if are_file_paths_same {
-        todo!()
-    } else {
-        let opt_dataset = GdalRasterLoader::load_tile_data(dataset_params, read_advise)?;
-        if let Some(ds) = &opt_dataset {
-            cache.dataset = Some(ds.clone());
-            cache.dataset_params = Some(dataset_params.clone());
-        }
-        Ok(opt_dataset)
-    }
-}
-
-/// A method to load single tiles from a GDAL dataset using a single-entry dataset cache with retry.
-pub async fn load_tile_data_cached_async<T: Pixel + GdalType + FromPrimitive>(
-    cache: Arc<tokio::sync::Mutex<GdalDatasetCache<T>>>,
-    dataset_params: &GdalDatasetParameters,
-    read_advise: GdalReadAdvise,
-) -> Result<Option<GridAndProperties<T>>> {
-    // TODO: detect usage of vsi curl properly, e.g. also check for `/vsicurl_streaming` and combinations with `/vsizip`
-    let is_vsi_curl = dataset_params.file_path.starts_with("/vsicurl/");
-
-    retry(
-        dataset_params
-            .retry
-            .map(|r| r.max_retries)
-            .unwrap_or_default(),
-        GDAL_RETRY_INITIAL_BACKOFF_MS,
-        GDAL_RETRY_EXPONENTIAL_BACKOFF_FACTOR,
-        Some(GDAL_RETRY_MAX_BACKOFF_MS),
-        || {
-            let dataset_params = dataset_params.clone();
-            let cache = Arc::clone(&cache);
-
-            async move {
-                let mut cache_guard = cache.lock().await;
-                let load_tile_result =
-                    load_tile_data_cached(&mut cache_guard, &dataset_params, read_advise);
-
-                match load_tile_result {
-                    Ok(r) => Ok(r),
-                    Err(e) => {
-                        if is_vsi_curl {
-                            // clear the VSICurl cache, to force GDAL to try to re-download the file
-                            // otherwise it will assume any observed error will happen again
-                            clear_gdal_vsi_cache_for_path(dataset_params.file_path.as_path());
-                        }
-
-                        Err(e)
-                    }
-                }
-            }
-        },
-    )
-    .await
 }
 
 fn error_is_gdal_file_not_found(error: &Error) -> bool {
@@ -1053,22 +976,24 @@ where
                             }
                         });
 
-        #[cfg(all(feature = "gdalsource-default", not(feature = "gdalsource-process")))]
+        #[cfg(not(feature = "gdalsource-process"))]
         let loaded_source_stream =
             load_source_stream::<P, _>(stream, &query, tiling_strategy, reader_mode);
 
         #[cfg(feature = "gdalsource-process")]
-        let loaded_source_stream = load_source_stream::<P, _>(
-            stream,
-            &query,
-            tiling_strategy,
-            reader_mode,
-            Arc::clone(
-                self.process_data
-                    .as_ref()
-                    .expect("process-data to be set for the process feature"),
-            ),
-        );
+        let loaded_source_stream = {
+            load_source_stream::<P, _>(
+                stream,
+                &query,
+                tiling_strategy,
+                reader_mode,
+                Arc::clone(
+                    self.process_manager
+                        .as_ref()
+                        .expect("The ProcessManager should be set on the process-manager path"),
+                ),
+            )
+        };
 
         Ok(loaded_source_stream.boxed())
     }
@@ -1137,7 +1062,7 @@ impl OperatorName for GdalSource {
     const TYPE_NAME: &'static str = "GdalSource";
 }
 
-#[cfg(all(feature = "gdalsource-default", not(feature = "gdalsource-process")))]
+#[cfg(not(feature = "gdalsource-process"))]
 fn load_source_stream<P, S>(
     source_stream: S,
     query: &RasterQueryRectangle,
@@ -1162,7 +1087,7 @@ fn load_source_stream<P, S>(
     query: &RasterQueryRectangle,
     tiling_strategy: TilingStrategy,
     reader_mode: GdalReaderMode,
-    process_data: Arc<ProcessData>,
+    process_manager: Arc<Mutex<ProcessManager>>,
 ) -> impl Stream<Item = Result<RasterTile2D<P>>> + use<P, S>
 where
     P: Pixel + GdalType + FromPrimitive,
@@ -1172,13 +1097,10 @@ where
         source_stream,
         query.spatial_bounds(),
         tiling_strategy,
-        process_data,
+        process_manager,
         reader_mode,
     )
 }
-
-#[cfg(not(any(feature = "gdalsource-default", feature = "gdalsource-process")))]
-compile_error!("Enable one of gdalsource-default or gdalsource-process.");
 
 fn overview_level_spatial_grid(
     source_spatial_grid: SpatialGridDefinition,
@@ -1232,16 +1154,10 @@ impl RasterOperator for GdalSource {
         debug!("Initializing GdalSource for {:?}.", &self.params.data);
         debug!("GdalSource path: {:?}", path);
 
-        #[cfg(feature = "gdalsource-process")]
-        let process_data = {
-            let (child, sender, receiver) = spawn_ipc_server_process_bytes::<JsonPayload>();
-            Arc::new(ProcessData::new(child, sender, receiver))
-        };
-
         let meta_data_result_descriptor = meta_data.result_descriptor().await?;
 
         let op_name = CanonicOperatorName::from(&self);
-        let mut op = if self.params.overview_level.is_none() {
+        let op = if self.params.overview_level.is_none() {
             InitializedGdalSourceOperator::initialize_original_resolution(
                 op_name,
                 path,
@@ -1263,46 +1179,10 @@ impl RasterOperator for GdalSource {
             )
         };
 
-        #[cfg(feature = "gdalsource-process")]
-        {
-            op.process_data = Some(process_data);
-        }
-
         Ok(op.boxed())
     }
 
     span_fn!(GdalSource);
-}
-
-pub struct ProcessData {
-    child: Mutex<std::process::Child>,
-    sender: Arc<IpcSender<JsonPayload>>,
-    receiver: Arc<Mutex<IpcBytesReceiver>>,
-}
-
-impl ProcessData {
-    fn new(
-        child: std::process::Child,
-        sender: IpcSender<JsonPayload>,
-        receiver: IpcBytesReceiver,
-    ) -> Self {
-        Self {
-            child: Mutex::new(child),
-            sender: Arc::new(sender),
-            receiver: Arc::new(Mutex::new(receiver)),
-        }
-    }
-}
-
-impl Drop for ProcessData {
-    fn drop(&mut self) {
-        let _ = self
-            .sender
-            .send(JsonPayload::new(&IpcChannelMessage::EndConnection));
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -1316,8 +1196,6 @@ pub struct InitializedGdalSourceOperator {
     // the overview level to use. 0/1 means the highest resolution
     pub overview_level: u32,
     pub original_resolution_spatial_grid: Option<SpatialGridDefinition>,
-    #[cfg(feature = "gdalsource-process")]
-    pub process_data: Option<Arc<ProcessData>>,
 }
 
 impl InitializedGdalSourceOperator {
@@ -1338,8 +1216,6 @@ impl InitializedGdalSourceOperator {
             tiling_specification,
             overview_level: 0,
             original_resolution_spatial_grid: None,
-            #[cfg(feature = "gdalsource-process")]
-            process_data: None,
         }
     }
 
@@ -1378,8 +1254,6 @@ impl InitializedGdalSourceOperator {
             data_name,
             overview_level,
             original_resolution_spatial_grid: original_grid,
-            #[cfg(feature = "gdalsource-process")]
-            process_data: None,
         }
     }
 }
@@ -1400,7 +1274,11 @@ impl InitializedRasterOperator for InitializedGdalSourceOperator {
                     original_resolution_spatial_grid: self.original_resolution_spatial_grid,
                     _phantom_data: PhantomData,
                     #[cfg(feature = "gdalsource-process")]
-                    process_data: self.process_data.clone(),
+                    process_manager: Some(ProcessManager::new_with_arc_mutex(
+                        DEFAULT_PROCESS_WORKER_POOL_SIZE,
+                    )),
+                    #[cfg(not(feature = "gdalsource-process"))]
+                    process_manager: None,
                 }
                 .boxed(),
             ),
@@ -1413,7 +1291,11 @@ impl InitializedRasterOperator for InitializedGdalSourceOperator {
                     original_resolution_spatial_grid: self.original_resolution_spatial_grid,
                     _phantom_data: PhantomData,
                     #[cfg(feature = "gdalsource-process")]
-                    process_data: self.process_data.clone(),
+                    process_manager: Some(ProcessManager::new_with_arc_mutex(
+                        DEFAULT_PROCESS_WORKER_POOL_SIZE,
+                    )),
+                    #[cfg(not(feature = "gdalsource-process"))]
+                    process_manager: None,
                 }
                 .boxed(),
             ),
@@ -1426,7 +1308,11 @@ impl InitializedRasterOperator for InitializedGdalSourceOperator {
                     original_resolution_spatial_grid: self.original_resolution_spatial_grid,
                     _phantom_data: PhantomData,
                     #[cfg(feature = "gdalsource-process")]
-                    process_data: self.process_data.clone(),
+                    process_manager: Some(ProcessManager::new_with_arc_mutex(
+                        DEFAULT_PROCESS_WORKER_POOL_SIZE,
+                    )),
+                    #[cfg(not(feature = "gdalsource-process"))]
+                    process_manager: None,
                 }
                 .boxed(),
             ),
@@ -1449,7 +1335,11 @@ impl InitializedRasterOperator for InitializedGdalSourceOperator {
                     original_resolution_spatial_grid: self.original_resolution_spatial_grid,
                     _phantom_data: PhantomData,
                     #[cfg(feature = "gdalsource-process")]
-                    process_data: self.process_data.clone(),
+                    process_manager: Some(ProcessManager::new_with_arc_mutex(
+                        DEFAULT_PROCESS_WORKER_POOL_SIZE,
+                    )),
+                    #[cfg(not(feature = "gdalsource-process"))]
+                    process_manager: None,
                 }
                 .boxed(),
             ),
@@ -1462,7 +1352,11 @@ impl InitializedRasterOperator for InitializedGdalSourceOperator {
                     original_resolution_spatial_grid: self.original_resolution_spatial_grid,
                     _phantom_data: PhantomData,
                     #[cfg(feature = "gdalsource-process")]
-                    process_data: self.process_data.clone(),
+                    process_manager: Some(ProcessManager::new_with_arc_mutex(
+                        DEFAULT_PROCESS_WORKER_POOL_SIZE,
+                    )),
+                    #[cfg(not(feature = "gdalsource-process"))]
+                    process_manager: None,
                 }
                 .boxed(),
             ),
@@ -1480,7 +1374,11 @@ impl InitializedRasterOperator for InitializedGdalSourceOperator {
                     original_resolution_spatial_grid: self.original_resolution_spatial_grid,
                     _phantom_data: PhantomData,
                     #[cfg(feature = "gdalsource-process")]
-                    process_data: self.process_data.clone(),
+                    process_manager: Some(ProcessManager::new_with_arc_mutex(
+                        DEFAULT_PROCESS_WORKER_POOL_SIZE,
+                    )),
+                    #[cfg(not(feature = "gdalsource-process"))]
+                    process_manager: None,
                 }
                 .boxed(),
             ),
@@ -1493,7 +1391,11 @@ impl InitializedRasterOperator for InitializedGdalSourceOperator {
                     original_resolution_spatial_grid: self.original_resolution_spatial_grid,
                     _phantom_data: PhantomData,
                     #[cfg(feature = "gdalsource-process")]
-                    process_data: self.process_data.clone(),
+                    process_manager: Some(ProcessManager::new_with_arc_mutex(
+                        DEFAULT_PROCESS_WORKER_POOL_SIZE,
+                    )),
+                    #[cfg(not(feature = "gdalsource-process"))]
+                    process_manager: None,
                 }
                 .boxed(),
             ),
@@ -2049,15 +1951,12 @@ mod tests {
     }
 
     // TODO name / test
+    #[cfg(feature = "gdalsource-process")]
     fn load_ndvi_jan_2014_by_process(
         output_shape: GridShape2D,
         output_bounds: SpatialPartition2D,
-        sender: IpcSender<JsonPayload>,
-        receiver: IpcBytesReceiver,
+        process_data: Arc<ProcessData>,
     ) -> Result<RasterTile2D<u8>> {
-        let receiver = Arc::new(Mutex::new(receiver));
-        let sender = Arc::new(sender);
-
         let dataset_params = GdalDatasetParameters {
             file_path: test_data!("raster/modis_ndvi/MOD13A2_M_NDVI_2014-01-01.TIFF").into(),
             rasterband_channel: 1,
@@ -2119,60 +2018,9 @@ mod tests {
             TimeInterval::default(),
             gdal_read_advise,
             CacheHint::default(),
-            &sender,
-            &receiver,
+            &process_data,
         )
     }
-
-    // fn load_ndvi_jan_2014(
-    //     output_shape: GridShape2D,
-    //     output_bounds: SpatialPartition2D,
-    // ) -> Result<RasterTile2D<u8>> {
-    //     GdalRasterLoader::load_tile_data::<u8>(
-    //         &GdalDatasetParameters {
-    //             file_path: test_data!("raster/modis_ndvi/MOD13A2_M_NDVI_2014-01-01.TIFF").into(),
-    //             rasterband_channel: 1,
-    //             geo_transform: GdalDatasetGeoTransform {
-    //                 origin_coordinate: (-180., 90.).into(),
-    //                 x_pixel_size: 0.1,
-    //                 y_pixel_size: -0.1,
-    //             },
-    //             width: 3600,
-    //             height: 1800,
-    //             file_not_found_handling: FileNotFoundHandling::NoData,
-    //             no_data_value: Some(0.),
-    //             properties_mapping: Some(vec![
-    //                 GdalMetadataMapping {
-    //                     source_key: RasterPropertiesKey {
-    //                         domain: None,
-    //                         key: "AREA_OR_POINT".to_string(),
-    //                     },
-    //                     target_type: RasterPropertiesEntryType::String,
-    //                     target_key: RasterPropertiesKey {
-    //                         domain: None,
-    //                         key: "AREA_OR_POINT".to_string(),
-    //                     },
-    //                 },
-    //                 GdalMetadataMapping {
-    //                     source_key: RasterPropertiesKey {
-    //                         domain: Some("IMAGE_STRUCTURE".to_string()),
-    //                         key: "COMPRESSION".to_string(),
-    //                     },
-    //                     target_type: RasterPropertiesEntryType::String,
-    //                     target_key: RasterPropertiesKey {
-    //                         domain: Some("IMAGE_STRUCTURE_INFO".to_string()),
-    //                         key: "COMPRESSION".to_string(),
-    //                     },
-    //                 },
-    //             ]),
-    //             gdal_open_options: None,
-    //             gdal_config_options: None,
-    //             allow_alphaband_as_mask: true,
-    //             retry: None,
-    //         });
-
-    //         GdalRasterLoader::load_tile_data::<u8>(&dataset_params, gdal_read_advice)
-    //     }
 
     // This method loads raster data from a cropped MODIS NDVI raster.
     // To inspect the byte values first convert the file to XYZ with GDAL:
@@ -2440,12 +2288,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "gdalsource-process")]
     fn test_load_tile_data_process() {
         let output_shape: GridShape2D = [8, 8].into();
         let output_bounds =
             SpatialPartition2D::new_unchecked((-180., 90.).into(), (180., -90.).into());
 
-        let (mut child, sender, receiver) = spawn_ipc_server_process_bytes::<JsonPayload>();
+        let pd = ProcessData::spawn();
 
         let RasterTile2D {
             global_geo_transform: _,
@@ -2455,14 +2304,9 @@ mod tests {
             time: _,
             properties,
             cache_hint: _,
-        } = load_ndvi_jan_2014_by_process(output_shape, output_bounds, sender.clone(), receiver)
-            .unwrap();
+        } = load_ndvi_jan_2014_by_process(output_shape, output_bounds, pd.clone()).unwrap();
 
-        sender
-            .send(JsonPayload::new(&IpcChannelMessage::EndConnection))
-            .unwrap();
-        let is_dead = child.kill();
-        assert!(is_dead.is_ok());
+        pd.send(IpcChannelMessage::EndConnection).unwrap();
 
         assert!(!grid.is_empty());
 

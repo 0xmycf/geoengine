@@ -1,27 +1,18 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::{Child, Command};
+use std::sync::{Arc, LazyLock, Mutex};
 
+use gdal::raster::GdalType;
+use geoengine_datatypes::raster::{Pixel, RasterTile2D};
 use geoengine_datatypes::{
     primitives::{CacheHint, TimeInterval},
     raster::TileInformation,
 };
 use ipc_channel::ipc::{self, IpcBytesReceiver, IpcBytesSender, IpcReceiver, IpcSender};
+use num::FromPrimitive;
 
 use crate::source::{GdalDatasetParameters, gdal_source::reader::GdalReadAdvise};
-
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct JsonPayload(String);
-
-impl JsonPayload {
-    pub fn new(message: &IpcChannelMessage) -> Self {
-        Self(serde_json::to_string(message).expect("Failed to serialize IpcChannelMessage to JSON"))
-    }
-
-    pub fn get(self) -> IpcChannelMessage {
-        let message: IpcChannelMessage = serde_json::from_str(&self.0)
-            .expect("Failed to deserialize IpcChannelMessage from JSON");
-        message
-    }
-}
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq)]
 pub struct IpcChannelMessagePayload {
@@ -48,27 +39,16 @@ impl IpcChannelMessage {
 pub fn spawn_ipc_server_process_bytes<S>() -> (Child, IpcSender<S>, IpcBytesReceiver) {
     let (server, token) = ipc::IpcOneShotServer::<(IpcSender<S>, IpcBytesReceiver)>::new()
         .expect("Failed to create IPC Server");
-    // let path = env!("CARGO_BIN_EXE_gdalprocess-ipc-channel-server");
-    // let path = std::env::var("CARGO_BIN_EXE_gdalsource-process").expect("the CARGO_BIN_EXE_gdalsource-process env var is not set");
 
-    // let exe = std::env::current_exe().expect("failed to get current exe path");
-    // let path = exe
-    //     .parent()
-    //     .expect("failed to get exe parent dir")
-    //     .join("gdalsource-process");
-
-    // get the users home
-    let home = std::env::var("HOME").expect("failed to get HOME env var");
-    let location = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-    let path = format!(
-        "{home}/Documents/work/arbeit-geoengine/geoengine-workflow-backend/target/{location}/gdalsource-process",
-    );
-
-    // dbg!(path);
+    let path: PathBuf = std::env::var("GDAL_SOURCE_PROCESS_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::current_exe()
+                .expect("failed to get current executable path")
+                .parent()
+                .expect("executable has no parent directory")
+                .join("gdalsource-process")
+        });
 
     let child = Command::new(path)
         .arg(token)
@@ -124,4 +104,153 @@ where
         .expect("Failed to send sender to server");
 
     (client_sender, client_reciever)
+}
+
+/// Worker pool of multiple processes
+/// RoundRobin by default, but if a [`RaterTile2D`] is requested that is already
+/// in cache use the corresponding process instead.
+///
+/// If no process is available, this waits till there is one.
+pub struct ProcessManager {
+    rr_index: usize,
+    pool: Vec<LazyLock<Arc<ProcessData>>>,
+    cache: HashMap<PathBuf, Arc<ProcessData>>,
+}
+
+impl ProcessManager {
+    /// Creates a new [`ProcessManager`] with `size` many workers
+    pub fn new(size: usize) -> Self {
+        let pool = (0..size)
+            .map(|_| LazyLock::new(ProcessData::spawn as fn() -> Arc<ProcessData>))
+            .collect();
+
+        Self {
+            rr_index: 0,
+            pool,
+            cache: HashMap::with_capacity(size),
+        }
+    }
+
+    #[inline]
+    pub fn new_with_arc_mutex(size: usize) -> Arc<tokio::sync::Mutex<Self>> {
+        Arc::new(tokio::sync::Mutex::new(Self::new(size)))
+    }
+
+    /// Returns the next process from the pool using round-robin scheduling,
+    /// advancing the index for the next call.
+    fn next_rr(&mut self) -> Arc<ProcessData> {
+        let process = Arc::clone(&*self.pool[self.rr_index]);
+        self.rr_index = (self.rr_index + 1) % self.pool.len();
+        process
+    }
+
+    /// Acquires a process for the given file `path`.
+    ///
+    /// If the path is already in the cache, the previously assigned process is
+    /// returned so that the worker that already has the file open handles the
+    /// request. Otherwise the next round-robin process is selected, recorded in
+    /// the cache, and returned.
+    pub fn acquire(&mut self, path: &PathBuf) -> Arc<ProcessData> {
+        if let Some(process) = self.cache.get(path) {
+            return Arc::clone(process);
+        }
+
+        let process = self.next_rr();
+        self.cache.insert(path.clone(), Arc::clone(&process));
+        process
+    }
+}
+
+pub struct ProcessData {
+    child: Child,
+    sender: IpcSender<IpcChannelMessage>,
+    receiver: Mutex<IpcBytesReceiver>,
+}
+
+impl ProcessData {
+    fn new(child: Child, sender: IpcSender<IpcChannelMessage>, receiver: IpcBytesReceiver) -> Self {
+        Self {
+            child,
+            sender,
+            receiver: Mutex::new(receiver),
+        }
+    }
+
+    pub fn spawn() -> Arc<Self> {
+        let (child, sender, receiver) = spawn_ipc_server_process_bytes::<IpcChannelMessage>();
+        Arc::new(Self::new(child, sender, receiver))
+    }
+
+    pub fn send(&self, message: IpcChannelMessage) -> crate::util::Result<()> {
+        // let payload = JsonPayload::new(&message);
+        self.sender
+            .send(message)
+            .map_err(|e| crate::error::Error::Io {
+                source: std::io::Error::other(e.to_string()),
+            })
+    }
+
+    pub fn recv(&self) -> crate::util::Result<Vec<u8>> {
+        self.receiver
+            .lock()
+            .expect("icp receiver lock should be aquireable")
+            .recv()
+            .map_err(|e| crate::error::Error::Io {
+                source: std::io::Error::other(e.to_string()),
+            })
+    }
+
+    pub async fn try_recv(self: Arc<Self>) -> crate::util::Result<Vec<u8>> {
+        self.receiver
+            .lock()
+            .expect("icp receiver lock should be aquireable")
+            .try_recv()
+            .map_err(|e| crate::error::Error::Io {
+                source: std::io::Error::other(e.to_string()),
+            })
+    }
+}
+
+impl Drop for ProcessData {
+    fn drop(&mut self) {
+        let _ = self
+            .sender
+            .send(IpcChannelMessage::EndConnection);
+        let _ = self.child.kill();
+    }
+}
+
+/// A simple, single-entry cache for an open GDAL dataset.
+/// TODO (high): make sure that this caches the right thing, as we need to make sure that the correct bounds etc are returned
+pub struct GdalDatasetCache<T: Pixel + GdalType + FromPrimitive> {
+    pub parameters: Option<GdalDatasetParameters>,
+    pub dataset: Option<RasterTile2D<T>>,
+}
+
+impl<T: Pixel + GdalType + FromPrimitive> GdalDatasetCache<T> {
+    pub fn new() -> Self {
+        Self {
+            parameters: None,
+            dataset: None,
+        }
+    }
+
+    pub fn cache(&mut self, parameters: GdalDatasetParameters, dataset: RasterTile2D<T>) {
+        self.parameters = Some(parameters);
+        self.dataset = Some(dataset);
+    }
+
+    pub fn clear(&mut self) {
+        self.parameters = None;
+        self.dataset = None;
+    }
+
+    pub fn get(&self, parameters: &GdalDatasetParameters) -> Option<RasterTile2D<T>> {
+        if let Some(ps) = self.parameters.as_ref()
+            && *ps == *parameters
+        {
+            return self.dataset.clone();
+        }
+        None
+    }
 }

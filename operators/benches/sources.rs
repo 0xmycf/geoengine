@@ -13,6 +13,8 @@ use geoengine_datatypes::{
     util::test::TestDefault,
 };
 use geoengine_operators::engine::{MockExecutionContext, RasterResultDescriptor, TimeDescriptor};
+#[cfg(feature = "gdalsource-process")]
+use geoengine_operators::source::gdal_source::process::ProcessManager;
 use geoengine_operators::{
     engine::{ChunkByteSize, RasterQueryProcessor},
     mock::MockRasterSourceProcessor,
@@ -33,7 +35,10 @@ fn setup_gdal_source(
         meta_data: Box::new(meta_data),
         original_resolution_spatial_grid: None,
         _phantom_data: PhantomData,
-        process_data: None,
+        #[cfg(feature = "gdalsource-process")]
+        process_manager: Some(ProcessManager::new_with_arc_mutex(4 /* TODO configurable / some const / static default? */)),
+        #[cfg(not(feature = "gdalsource-process"))]
+        process_manager: None,
     }
 }
 

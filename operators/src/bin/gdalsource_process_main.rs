@@ -1,14 +1,14 @@
 use geoengine_datatypes::raster::{RasterTile2D, raster_tile_2d_to_arrow_ipc_file_for_ipc_channel};
 use geoengine_operators::source::gdal_source::{
-    self, GdalDatasetCache, GridAndProperties,
-    process::{IpcChannelMessage, IpcChannelMessagePayload, JsonPayload, setup_client_for_bytes},
+    self,
+    process::{
+        GdalDatasetCache, IpcChannelMessage, IpcChannelMessagePayload, setup_client_for_bytes,
+    },
 };
-use ipc_channel::ipc::IpcError;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use ipc_channel::ipc::{IpcBytesSender, IpcError};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     if let Err(err) = run().await {
         eprintln!("Error: {err}");
         std::process::exit(1);
@@ -17,16 +17,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+async fn run() -> Result<()> {
     let token = setup();
     dbg!(token.clone());
 
-    let (sender, receiver) = setup_client_for_bytes::<JsonPayload>(token);
+    let (sender, receiver) = setup_client_for_bytes::<IpcChannelMessage>(token);
 
-    let dataset_cache = Arc::new(Mutex::new(GdalDatasetCache::new()));
+    let mut dataset_cache = GdalDatasetCache::new();
 
     loop {
-        let message = receiver.recv().map(JsonPayload::get).map_err(|e| {
+        let message = receiver.recv().map_err(|e| {
             match e {
                 IpcError::Bincode(ref error_kind) => {
                     // bincode error
@@ -46,30 +48,42 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     cache_hint,
                     read_advise,
                 } = *b;
-                // dbg!("Received request for tile data");
-                // TODO: make more general for the other pixel types... how (Phantom Data?)?
-                // dbg!(tile_time);
-                let tile: Option<GridAndProperties<u8>> = gdal_source::load_tile_data_cached_async(
-                    Arc::clone(&dataset_cache),
-                    &dataset_params,
+
+                dbg!("Received request for tile data", &dataset_params.file_path);
+                let params_for_cache = &dataset_params;
+
+                if let Some(tile) = dataset_cache.get(&params_for_cache) {
+                    if let Err(some_err) = send_tile(tile, &sender) {
+                        panic!("Cannot send data back to engine: {some_err:#?}")
+                    }
+                }
+
+                #[allow(deprecated)] // this is the place where it should be used!
+                let tile = gdal_source::__private::load_tile_async(
+                    dataset_params.clone(),
                     read_advise,
+                    tile_information,
+                    tile_time,
+                    cache_hint,
                 )
                 .await?;
-                if let None = tile {
-                    // TODO (high) make this fault tolerant
-                    panic!("tile is none => something went wrong");
+                // TODO this might be incorrect for the wrong tile_slices
+                dataset_cache.cache(params_for_cache.clone(), tile.clone());
+                if let Err(some_err) = send_tile(tile, &sender) {
+                    panic!("Error sending data to client {some_err:#?}");
                 }
-                let ipc_data = raster_tile_2d_to_arrow_ipc_file_for_ipc_channel::<u8>(todo!("wip")/*tile.unwrap().grid*/)?;
-
-                sender.send(&ipc_data)?;
-                // dbg!("Sent tile data to client");
             }
             IpcChannelMessage::EndConnection => {
-                // dbg!("Received end connection message");
                 return Ok(());
             }
         }
     }
+}
+
+fn send_tile(tile: RasterTile2D<u8>, sender: &IpcBytesSender) -> Result<()> {
+    let ipc_data = raster_tile_2d_to_arrow_ipc_file_for_ipc_channel::<u8>(tile)?;
+    sender.send(&ipc_data)?;
+    Ok(())
 }
 
 type Token = String;

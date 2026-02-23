@@ -1059,6 +1059,8 @@ fn geotiff_to_cog(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "gdalsource-process")]
+    use crate::source::gdal_source::process::ProcessManager;
     use std::marker::PhantomData;
     use std::ops::Add;
 
@@ -1091,7 +1093,12 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
-            process_data: None
+            #[cfg(feature = "gdalsource-process")]
+            process_manager: Some(ProcessManager::new_with_arc_mutex(
+                4, /* TODO configurable / some const / static default? */
+            )),
+            #[cfg(not(feature = "gdalsource-process"))]
+            process_manager: None,
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1145,7 +1152,12 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
-            process_data: None,
+            #[cfg(feature = "gdalsource-process")]
+            process_manager: Some(ProcessManager::new_with_arc_mutex(
+                4, /* TODO configurable / some const / static default? */
+            )),
+            #[cfg(not(feature = "gdalsource-process"))]
+            process_manager: None,
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1194,7 +1206,12 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
-            process_data: None,
+            #[cfg(feature = "gdalsource-process")]
+            process_manager: Some(ProcessManager::new_with_arc_mutex(
+                4, /* TODO configurable / some const / static default? */
+            )),
+            #[cfg(not(feature = "gdalsource-process"))]
+            process_manager: None,
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1248,7 +1265,12 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
-            process_data: None,
+            #[cfg(feature = "gdalsource-process")]
+            process_manager: Some(ProcessManager::new_with_arc_mutex(
+                4, /* TODO configurable / some const / static default? */
+            )),
+            #[cfg(not(feature = "gdalsource-process"))]
+            process_manager: None,
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1304,8 +1326,12 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
-            process_data: None,
-
+            #[cfg(feature = "gdalsource-process")]
+            process_manager: Some(ProcessManager::new_with_arc_mutex(
+                4, /* TODO configurable / some const / static default? */
+            )),
+            #[cfg(not(feature = "gdalsource-process"))]
+            process_manager: None,
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1361,7 +1387,12 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
-            process_data: None,
+            #[cfg(feature = "gdalsource-process")]
+            process_manager: Some(ProcessManager::new_with_arc_mutex(
+                4, /* TODO configurable / some const / static default? */
+            )),
+            #[cfg(not(feature = "gdalsource-process"))]
+            process_manager: None,
         };
 
         let mut bytes = raster_stream_to_geotiff_bytes(
@@ -1437,7 +1468,12 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
-            process_data:None
+            #[cfg(feature = "gdalsource-process")]
+            process_manager: Some(ProcessManager::new_with_arc_mutex(
+                4, /* TODO configurable / some const / static default? */
+            )),
+            #[cfg(not(feature = "gdalsource-process"))]
+            process_manager: None,
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1481,7 +1517,12 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
-            process_data:None
+            #[cfg(feature = "gdalsource-process")]
+            process_manager: Some(ProcessManager::new_with_arc_mutex(
+                4, /* TODO configurable / some const / static default? */
+            )),
+            #[cfg(not(feature = "gdalsource-process"))]
+            process_manager: None,
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1535,7 +1576,13 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
-            process_data: None
+
+            #[cfg(feature = "gdalsource-process")]
+            process_manager: Some(ProcessManager::new_with_arc_mutex(
+                4, /* TODO configurable / some const / static default? */
+            )),
+            #[cfg(not(feature = "gdalsource-process"))]
+            process_manager: None,
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1757,7 +1804,13 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
-            process_data: None
+
+            #[cfg(feature = "gdalsource-process")]
+            process_manager: Some(ProcessManager::new_with_arc_mutex(
+                4, /* TODO configurable / some const / static default? */
+            )),
+            #[cfg(not(feature = "gdalsource-process"))]
+            process_manager: None,
         };
 
         let (mut bytes, _) = raster_stream_to_multiband_geotiff_bytes(

@@ -11,12 +11,10 @@ repository.workspace = true
 [[bin]]
 name = "gdalsource-process"
 path = "src/bin/gdalsource_process_main.rs"
-required-features = ["gdalsource-process"]
 
 [features]
-default = ["gdalsource-default"]
+default = []
 
-gdalsource-default = []
 # uses the new process thing instead of the default execution model
 gdalsource-process = []
 

@@ -403,7 +403,7 @@ pub fn connection_closed(req: &HttpRequest, timeout: Option<Duration>) -> BoxFut
 pub fn connection_init(_connection: &dyn Any, _data: &mut Extensions) {}
 
 #[cfg(not(target_os = "linux"))]
-pub fn connection_closed(_req: &HttpRequest, timeout: Option<Duration>) -> BoxFuture<()> {
+pub fn connection_closed(_req: &'_ HttpRequest, timeout: Option<Duration>) -> BoxFuture<'_, ()> {
     if let Some(timeout) = timeout {
         Box::pin(tokio::time::sleep(timeout))
     } else {

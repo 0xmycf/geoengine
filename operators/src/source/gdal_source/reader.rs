@@ -371,7 +371,6 @@ impl GdalReadWindow {
     }
 }
 
-#[derive(Clone)]
 pub struct GridAndProperties<T> {
     pub grid: GridOrEmpty2D<T>,
     pub properties: RasterProperties,
