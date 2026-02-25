@@ -18,7 +18,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 async fn run() -> Result<()> {
     let token = setup();
-    dbg!(token.clone());
+    println!("Starting GDAL process with token: {token}");
 
     let (sender, receiver) = setup_client_for_bytes::<IpcChannelMessage>(token);
 
@@ -46,26 +46,26 @@ async fn run() -> Result<()> {
                     read_advise,
                 } = *b;
 
-                dbg!("Received request for tile data", &dataset_params.file_path);
+                // dbg!("Received request for tile data", &dataset_params.file_path);
                 let params_for_cache = &dataset_params;
 
-                if let Some(tile) = dataset_cache.get(&params_for_cache) {
+                if let Some(tile) = dataset_cache.get(&params_for_cache, &tile_information) {
                     if let Err(some_err) = send_tile(tile, &sender) {
                         panic!("Cannot send data back to engine: {some_err:#?}")
                     }
+                    continue;
                 }
 
                 #[allow(deprecated)] // this is the place where it should be used!
                 let tile = source::__private::load_tile_async(
                     dataset_params.clone(),
                     read_advise,
-                    tile_information,
+                    tile_information.clone(),
                     tile_time,
                     cache_hint,
                 )
                 .await?;
-                // TODO this might be incorrect for the wrong tile_slices
-                dataset_cache.cache(params_for_cache.clone(), tile.clone());
+                dataset_cache.cache(params_for_cache.clone(), tile_information, tile.clone());
                 if let Err(some_err) = send_tile(tile, &sender) {
                     panic!("Error sending data to client {some_err:#?}");
                 }

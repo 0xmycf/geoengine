@@ -4,10 +4,9 @@ use std::process::{Child, Command};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use gdal::raster::GdalType;
-use geoengine_datatypes::raster::{Pixel, RasterTile2D};
+use geoengine_datatypes::raster::{Pixel, RasterTile2D, TileInformation};
 use geoengine_datatypes::{
     primitives::{CacheHint, TimeInterval},
-    raster::TileInformation,
 };
 use ipc_channel::ipc::{self, IpcBytesReceiver, IpcBytesSender, IpcReceiver, IpcSender};
 use num::FromPrimitive;
@@ -216,9 +215,10 @@ impl Drop for ProcessData {
     }
 }
 
-/// A simple, single-entry cache for an open GDAL dataset.
+/// A simple, single-entry cache for an open GDAL dataset tile.
 pub struct GdalDatasetCache<T: Pixel + GdalType + FromPrimitive> {
     parameters: Option<GdalDatasetParameters>,
+    tile_information: Option<TileInformation>,
     dataset: Option<RasterTile2D<T>>,
 }
 
@@ -226,24 +226,37 @@ impl<T: Pixel + GdalType + FromPrimitive> GdalDatasetCache<T> {
     pub fn new() -> Self {
         Self {
             parameters: None,
+            tile_information: None,
             dataset: None,
         }
     }
 
-    pub fn cache(&mut self, parameters: GdalDatasetParameters, dataset: RasterTile2D<T>) {
+    pub fn cache(
+        &mut self,
+        parameters: GdalDatasetParameters,
+        tile_information: TileInformation,
+        dataset: RasterTile2D<T>,
+    ) {
         self.parameters = Some(parameters);
+        self.tile_information = Some(tile_information);
         self.dataset = Some(dataset);
     }
 
     pub fn clear(&mut self) {
         self.parameters = None;
+        self.tile_information = None;
         self.dataset = None;
     }
 
     /// Copies the dataset before returning
-    pub fn get(&self, parameters: &GdalDatasetParameters) -> Option<RasterTile2D<T>> {
-        if let Some(ps) = self.parameters.as_ref()
+    pub fn get(
+        &self,
+        parameters: &GdalDatasetParameters,
+        tile_information: &TileInformation,
+    ) -> Option<RasterTile2D<T>> {
+        if let (Some(ps), Some(ti)) = (self.parameters.as_ref(), self.tile_information.as_ref())
             && *ps == *parameters
+            && *ti == *tile_information
         {
             return self.dataset.clone();
         }

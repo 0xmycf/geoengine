@@ -102,7 +102,6 @@ harness = false
 [[bench]]
 name = "gdal_source_operator_bench"
 harness = false
-required-features = ["gdalsource-default"]
 
 # the bench for the gdalsource-process feature is located
 # in a sub-crate: <roo>/operators/gdalsource_process_bench/benches

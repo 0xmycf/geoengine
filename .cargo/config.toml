@@ -6,5 +6,5 @@ rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 # for release (/ benchmarks), use:
 # GDAL_SOURCE_PROCESS_PATH=target/release/gdalsource-process cargo run --release
 # or
-# GDAL_SOURCE_PROCESS_PATH=target/release/gdalsource-process cargo bench --bench <the_bench>
+# GDAL_SOURCE_PROCESS_PATH=$(pwd)/target/release/gdalsource-process cargo bench --bench <the_bench>
 GDAL_SOURCE_PROCESS_PATH = { value = "target/debug/gdalsource-process", relative = true }
