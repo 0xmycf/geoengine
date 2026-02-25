@@ -39,6 +39,7 @@ use geoengine_datatypes::primitives::{
     SpatialResolution, TimeInterval, TryIrregularTimeFillIterExt, TryRegularTimeFillIterExt,
     find_next_best_overview_level,
 };
+use reader::{GdalReadAdvise, GridAndProperties, ReaderState};
 
 #[cfg(feature = "gdalsource-process")]
 use geoengine_datatypes::raster::arrow_ipc_file_to_raster_tile_2d;
@@ -77,9 +78,6 @@ mod error;
 mod loading_info;
 pub mod process;
 mod reader;
-
-// TODO (high): remove this once I've figured out how the process connects / talks to this module
-pub use reader::{GdalReadAdvise, GridAndProperties, ReaderState};
 
 static GDAL_RETRY_INITIAL_BACKOFF_MS: u64 = 1000;
 static GDAL_RETRY_MAX_BACKOFF_MS: u64 = 60 * 60 * 1000;
@@ -353,7 +351,6 @@ where
 )]
 pub mod __private {
     use super::*;
-    use crate::source::gdal_source::GdalRasterLoader;
 
     pub async fn load_tile_async<T: Pixel + GdalType + FromPrimitive>(
         dataset_params: GdalDatasetParameters,
@@ -362,8 +359,6 @@ pub mod __private {
         tile_time: TimeInterval,
         cache_hint: CacheHint,
     ) -> Result<RasterTile2D<T>> {
-
-
         debug!(
             "Loading tile {:?}, from {}, band: {}",
             &tile_information,
@@ -388,13 +383,6 @@ pub mod __private {
     }
 }
 
-pub async fn load_tile_async<T: Pixel + GdalType + FromPrimitive>(
-    dataset_params: GdalDatasetParameters,
-    gdal_read_advice: GdalReadAdvise,
-) -> Result<Option<GridAndProperties<T>>> {
-    GdalRasterLoader::load_tile_data_async(dataset_params, gdal_read_advice).await
-}
-
 struct GdalRasterLoader {}
 
 impl GdalRasterLoader {
@@ -408,12 +396,11 @@ impl GdalRasterLoader {
         process_data: &ProcessData,
     ) -> Result<RasterTile2D<T>> {
         // TODO: detect usage of vsi curl properly, e.g. also check for `/vsicurl_streaming` and combinations with `/vsizip`
+
         let is_vsi_curl = dataset_params.file_path.starts_with("/vsicurl/");
 
         let ds = dataset_params.clone();
-
         let file_path = ds.file_path.clone();
-        let (mut child, sender, receiver) = spawn_ipc_server_process_bytes::<JsonPayload>();
 
         let data = IpcChannelMessage::new_request_tile_message(IpcChannelMessagePayload {
             cache_hint,
@@ -1841,7 +1828,7 @@ mod tests {
         assert_eq!(msg, recv);
     }
 
-    #[test] // works
+    #[test]
     fn test_sending_time() {
         let msg = TimeInstance::from_millis(10).unwrap();
 
@@ -1852,7 +1839,7 @@ mod tests {
         assert_eq!(msg, recv);
     }
 
-    #[test] // works
+    #[test]
     fn test_sending_time_interval() {
         let msg = TimeInterval::default();
 
@@ -1863,7 +1850,7 @@ mod tests {
         assert_eq!(msg, recv);
     }
 
-    #[test] // does not work (the de-serialization of the nested time interval fails )
+    #[test]
     fn test_sending_request_tile_data() {
         use process::{IpcChannelMessage, IpcChannelMessagePayload};
 
@@ -1950,7 +1937,7 @@ mod tests {
         }
     }
 
-    // TODO name / test
+    // TODO (low): name / test
     #[cfg(feature = "gdalsource-process")]
     fn load_ndvi_jan_2014_by_process(
         output_shape: GridShape2D,

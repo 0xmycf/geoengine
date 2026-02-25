@@ -1,9 +1,6 @@
 use geoengine_datatypes::raster::{RasterTile2D, raster_tile_2d_to_arrow_ipc_file_for_ipc_channel};
-use geoengine_operators::source::gdal_source::{
-    self,
-    process::{
-        GdalDatasetCache, IpcChannelMessage, IpcChannelMessagePayload, setup_client_for_bytes,
-    },
+use geoengine_operators::source::{
+    self, GdalDatasetCache, IpcChannelMessage, IpcChannelMessagePayload, setup_client_for_bytes,
 };
 use ipc_channel::ipc::{IpcBytesSender, IpcError};
 
@@ -59,7 +56,7 @@ async fn run() -> Result<()> {
                 }
 
                 #[allow(deprecated)] // this is the place where it should be used!
-                let tile = gdal_source::__private::load_tile_async(
+                let tile = source::__private::load_tile_async(
                     dataset_params.clone(),
                     read_advise,
                     tile_information,

@@ -1060,7 +1060,7 @@ fn geotiff_to_cog(
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "gdalsource-process")]
-    use crate::source::gdal_source::process::ProcessManager;
+    use crate::source::ProcessManager;
     use std::marker::PhantomData;
     use std::ops::Add;
 

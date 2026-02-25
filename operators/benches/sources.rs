@@ -14,7 +14,8 @@ use geoengine_datatypes::{
 };
 use geoengine_operators::engine::{MockExecutionContext, RasterResultDescriptor, TimeDescriptor};
 #[cfg(feature = "gdalsource-process")]
-use geoengine_operators::source::gdal_source::process::ProcessManager;
+use geoengine_operators::source::ProcessManager;
+
 use geoengine_operators::{
     engine::{ChunkByteSize, RasterQueryProcessor},
     mock::MockRasterSourceProcessor,

@@ -12,7 +12,7 @@ use geoengine_datatypes::{
 use ipc_channel::ipc::{self, IpcBytesReceiver, IpcBytesSender, IpcReceiver, IpcSender};
 use num::FromPrimitive;
 
-use crate::source::{GdalDatasetParameters, gdal_source::reader::GdalReadAdvise};
+use super::{GdalDatasetParameters, GdalReadAdvise};
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq)]
 pub struct IpcChannelMessagePayload {
@@ -25,7 +25,6 @@ pub struct IpcChannelMessagePayload {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq)]
 pub enum IpcChannelMessage {
-    // TODO (high): make sure we send the right data over
     RequestTileData(Box<IpcChannelMessagePayload>),
     EndConnection,
 }
@@ -182,7 +181,6 @@ impl ProcessData {
     }
 
     pub fn send(&self, message: IpcChannelMessage) -> crate::util::Result<()> {
-        // let payload = JsonPayload::new(&message);
         self.sender
             .send(message)
             .map_err(|e| crate::error::Error::Io {
@@ -213,18 +211,15 @@ impl ProcessData {
 
 impl Drop for ProcessData {
     fn drop(&mut self) {
-        let _ = self
-            .sender
-            .send(IpcChannelMessage::EndConnection);
+        let _ = self.sender.send(IpcChannelMessage::EndConnection);
         let _ = self.child.kill();
     }
 }
 
 /// A simple, single-entry cache for an open GDAL dataset.
-/// TODO (high): make sure that this caches the right thing, as we need to make sure that the correct bounds etc are returned
 pub struct GdalDatasetCache<T: Pixel + GdalType + FromPrimitive> {
-    pub parameters: Option<GdalDatasetParameters>,
-    pub dataset: Option<RasterTile2D<T>>,
+    parameters: Option<GdalDatasetParameters>,
+    dataset: Option<RasterTile2D<T>>,
 }
 
 impl<T: Pixel + GdalType + FromPrimitive> GdalDatasetCache<T> {
@@ -245,6 +240,7 @@ impl<T: Pixel + GdalType + FromPrimitive> GdalDatasetCache<T> {
         self.dataset = None;
     }
 
+    /// Copies the dataset before returning
     pub fn get(&self, parameters: &GdalDatasetParameters) -> Option<RasterTile2D<T>> {
         if let Some(ps) = self.parameters.as_ref()
             && *ps == *parameters

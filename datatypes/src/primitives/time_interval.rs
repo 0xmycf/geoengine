@@ -17,9 +17,7 @@ use std::{cmp::Ordering, convert::TryInto};
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq, ToSql, FromSql, Hash)]
 #[repr(C)]
 pub struct TimeInterval {
-    // #[serde(deserialize_with = "crate::primitives::time_instance::deserialize_time_interval")]
     start: TimeInstance,
-    // #[serde(deserialize_with = "crate::primitives::time_instance::deserialize_time_interval")]
     end: TimeInstance,
 }
 

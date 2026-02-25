@@ -1,7 +1,5 @@
 use super::datetime::DateTimeError;
 use super::{DateTime, Duration};
-use crate::error::Error;
-use crate::primitives::PrimitivesError;
 use crate::{
     primitives::error::{self},
     util::Result,
@@ -84,23 +82,6 @@ impl TimeInstance {
     #[inline]
     pub fn is_max(self) -> bool {
         self == Self::MAX
-    }
-
-    /// Deserializes a `TimeInstance` from either RFC 3339 timestamp string or Unix timestamp integer.
-    pub fn deserialize(input: &str) -> Result<Self> {
-        if let Ok(millis) = input.parse::<i64>() {
-            Self::from_millis(millis)
-        } else if let Ok(dt) = input.parse::<u64>() {
-            Self::from_millis(dt as i64)
-        } else {
-            Self::from_str(input).map_err(|e| {
-                let err = PrimitivesError::NoDateTimeParse {
-                    datetime: input.to_string(),
-                    source: e,
-                };
-                Error::Primitives { source: err }
-            })
-        }
     }
 
     pub const MIN: Self = TimeInstance::from_millis_unchecked(-8_334_601_228_800_000);
@@ -203,23 +184,6 @@ impl FromStr for TimeInstance {
         Ok(date_time.into())
     }
 }
-
-// impl Serialize for TimeInstance {
-//     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-//     where
-//         S: serde::Serializer,
-//     {
-//         if serializer.is_human_readable() {
-//             let s = self.as_date_time().map_or_else(
-//                 || format!("Invalid TimeInstance({})", self.0),
-//                 super::datetime::DateTime::to_datetime_string_with_millis,
-//             );
-//             serializer.serialize_str(&s)
-//         } else {
-//             serializer.serialize_i64(self.0)
-//         }
-//     }
-// }
 
 impl<'de> Deserialize<'de> for TimeInstance {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>

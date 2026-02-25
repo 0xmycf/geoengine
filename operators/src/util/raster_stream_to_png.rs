@@ -343,7 +343,7 @@ mod tests {
 
     use crate::engine::{MockExecutionContext, RasterQueryProcessor};
     #[cfg(feature = "gdalsource-process")]
-    use crate::source::gdal_source::process::ProcessManager;
+    use crate::source::ProcessManager;
     use crate::{source::GdalSourceProcessor, util::gdal::create_ndvi_meta_data};
     use geoengine_datatypes::primitives::{DateTime, TimeInstance};
     use geoengine_datatypes::{
