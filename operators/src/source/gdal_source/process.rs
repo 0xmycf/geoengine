@@ -3,11 +3,9 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use gdal::raster::GdalType;
 use geoengine_datatypes::primitives::{CacheHint, TimeInterval};
-use geoengine_datatypes::raster::{Pixel, RasterTile2D, TileInformation};
+use geoengine_datatypes::raster::{RasterDataType, TileInformation, TypedRasterTile2D};
 use ipc_channel::ipc::{self, IpcBytesReceiver, IpcBytesSender, IpcReceiver, IpcSender};
-use num::FromPrimitive;
 
 use super::{GdalDatasetParameters, GdalReadAdvise};
 
@@ -18,6 +16,8 @@ pub struct IpcChannelMessagePayload {
     pub tile_information: TileInformation,
     pub tile_time: TimeInterval,
     pub read_advise: GdalReadAdvise,
+    /// We use this to know what type we serialize using the arrow_conversion functions
+    pub data_type: RasterDataType,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq)]
@@ -211,13 +211,13 @@ impl Drop for ProcessData {
 }
 
 /// A simple, single-entry cache for an open GDAL dataset tile.
-pub struct GdalDatasetCache<T: Pixel + GdalType + FromPrimitive> {
+pub struct GdalDatasetCache {
     parameters: Option<GdalDatasetParameters>,
     tile_information: Option<TileInformation>,
-    dataset: Option<RasterTile2D<T>>,
+    dataset: Option<TypedRasterTile2D>,
 }
 
-impl<T: Pixel + GdalType + FromPrimitive> GdalDatasetCache<T> {
+impl GdalDatasetCache {
     pub fn new() -> Self {
         Self {
             parameters: None,
@@ -230,7 +230,7 @@ impl<T: Pixel + GdalType + FromPrimitive> GdalDatasetCache<T> {
         &mut self,
         parameters: GdalDatasetParameters,
         tile_information: TileInformation,
-        dataset: RasterTile2D<T>,
+        dataset: TypedRasterTile2D,
     ) {
         self.parameters = Some(parameters);
         self.tile_information = Some(tile_information);
@@ -243,12 +243,12 @@ impl<T: Pixel + GdalType + FromPrimitive> GdalDatasetCache<T> {
         self.dataset = None;
     }
 
-    /// Copies the dataset before returning
+    /// Clones the dataset before returning
     pub fn get(
         &self,
         parameters: &GdalDatasetParameters,
         tile_information: &TileInformation,
-    ) -> Option<RasterTile2D<T>> {
+    ) -> Option<TypedRasterTile2D> {
         if let (Some(ps), Some(ti)) = (self.parameters.as_ref(), self.tile_information.as_ref())
             && *ps == *parameters
             && *ti == *tile_information

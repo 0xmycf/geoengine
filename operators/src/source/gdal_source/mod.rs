@@ -408,6 +408,7 @@ impl GdalRasterLoader {
             tile_information,
             tile_time,
             read_advise,
+            data_type: T::TYPE
         });
 
         let result = process_data
@@ -1866,6 +1867,7 @@ mod tests {
         };
 
         let payload = IpcChannelMessagePayload {
+            data_type: RasterDataType::U8,
             dataset_params: GdalDatasetParameters {
                 file_path: test_data!("raster/modis_ndvi/MOD13A2_M_NDVI_2014-01-01.TIFF").into(),
                 rasterband_channel: 1,

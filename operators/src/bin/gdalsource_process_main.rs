@@ -1,8 +1,12 @@
-use geoengine_datatypes::raster::{RasterTile2D, raster_tile_2d_to_arrow_ipc_file_for_ipc_channel};
+use gdal::raster::GdalType;
+use geoengine_datatypes::raster::{
+    Pixel, RasterTile2D, TypedRasterTile2D, raster_tile_2d_to_arrow_ipc_file_for_ipc_channel,
+};
 use geoengine_operators::source::{
     self, GdalDatasetCache, IpcChannelMessage, IpcChannelMessagePayload, setup_client_for_bytes,
 };
 use ipc_channel::ipc::{IpcBytesSender, IpcError};
+use num::FromPrimitive;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -28,7 +32,6 @@ async fn run() -> Result<()> {
         let message = receiver.recv().map_err(|e| {
             match e {
                 IpcError::Bincode(ref error_kind) => {
-                    // bincode error
                     dbg!(error_kind);
                 }
                 IpcError::Io(_) | IpcError::Disconnected => (),
@@ -37,38 +40,38 @@ async fn run() -> Result<()> {
         })?;
 
         match message {
-            IpcChannelMessage::RequestTileData(b) => {
-                let IpcChannelMessagePayload {
-                    dataset_params,
-                    tile_information,
-                    tile_time,
-                    cache_hint,
-                    read_advise,
-                } = *b;
-
-                let params_for_cache = &dataset_params;
-
-                if let Some(tile) = dataset_cache.get(&params_for_cache, &tile_information) {
-                    if let Err(some_err) = send_tile(tile, &sender) {
-                        panic!("Cannot send data back to engine: {some_err:#?}")
-                    }
-                    continue;
+            IpcChannelMessage::RequestTileData(b) => match b.data_type {
+                geoengine_datatypes::raster::RasterDataType::U8 => {
+                    handle::<u8>(*b, &mut dataset_cache, &sender).await?
                 }
-
-                #[allow(deprecated)] // this is the place where it should be used!
-                let tile = source::__private::load_tile_async(
-                    dataset_params.clone(),
-                    read_advise,
-                    tile_information.clone(),
-                    tile_time,
-                    cache_hint,
-                )
-                .await?;
-                dataset_cache.cache(params_for_cache.clone(), tile_information, tile.clone());
-                if let Err(some_err) = send_tile(tile, &sender) {
-                    panic!("Error sending data to client {some_err:#?}");
+                geoengine_datatypes::raster::RasterDataType::U16 => {
+                    handle::<u16>(*b, &mut dataset_cache, &sender).await?
                 }
-            }
+                geoengine_datatypes::raster::RasterDataType::U32 => {
+                    handle::<u32>(*b, &mut dataset_cache, &sender).await?
+                }
+                geoengine_datatypes::raster::RasterDataType::U64 => {
+                    handle::<u64>(*b, &mut dataset_cache, &sender).await?
+                }
+                geoengine_datatypes::raster::RasterDataType::I8 => {
+                    handle::<i8>(*b, &mut dataset_cache, &sender).await?
+                }
+                geoengine_datatypes::raster::RasterDataType::I16 => {
+                    handle::<i16>(*b, &mut dataset_cache, &sender).await?
+                }
+                geoengine_datatypes::raster::RasterDataType::I32 => {
+                    handle::<i32>(*b, &mut dataset_cache, &sender).await?
+                }
+                geoengine_datatypes::raster::RasterDataType::I64 => {
+                    handle::<i64>(*b, &mut dataset_cache, &sender).await?
+                }
+                geoengine_datatypes::raster::RasterDataType::F32 => {
+                    handle::<f32>(*b, &mut dataset_cache, &sender).await?
+                }
+                geoengine_datatypes::raster::RasterDataType::F64 => {
+                    handle::<f64>(*b, &mut dataset_cache, &sender).await?
+                }
+            },
             IpcChannelMessage::EndConnection => {
                 return Ok(());
             }
@@ -76,8 +79,66 @@ async fn run() -> Result<()> {
     }
 }
 
-fn send_tile(tile: RasterTile2D<u8>, sender: &IpcBytesSender) -> Result<()> {
-    let ipc_data = raster_tile_2d_to_arrow_ipc_file_for_ipc_channel::<u8>(tile)?;
+async fn handle<P: FromPrimitive + Pixel + GdalType>(
+    IpcChannelMessagePayload {
+        cache_hint,
+        dataset_params,
+        tile_information,
+        tile_time,
+        read_advise,
+        data_type: _,
+    }: IpcChannelMessagePayload,
+    dataset_cache: &mut GdalDatasetCache,
+    sender: &IpcBytesSender,
+) -> Result<()>
+where
+    RasterTile2D<P>: Into<TypedRasterTile2D>,
+{
+    let params_for_cache = &dataset_params;
+
+    if let Some(tile) = dataset_cache.get(params_for_cache, &tile_information) {
+        if let Err(some_err) = send_tile(tile, sender) {
+            panic!("Cannot send data back to engine: {some_err:#?}")
+        }
+        return Ok(());
+    }
+
+    #[allow(deprecated)] // this is the place where it should be used!
+    let tile: RasterTile2D<P> = source::__private::load_tile_async(
+        dataset_params.clone(),
+        read_advise,
+        tile_information.clone(),
+        tile_time,
+        cache_hint,
+    )
+    .await?;
+
+    let typed_tile: TypedRasterTile2D = tile.into();
+    dataset_cache.cache(
+        params_for_cache.clone(),
+        tile_information,
+        typed_tile.clone(),
+    );
+
+    if let Err(some_err) = send_tile(typed_tile, sender) {
+        panic!("Error sending data to client {some_err:#?}");
+    }
+    Ok(())
+}
+
+fn send_tile(tile: TypedRasterTile2D, sender: &IpcBytesSender) -> Result<()> {
+    let ipc_data = match tile {
+        TypedRasterTile2D::U8(t) => raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(t)?,
+        TypedRasterTile2D::U16(t) => raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(t)?,
+        TypedRasterTile2D::U32(t) => raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(t)?,
+        TypedRasterTile2D::U64(t) => raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(t)?,
+        TypedRasterTile2D::I8(t) => raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(t)?,
+        TypedRasterTile2D::I16(t) => raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(t)?,
+        TypedRasterTile2D::I32(t) => raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(t)?,
+        TypedRasterTile2D::I64(t) => raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(t)?,
+        TypedRasterTile2D::F32(t) => raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(t)?,
+        TypedRasterTile2D::F64(t) => raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(t)?,
+    };
     sender.send(&ipc_data)?;
     Ok(())
 }
