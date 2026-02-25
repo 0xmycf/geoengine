@@ -46,7 +46,6 @@ async fn run() -> Result<()> {
                     read_advise,
                 } = *b;
 
-                // dbg!("Received request for tile data", &dataset_params.file_path);
                 let params_for_cache = &dataset_params;
 
                 if let Some(tile) = dataset_cache.get(&params_for_cache, &tile_information) {

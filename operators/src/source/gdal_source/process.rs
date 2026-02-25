@@ -4,10 +4,8 @@ use std::process::{Child, Command};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use gdal::raster::GdalType;
+use geoengine_datatypes::primitives::{CacheHint, TimeInterval};
 use geoengine_datatypes::raster::{Pixel, RasterTile2D, TileInformation};
-use geoengine_datatypes::{
-    primitives::{CacheHint, TimeInterval},
-};
 use ipc_channel::ipc::{self, IpcBytesReceiver, IpcBytesSender, IpcReceiver, IpcSender};
 use num::FromPrimitive;
 
@@ -108,7 +106,7 @@ where
 /// RoundRobin by default, but if a [`RaterTile2D`] is requested that is already
 /// in cache use the corresponding process instead.
 ///
-/// If no process is available, this waits till there is one.
+/// The workers are only started once requested.
 pub struct ProcessManager {
     rr_index: usize,
     pool: Vec<LazyLock<Arc<ProcessData>>>,
@@ -161,56 +159,53 @@ impl ProcessManager {
 
 pub struct ProcessData {
     child: Child,
-    sender: IpcSender<IpcChannelMessage>,
-    receiver: Mutex<IpcBytesReceiver>,
+    /// stored in one mutex to gether to ensure that one call to `send`,
+    /// ends up with the correct result from `recv`
+    sender_receiver_pair: Mutex<(IpcSender<IpcChannelMessage>, IpcBytesReceiver)>,
 }
 
 impl ProcessData {
     fn new(child: Child, sender: IpcSender<IpcChannelMessage>, receiver: IpcBytesReceiver) -> Self {
         Self {
             child,
-            sender,
-            receiver: Mutex::new(receiver),
+            sender_receiver_pair: Mutex::new((sender, receiver)),
         }
     }
 
+    /// Spawns a new child process
+    /// Is kept alive until `Self` is dropped.
     pub fn spawn() -> Arc<Self> {
         let (child, sender, receiver) = spawn_ipc_server_process_bytes::<IpcChannelMessage>();
         Arc::new(Self::new(child, sender, receiver))
     }
 
-    pub fn send(&self, message: IpcChannelMessage) -> crate::util::Result<()> {
-        self.sender
-            .send(message)
-            .map_err(|e| crate::error::Error::Io {
-                source: std::io::Error::other(e.to_string()),
-            })
-    }
-
-    pub fn recv(&self) -> crate::util::Result<Vec<u8>> {
-        self.receiver
+    /// Sends `message` to the worker and blocks until the response arrives.
+    pub fn send_recv_blocking(&self, message: IpcChannelMessage) -> crate::util::Result<Vec<u8>> {
+        let pair = self
+            .sender_receiver_pair
             .lock()
-            .expect("icp receiver lock should be aquireable")
-            .recv()
-            .map_err(|e| crate::error::Error::Io {
-                source: std::io::Error::other(e.to_string()),
-            })
-    }
+            .expect("lock should not be poisoned");
 
-    pub async fn try_recv(self: Arc<Self>) -> crate::util::Result<Vec<u8>> {
-        self.receiver
-            .lock()
-            .expect("icp receiver lock should be aquireable")
-            .try_recv()
-            .map_err(|e| crate::error::Error::Io {
-                source: std::io::Error::other(e.to_string()),
-            })
+        let sender = &pair.0;
+        let receiver = &pair.1;
+
+        sender.send(message).map_err(|e| crate::error::Error::Io {
+            source: std::io::Error::other(e.to_string()),
+        })?;
+
+        let bytes = receiver.recv().map_err(|e| crate::error::Error::Io {
+            source: std::io::Error::other(e.to_string()),
+        })?;
+
+        Ok(bytes)
     }
 }
 
 impl Drop for ProcessData {
     fn drop(&mut self) {
-        let _ = self.sender.send(IpcChannelMessage::EndConnection);
+        if let Ok((sender, _receiver)) = self.sender_receiver_pair.get_mut() {
+            let _ = sender.send(IpcChannelMessage::EndConnection);
+        }
         let _ = self.child.kill();
     }
 }

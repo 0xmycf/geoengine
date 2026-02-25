@@ -402,32 +402,28 @@ impl GdalRasterLoader {
         let ds = dataset_params.clone();
         let file_path = ds.file_path.clone();
 
-        let data = IpcChannelMessage::new_request_tile_message(IpcChannelMessagePayload {
+        let message = IpcChannelMessage::new_request_tile_message(IpcChannelMessagePayload {
             cache_hint,
             dataset_params,
             tile_information,
             tile_time,
             read_advise,
         });
-        process_data.send(data).map_err(|e| Error::Io {
-            source: std::io::Error::other(format!(
-                "Failed to send request to gdal source process: {}",
-                e
-            )),
-        })?;
 
-        let load_tile_result = process_data.recv().map(|msg| {
-            arrow_ipc_file_to_raster_tile_2d::<T>(msg).map_err(|e| Error::Io {
-                source: std::io::Error::other(format!(
-                    "Failed to convert arrow ipc data to raster tile: {}",
-                    e
-                )),
-            })
-        });
+        let result = process_data
+            .send_recv_blocking(message)
+            .and_then(|msg| {
+                arrow_ipc_file_to_raster_tile_2d::<T>(msg).map_err(|e| Error::Io {
+                    source: std::io::Error::other(format!(
+                        "Failed to convert arrow ipc data to raster tile: {}",
+                        e
+                    )),
+                })
+            });
 
-        match load_tile_result {
-            Ok(Ok(r)) => Ok(r),
-            Ok(Err(e)) | Err(e) => {
+        match result {
+            Ok(r) => Ok(r),
+            Err(e) => {
                 if is_vsi_curl {
                     // clear the VSICurl cache, to force GDAL to try to re-download the file
                     // otherwise it will assume any observed error will happen again
@@ -540,14 +536,18 @@ impl GdalRasterLoader {
                     manager.acquire(&ds.file_path)
                 };
 
-                Self::load_tile_data_process(
-                    ds,
-                    tile_information,
-                    tile_time,
-                    gdal_read_advise,
-                    cache_hint,
-                    &process_data,
-                )
+                crate::util::spawn_blocking(move || {
+                    Self::load_tile_data_process(
+                        ds,
+                        tile_information,
+                        tile_time,
+                        gdal_read_advise,
+                        cache_hint,
+                        &process_data,
+                    )
+                })
+                .await
+                .context(crate::error::TokioJoin)?
             }
             _ => {
                 debug!(
@@ -2292,8 +2292,6 @@ mod tests {
             properties,
             cache_hint: _,
         } = load_ndvi_jan_2014_by_process(output_shape, output_bounds, pd.clone()).unwrap();
-
-        pd.send(IpcChannelMessage::EndConnection).unwrap();
 
         assert!(!grid.is_empty());
 

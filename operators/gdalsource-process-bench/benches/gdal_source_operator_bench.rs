@@ -1,9 +1,10 @@
 use std::cell::Cell;
+use std::str::FromStr;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use futures::StreamExt;
 use geoengine_datatypes::{
-    primitives::{BandSelection, RasterQueryRectangle, TimeInterval},
+    primitives::{BandSelection, RasterQueryRectangle, TimeInstance, TimeInterval},
     raster::{GridBoundingBox2D, GridShape2D, GridSize},
 };
 use rand::rngs::SmallRng;
@@ -58,11 +59,15 @@ fn make_query_rectangles(
         .collect()
 }
 
-fn bench_with_shape(c: &mut Criterion, bench_name: &str, output_shape: GridShape2D) {
+fn bench_with_shape(
+    c: &mut Criterion,
+    bench_name: &str,
+    output_shape: GridShape2D,
+    time_interval: TimeInterval,
+) {
     let _ = ThreadPoolBuilder::new().build_global();
     let meta = create_ndvi_meta_data();
     let params = meta.params.clone();
-    let time_interval = meta.data_time;
     let query_rectangles = make_query_rectangles(512, output_shape, &params, time_interval, 0);
     let query_idx = Cell::new(0);
 
@@ -112,8 +117,42 @@ fn bench_with_shape(c: &mut Criterion, bench_name: &str, output_shape: GridShape
 }
 
 fn gdal_source_operator_process(c: &mut Criterion) {
-    bench_with_shape(c, "gdal_source_operator_process_small", [8, 8].into());
-    bench_with_shape(c, "gdal_source_operator_process_large", [256, 256].into());
+    let meta = create_ndvi_meta_data();
+
+    // One time interval
+    let single_ts = TimeInterval::new_unchecked(
+        // time step is months for this dataset
+        TimeInstance::from_str("2014-01-01T00:00:00.000Z").expect("it shoudl be valid"),
+        TimeInstance::from_str("2014-02-01T00:00:00.000Z").expect("it should be valid"),
+    );
+
+    // multiple time slices
+    let multi_ts = meta.data_time;
+
+    bench_with_shape(
+        c,
+        "gdal_source_operator_process_small_single_ts",
+        [8, 8].into(),
+        single_ts,
+    );
+    bench_with_shape(
+        c,
+        "gdal_source_operator_process_small_multi_ts",
+        [8, 8].into(),
+        multi_ts,
+    );
+    bench_with_shape(
+        c,
+        "gdal_source_operator_process_large_single_ts",
+        [256, 256].into(),
+        single_ts,
+    );
+    bench_with_shape(
+        c,
+        "gdal_source_operator_process_large_multi_ts",
+        [256, 256].into(),
+        multi_ts,
+    );
 }
 
 criterion_group!(benches, gdal_source_operator_process);
