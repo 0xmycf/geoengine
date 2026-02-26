@@ -3,6 +3,8 @@ use crate::engine::{
     SpatialGridDescriptor, WorkflowOperatorPath,
 };
 use crate::optimization::{OptimizableOperator, OptimizationError, SourcesMustNotUseOverviews};
+#[cfg(feature = "gdalsource-process")]
+use crate::source::GdalDatasetCache;
 use crate::source::gdal_source::process::ProcessManager;
 #[cfg(feature = "gdalsource-process")]
 use crate::source::gdal_source::process::{
@@ -83,8 +85,11 @@ static GDAL_RETRY_INITIAL_BACKOFF_MS: u64 = 1000;
 static GDAL_RETRY_MAX_BACKOFF_MS: u64 = 60 * 60 * 1000;
 static GDAL_RETRY_EXPONENTIAL_BACKOFF_FACTOR: f64 = 2.;
 
+/*
+
+*/
 #[cfg(feature = "gdalsource-process")]
-const DEFAULT_PROCESS_WORKER_POOL_SIZE: usize = 4;
+const DEFAULT_PROCESS_WORKER_POOL_SIZE: usize = 1;
 
 /// Parameters for the GDAL Source Operator
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
@@ -349,10 +354,14 @@ where
 #[deprecated(
     note = "Do not use this directly. This is meant for use in `operators/src/bin/gdalsource_process_main.rs` only."
 )]
+#[cfg(feature = "gdalsource-process")]
 pub mod __private {
+    use crate::source::GdalDatasetCache;
+
     use super::*;
 
-    pub async fn load_tile_async<T: Pixel + GdalType + FromPrimitive>(
+    pub async fn load_tile_async_cached<T: Pixel + GdalType + FromPrimitive>(
+        cache: &mut GdalDatasetCache,
         dataset_params: GdalDatasetParameters,
         gdal_read_advise: GdalReadAdvise,
         tile_information: TileInformation,
@@ -366,7 +375,8 @@ pub mod __private {
             dataset_params.rasterband_channel
         );
 
-        let grid = GdalRasterLoader::load_tile_data_async(dataset_params, gdal_read_advise).await?;
+        let grid =
+            GdalRasterLoader::load_tile_data_async(cache, dataset_params, gdal_read_advise).await?;
 
         match grid {
             Some(grid) => Ok(RasterTile2D::new_with_properties(
@@ -408,19 +418,17 @@ impl GdalRasterLoader {
             tile_information,
             tile_time,
             read_advise,
-            data_type: T::TYPE
+            data_type: T::TYPE,
         });
 
-        let result = process_data
-            .send_recv_blocking(message)
-            .and_then(|msg| {
-                arrow_ipc_file_to_raster_tile_2d::<T>(msg).map_err(|e| Error::Io {
-                    source: std::io::Error::other(format!(
-                        "Failed to convert arrow ipc data to raster tile: {}",
-                        e
-                    )),
-                })
-            });
+        let result = process_data.send_recv_blocking(message).and_then(|msg| {
+            arrow_ipc_file_to_raster_tile_2d::<T>(msg).map_err(|e| Error::Io {
+                source: std::io::Error::other(format!(
+                    "Failed to convert arrow ipc data to raster tile: {}",
+                    e
+                )),
+            })
+        });
 
         match result {
             Ok(r) => Ok(r),
@@ -440,13 +448,23 @@ impl GdalRasterLoader {
     /// A method to async load single tiles from a GDAL dataset.
     ///
     async fn load_tile_data_async<T: Pixel + GdalType + FromPrimitive>(
+        #[cfg(feature = "gdalsource-process")] cache: &mut GdalDatasetCache,
         dataset_params: GdalDatasetParameters,
         read_advise: GdalReadAdvise,
     ) -> Result<Option<GridAndProperties<T>>> {
         // TODO: detect usage of vsi curl properly, e.g. also check for `/vsicurl_streaming` and combinations with `/vsizip`
         let is_vsi_curl = dataset_params.file_path.starts_with("/vsicurl/");
 
-        retry(
+        #[cfg(feature = "gdalsource-process")]
+        let path_for_cache = dataset_params.file_path.clone();
+
+        #[cfg(feature = "gdalsource-process")]
+        let protected_dataset = &Arc::new(std::sync::Mutex::new(cache.take(&path_for_cache)));
+
+        #[cfg(feature = "gdalsource-process")]
+        let protected_dataset_out = Arc::clone(&protected_dataset);
+
+        let ret = retry(
             dataset_params
                 .retry
                 .map(|r| r.max_retries)
@@ -458,11 +476,19 @@ impl GdalRasterLoader {
                 let ds = dataset_params.clone();
                 let file_path = ds.file_path.clone();
 
+                #[cfg(feature = "gdalsource-process")]
+                let ads = std::sync::Arc::clone(&protected_dataset);
                 async move {
-                    let load_tile_result =
-                        crate::util::spawn_blocking(move || Self::load_tile_data(&ds, read_advise))
-                            .await
-                            .context(crate::error::TokioJoin);
+                    let load_tile_result = crate::util::spawn_blocking(move || {
+                        Self::load_tile_data(
+                            #[cfg(feature = "gdalsource-process")]
+                            ads,
+                            &ds,
+                            read_advise,
+                        )
+                    })
+                    .await
+                    .context(crate::error::TokioJoin);
 
                     match load_tile_result {
                         Ok(Ok(r)) => Ok(r),
@@ -479,7 +505,22 @@ impl GdalRasterLoader {
                 }
             },
         )
-        .await
+        .await;
+
+        #[cfg(feature = "gdalsource-process")]
+        if ret.is_ok() {
+            match std::sync::Arc::into_inner(protected_dataset_out) {
+                Some(inner) => match inner.into_inner().expect("mutex should not be poisoned") {
+                    Some(ds) => {
+                        cache.cache(path_for_cache, ds);
+                    }
+                    None => panic!("the mutex could not be into_innered"),
+                },
+                None => panic!("the arc could not be unwrapped!"),
+            }
+        }
+
+        ret
     }
 
     fn read_advise_for_tile(
@@ -561,10 +602,7 @@ impl GdalRasterLoader {
         }
     }
 
-    // this is used if the gdalsource-process feature is disabled, but
-    // if we do #[cfg(not(feature = "..."))] then there will be errors at many places (which are fixable by annotating those too)
-    // but since, the long-term goal is to completely move to the proecess feature, we just ignore those warnings for now.
-    #[allow(unused)]
+    #[cfg(not(feature = "gdalsource-process"))]
     async fn load_tile_async<T: Pixel + GdalType + FromPrimitive>(
         dataset_params: Option<GdalDatasetParameters>,
         reader_mode: GdalReaderMode,
@@ -625,6 +663,7 @@ impl GdalRasterLoader {
     /// A method to load single tiles from a GDAL dataset.
     ///
     fn load_tile_data<T: Pixel + GdalType + FromPrimitive>(
+        #[cfg(feature = "gdalsource-process")] cache: Arc<std::sync::Mutex<Option<GdalDataset>>>,
         dataset_params: &GdalDatasetParameters,
         read_advise: GdalReadAdvise,
     ) -> Result<Option<GridAndProperties<T>>> {
@@ -647,6 +686,26 @@ impl GdalRasterLoader {
             .as_ref()
             .map(|config_options| TemporaryGdalThreadLocalConfigOptions::new(config_options));
 
+        #[cfg(feature = "gdalsource-process")]
+        let dataset_result = cache
+            .lock()
+            .expect("mutex guard should not be poisoned")
+            .take()
+            .map_or_else(
+                || {
+                    gdal_open_dataset_ex(
+                        &dataset_params.file_path,
+                        DatasetOptions {
+                            open_flags: GdalOpenFlags::GDAL_OF_RASTER,
+                            open_options: options.as_deref(),
+                            ..DatasetOptions::default()
+                        },
+                    )
+                },
+                Ok,
+            );
+
+        #[cfg(not(feature = "gdalsource-process"))]
         let dataset_result = gdal_open_dataset_ex(
             &dataset_params.file_path,
             DatasetOptions {
@@ -710,6 +769,11 @@ impl GdalRasterLoader {
 
         let properties = read_raster_properties(&dataset, dataset_params, &rasterband);
 
+        #[cfg(feature = "gdalsource-process")]
+        {
+            *cache.lock().expect("mutex guard should not be poisoned") = Some(dataset);
+        }
+
         let elapsed = start.elapsed();
         debug!("data loaded -> returning data grid, took {elapsed:?}");
 
@@ -722,6 +786,7 @@ impl GdalRasterLoader {
     ///
     /// A stream of futures producing `RasterTile2D` for a single slice in time
     ///
+    #[cfg(not(feature = "gdalsource-process"))]
     fn temporal_slice_tile_future_stream<T: Pixel + GdalType + FromPrimitive>(
         spatial_query: GridBoundingBox2D,
         info: GdalLoadingInfoTemporalSlice,
@@ -796,10 +861,7 @@ impl GdalRasterLoader {
             .try_buffered(16) // TODO: make this configurable
     }
 
-    // this is used if the gdalsource-process feature is disabled, but
-    // if we do #[cfg(not(feature = "..."))] then there will be errors at many places (which are fixable by annotating those too)
-    // but since, the long-term goal is to completely move to the proecess feature, we just ignore those warnings for now.
-    #[allow(unused)]
+    #[cfg(not(feature = "gdalsource-process"))]
     fn loading_info_to_tile_stream<
         T: Pixel + GdalType + FromPrimitive,
         S: Stream<Item = Result<GdalLoadingInfoTemporalSlice>>,
@@ -1672,13 +1734,18 @@ mod tests {
     use crate::test_data;
     use crate::util::Result;
     use crate::util::gdal::add_ndvi_dataset;
+    #[cfg(not(feature = "gdalsource-process"))]
     use float_cmp::assert_approx_eq;
     use geoengine_datatypes::hashmap;
     use geoengine_datatypes::primitives::{AxisAlignedRectangle, SpatialPartition2D, TimeInstance};
-    use geoengine_datatypes::raster::{BoundedGrid, GridShape2D, SpatialGridDefinition};
-    use geoengine_datatypes::raster::{
-        EmptyGrid2D, GridBounds, GridIdx2D, TilesEqualIgnoringCacheHint,
-    };
+    use geoengine_datatypes::raster::GridShape2D;
+
+    #[cfg(not(feature = "gdalsource-process"))]
+    use geoengine_datatypes::raster::{BoundedGrid, SpatialGridDefinition};
+    #[cfg(not(feature = "gdalsource-process"))]
+    use geoengine_datatypes::raster::{EmptyGrid2D, TilesEqualIgnoringCacheHint};
+
+    use geoengine_datatypes::raster::{GridBounds, GridIdx2D};
     use geoengine_datatypes::raster::{TileInformation, TilingStrategy};
     use geoengine_datatypes::util::gdal::hide_gdal_errors;
     use httptest::matchers::request;
@@ -2049,7 +2116,12 @@ mod tests {
             retry: None,
         };
 
-        GdalRasterLoader::load_tile_data::<u8>(&dataset_params, gdal_read_advice)
+        GdalRasterLoader::load_tile_data::<u8>(
+            #[cfg(feature = "gdalsource-process")]
+            Arc::new(std::sync::Mutex::new(None)),
+            &dataset_params,
+            gdal_read_advice,
+        )
     }
 
     #[test]
@@ -2563,6 +2635,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(feature = "gdalsource-process"))]
     async fn timestep_without_params() {
         let output_bounds =
             SpatialPartition2D::new_unchecked((-90., 90.).into(), (90., -90.).into());
@@ -2757,6 +2830,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
+    #[cfg(not(feature = "gdalsource-process"))]
     fn read_up_side_down_raster() {
         let up_side_down_params = GdalDatasetParameters {
             file_path: test_data!(
@@ -2856,10 +2930,14 @@ mod tests {
 
         assert_eq!(gdal_read_advice, exp_gdal_read_advice);
 
-        let GridAndProperties { grid, properties } =
-            GdalRasterLoader::load_tile_data::<u8>(&up_side_down_params, gdal_read_advice)
-                .unwrap()
-                .unwrap();
+        let GridAndProperties { grid, properties } = GdalRasterLoader::load_tile_data::<u8>(
+            #[cfg(feature = "gdalsource-process")]
+            None,
+            &up_side_down_params,
+            gdal_read_advice,
+        )
+        .unwrap()
+        .unwrap();
 
         assert!(!grid.is_empty());
         let grid = grid.into_materialized_masked_grid();
@@ -2884,6 +2962,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "gdalsource-process"))]
     fn read_raster_and_offset_scale() {
         let up_side_down_params = GdalDatasetParameters {
             file_path: test_data!("raster/modis_ndvi/cropped/MOD13A2_M_NDVI_2014-04-01_30x30.tif")
@@ -2912,10 +2991,14 @@ mod tests {
             flip_y: false,
         };
 
-        let GridAndProperties { grid, properties } =
-            GdalRasterLoader::load_tile_data::<u8>(&up_side_down_params, gdal_read_advice)
-                .unwrap()
-                .unwrap();
+        let GridAndProperties { grid, properties } = GdalRasterLoader::load_tile_data::<u8>(
+            #[cfg(feature = "gdalsource-process")]
+            None,
+            &up_side_down_params,
+            gdal_read_advice,
+        )
+        .unwrap()
+        .unwrap();
 
         assert!(!grid.is_empty());
 
@@ -2954,6 +3037,7 @@ mod tests {
         assert!(approx_eq!(f64, properties.scale(), 2.));
     }
 
+    #[cfg(not(feature = "gdalsource-process"))]
     #[test]
     fn it_creates_no_data_only_for_missing_files() {
         hide_gdal_errors();
@@ -2980,7 +3064,12 @@ mod tests {
             flip_y: false,
         };
 
-        let res = GdalRasterLoader::load_tile_data::<u8>(&ds, gdal_read_advice);
+        let res = GdalRasterLoader::load_tile_data::<u8>(
+            #[cfg(feature = "gdalsource-process")]
+            None,
+            &ds,
+            gdal_read_advice,
+        );
 
         assert!(res.is_ok());
 
@@ -3004,10 +3093,16 @@ mod tests {
         };
 
         // invalid channel => error
-        let result = GdalRasterLoader::load_tile_data::<u8>(&ds, gdal_read_advice);
+        let result = GdalRasterLoader::load_tile_data::<u8>(
+            #[cfg(feature = "gdalsource-process")]
+            None,
+            &ds,
+            gdal_read_advice,
+        );
         assert!(result.is_err());
     }
 
+    #[cfg(not(feature = "gdalsource-process"))]
     #[test]
     fn it_creates_no_data_only_for_http_404() {
         let server = Server::run();
@@ -3090,7 +3185,12 @@ mod tests {
         };
 
         // 500 => error
-        let res = GdalRasterLoader::load_tile_data::<u8>(&ds, gdal_read_advice);
+        let res = GdalRasterLoader::load_tile_data::<u8>(
+            #[cfg(feature = "gdalsource-process")]
+            None,
+            &ds,
+            gdal_read_advice,
+        );
         assert!(res.is_err());
     }
 
@@ -3177,6 +3277,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "gdalsource-process"))]
     #[tokio::test]
     async fn it_attaches_cache_hint() {
         let output_bounds =

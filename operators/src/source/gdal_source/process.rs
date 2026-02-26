@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::{Arc, LazyLock, Mutex};
 
+use gdal::Dataset as GdalDataset;
 use geoengine_datatypes::primitives::{CacheHint, TimeInterval};
-use geoengine_datatypes::raster::{RasterDataType, TileInformation, TypedRasterTile2D};
+use geoengine_datatypes::raster::{RasterDataType, TileInformation};
 use ipc_channel::ipc::{self, IpcBytesReceiver, IpcBytesSender, IpcReceiver, IpcSender};
 
 use super::{GdalDatasetParameters, GdalReadAdvise};
@@ -212,49 +213,42 @@ impl Drop for ProcessData {
 
 /// A simple, single-entry cache for an open GDAL dataset tile.
 pub struct GdalDatasetCache {
-    parameters: Option<GdalDatasetParameters>,
-    tile_information: Option<TileInformation>,
-    dataset: Option<TypedRasterTile2D>,
+    path: Option<PathBuf>,
+    dataset: Option<GdalDataset>,
 }
 
 impl GdalDatasetCache {
     pub fn new() -> Self {
         Self {
-            parameters: None,
-            tile_information: None,
+            path: None,
             dataset: None,
         }
     }
 
-    pub fn cache(
-        &mut self,
-        parameters: GdalDatasetParameters,
-        tile_information: TileInformation,
-        dataset: TypedRasterTile2D,
-    ) {
-        self.parameters = Some(parameters);
-        self.tile_information = Some(tile_information);
+    pub fn cache(&mut self, path: PathBuf, dataset: GdalDataset) {
+        self.path = Some(path);
         self.dataset = Some(dataset);
     }
 
     pub fn clear(&mut self) {
-        self.parameters = None;
-        self.tile_information = None;
+        self.path = None;
         self.dataset = None;
     }
 
-    /// Clones the dataset before returning
-    pub fn get(
-        &self,
-        parameters: &GdalDatasetParameters,
-        tile_information: &TileInformation,
-    ) -> Option<TypedRasterTile2D> {
-        if let (Some(ps), Some(ti)) = (self.parameters.as_ref(), self.tile_information.as_ref())
-            && *ps == *parameters
-            && *ti == *tile_information
+    /// Moves the GdlaDataset becuase it does not implement clone()
+    pub fn take(&mut self, input_path: &PathBuf) -> Option<GdalDataset> {
+        if let Some(path_ref) = self.path.as_ref()
+            && *path_ref == *input_path
         {
-            return self.dataset.clone();
+            return self.dataset.take();
         }
         None
+    }
+
+    pub fn contains(&self, input_path: &PathBuf) -> bool {
+        self.path
+            .as_ref()
+            .map(|path_ref| *path_ref == *input_path)
+            .unwrap_or_default()
     }
 }

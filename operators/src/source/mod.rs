@@ -9,12 +9,15 @@ pub use self::csv::{
 
 // __private has a deprecation warning, but must be exported for the bin
 #[allow(deprecated)]
+#[cfg(feature = "gdalsource-process")]
+pub use self::gdal_source::__private;
+
 pub use self::gdal_source::{
-    __private, FileNotFoundHandling, GdalDatasetGeoTransform, GdalDatasetParameters,
-    GdalLoadingInfo, GdalLoadingInfoTemporalSlice, GdalLoadingInfoTemporalSliceIterator,
-    GdalMetaDataList, GdalMetaDataRegular, GdalMetaDataStatic, GdalMetadataMapping,
-    GdalMetadataNetCdfCf, GdalRetryOptions, GdalSource, GdalSourceError, GdalSourceParameters,
-    GdalSourceProcessor, GdalSourceTimePlaceholder, TimeReference,
+    FileNotFoundHandling, GdalDatasetGeoTransform, GdalDatasetParameters, GdalLoadingInfo,
+    GdalLoadingInfoTemporalSlice, GdalLoadingInfoTemporalSliceIterator, GdalMetaDataList,
+    GdalMetaDataRegular, GdalMetaDataStatic, GdalMetadataMapping, GdalMetadataNetCdfCf,
+    GdalRetryOptions, GdalSource, GdalSourceError, GdalSourceParameters, GdalSourceProcessor,
+    GdalSourceTimePlaceholder, TimeReference,
     process::{
         GdalDatasetCache, IpcChannelMessage, IpcChannelMessagePayload, ProcessData, ProcessManager,
         setup_client, setup_client_for_bytes,

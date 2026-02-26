@@ -1,3 +1,4 @@
+
 use gdal::raster::GdalType;
 use geoengine_datatypes::raster::{
     Pixel, RasterTile2D, TypedRasterTile2D, raster_tile_2d_to_arrow_ipc_file_for_ipc_channel,
@@ -94,17 +95,10 @@ async fn handle<P: FromPrimitive + Pixel + GdalType>(
 where
     RasterTile2D<P>: Into<TypedRasterTile2D>,
 {
-    let params_for_cache = &dataset_params;
-
-    if let Some(tile) = dataset_cache.get(params_for_cache, &tile_information) {
-        if let Err(some_err) = send_tile(tile, sender) {
-            panic!("Cannot send data back to engine: {some_err:#?}")
-        }
-        return Ok(());
-    }
-
+    // cache now happens in the callchain
     #[allow(deprecated)] // this is the place where it should be used!
-    let tile: RasterTile2D<P> = source::__private::load_tile_async(
+    let tile: RasterTile2D<P> = source::__private::load_tile_async_cached(
+        dataset_cache,
         dataset_params.clone(),
         read_advise,
         tile_information.clone(),
@@ -113,32 +107,17 @@ where
     )
     .await?;
 
-    let typed_tile: TypedRasterTile2D = tile.into();
-    dataset_cache.cache(
-        params_for_cache.clone(),
-        tile_information,
-        typed_tile.clone(),
-    );
-
-    if let Err(some_err) = send_tile(typed_tile, sender) {
+    if let Err(some_err) = send_tile(tile, sender) {
         panic!("Error sending data to client {some_err:#?}");
     }
     Ok(())
 }
 
-fn send_tile(tile: TypedRasterTile2D, sender: &IpcBytesSender) -> Result<()> {
-    let ipc_data = match tile {
-        TypedRasterTile2D::U8(t) => raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(t)?,
-        TypedRasterTile2D::U16(t) => raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(t)?,
-        TypedRasterTile2D::U32(t) => raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(t)?,
-        TypedRasterTile2D::U64(t) => raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(t)?,
-        TypedRasterTile2D::I8(t) => raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(t)?,
-        TypedRasterTile2D::I16(t) => raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(t)?,
-        TypedRasterTile2D::I32(t) => raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(t)?,
-        TypedRasterTile2D::I64(t) => raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(t)?,
-        TypedRasterTile2D::F32(t) => raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(t)?,
-        TypedRasterTile2D::F64(t) => raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(t)?,
-    };
+fn send_tile<T: Pixel + FromPrimitive + GdalType>(
+    tile: RasterTile2D<T>,
+    sender: &IpcBytesSender,
+) -> Result<()> {
+    let ipc_data = raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(tile)?;
     sender.send(&ipc_data)?;
     Ok(())
 }
