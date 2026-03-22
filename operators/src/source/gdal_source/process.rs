@@ -235,7 +235,7 @@ impl GdalDatasetCache {
         self.dataset = None;
     }
 
-    /// Moves the GdlaDataset becuase it does not implement clone()
+    /// Moves the GdalDataset because it does not implement clone()
     pub fn take(&mut self, input_path: &PathBuf) -> Option<GdalDataset> {
         if let Some(path_ref) = self.path.as_ref()
             && *path_ref == *input_path

@@ -85,9 +85,6 @@ static GDAL_RETRY_INITIAL_BACKOFF_MS: u64 = 1000;
 static GDAL_RETRY_MAX_BACKOFF_MS: u64 = 60 * 60 * 1000;
 static GDAL_RETRY_EXPONENTIAL_BACKOFF_FACTOR: f64 = 2.;
 
-/*
-
-*/
 #[cfg(feature = "gdalsource-process")]
 const DEFAULT_PROCESS_WORKER_POOL_SIZE: usize = 1;
 
