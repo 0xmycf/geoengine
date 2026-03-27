@@ -5,8 +5,14 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use gdal::Dataset as GdalDataset;
 use geoengine_datatypes::primitives::{CacheHint, TimeInterval};
-use geoengine_datatypes::raster::{RasterDataType, TileInformation};
-use ipc_channel::ipc::{self, IpcBytesReceiver, IpcBytesSender, IpcReceiver, IpcSender};
+use geoengine_datatypes::raster::{
+    Pixel, RasterDataType, RasterTile2D, TileInformation,
+    arrow_ipc_file_to_raster_tile_2d_for_ipc_channel,
+    raster_tile_2d_to_arrow_ipc_file_for_ipc_channel,
+};
+use ipc_channel::ipc::{self, IpcBytesReceiver, IpcBytesSender, IpcError, IpcReceiver, IpcSender};
+
+use crate::error::Error;
 
 use super::{GdalDatasetParameters, GdalReadAdvise};
 
@@ -21,18 +27,117 @@ pub struct IpcChannelMessagePayload {
     pub data_type: RasterDataType,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq)]
-pub enum IpcChannelMessage {
-    RequestTileData(Box<IpcChannelMessagePayload>),
-    EndConnection,
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub struct TileData {
+    tile: Vec<u8>,
 }
 
-impl IpcChannelMessage {
-    pub fn new_request_tile_message(data: IpcChannelMessagePayload) -> Self {
-        Self::RequestTileData(Box::new(data))
+impl TileData {
+    pub fn new<P: Pixel>(tile: RasterTile2D<P>) -> Result<Self, Error> {
+        let as_vec = raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(tile)
+            .map_err(|err| Error::DataType { source: err })?;
+        Ok(Self { tile: as_vec })
     }
 }
 
+// [`IpcError`] does not implement the serde traits, and thus cant be send
+// via the ipc_channels
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub enum IpcProcessError {
+    Bincode(String),
+    Io(String),
+    Disconnected,
+    DataType(String),
+    Unknown(String),
+}
+
+pub type IpcProcessRasterResult = std::result::Result<TileData, IpcProcessError>;
+
+impl From<Error> for IpcProcessError {
+    fn from(value: Error) -> Self {
+        match value {
+            Error::DataType { source } => IpcProcessError::DataType(source.to_string()),
+            err => IpcProcessError::Unknown(err.to_string()),
+        }
+    }
+}
+
+impl From<IpcError> for IpcProcessError {
+    fn from(value: IpcError) -> Self {
+        match value {
+            IpcError::Bincode(error_kind) => IpcProcessError::Bincode(error_kind.to_string()),
+            IpcError::Io(error) => IpcProcessError::Io(error.to_string()),
+            IpcError::Disconnected => IpcProcessError::Disconnected,
+        }
+    }
+}
+
+pub fn into_raster<P: Pixel>(
+    result: IpcProcessRasterResult,
+) -> std::result::Result<RasterTile2D<P>, crate::error::Error> {
+    result
+        .map_err(|err| match err {
+            IpcProcessError::Bincode(error_kind) => Error::GdalSource {
+                source: crate::source::GdalSourceError::ProcessInternalBincodeError {
+                    error_kind: error_kind,
+                },
+            },
+            IpcProcessError::Io(error) => Error::GdalSource {
+                source: crate::source::GdalSourceError::ProcessInternalIoError {
+                    internal_error: error,
+                },
+            },
+            IpcProcessError::Disconnected => Error::GdalSource {
+                source: crate::source::GdalSourceError::ProcessIsDisconnected,
+            },
+            IpcProcessError::DataType(reason) => Error::GdalSource {
+                source: crate::source::GdalSourceError::IpcArrowConversionFailed { reason },
+            },
+            IpcProcessError::Unknown(err) => Error::GdalSource {
+                source: crate::source::GdalSourceError::UnknownErrorHappenedWhileReading {
+                    error: err,
+                },
+            },
+        })
+        .and_then(|td| {
+            arrow_ipc_file_to_raster_tile_2d_for_ipc_channel(td.tile)
+                .map_err(|err| Error::DataType { source: err })
+        })
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq)]
+pub struct IpcChannelMessage(pub IpcChannelMessagePayload);
+
+impl IpcChannelMessage {
+    pub fn new_request_tile_message(data: IpcChannelMessagePayload) -> Self {
+        Self(data)
+    }
+}
+
+pub fn spawn_ipc_server_process<S, R>() -> (Child, IpcSender<S>, IpcReceiver<R>) {
+    let (server, token) = ipc::IpcOneShotServer::<(IpcSender<S>, IpcReceiver<R>)>::new()
+        .expect("Failed to create IPC Server");
+
+    let path: PathBuf = std::env::var("GDAL_SOURCE_PROCESS_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::current_exe()
+                .expect("failed to get current executable path")
+                .parent()
+                .expect("executable has no parent directory")
+                .join("gdalsource-process")
+        });
+
+    let child = Command::new(path)
+        .arg(token)
+        .spawn()
+        .expect("failed to spawn ipc server process");
+
+    let (_rx, channels) = server.accept().expect("accept failed to receive message");
+    (child, channels.0, channels.1)
+}
+
+#[allow(unused)] // TODO (high): remove if not needed
 pub fn spawn_ipc_server_process_bytes<S>() -> (Child, IpcSender<S>, IpcBytesReceiver) {
     let (server, token) = ipc::IpcOneShotServer::<(IpcSender<S>, IpcBytesReceiver)>::new()
         .expect("Failed to create IPC Server");
@@ -162,11 +267,18 @@ pub struct ProcessData {
     child: Child,
     /// stored in one mutex to gether to ensure that one call to `send`,
     /// ends up with the correct result from `recv`
-    sender_receiver_pair: Mutex<(IpcSender<IpcChannelMessage>, IpcBytesReceiver)>,
+    sender_receiver_pair: Mutex<(
+        IpcSender<IpcChannelMessage>,
+        IpcReceiver<IpcProcessRasterResult>,
+    )>,
 }
 
 impl ProcessData {
-    fn new(child: Child, sender: IpcSender<IpcChannelMessage>, receiver: IpcBytesReceiver) -> Self {
+    fn new(
+        child: Child,
+        sender: IpcSender<IpcChannelMessage>,
+        receiver: IpcReceiver<IpcProcessRasterResult>,
+    ) -> Self {
         Self {
             child,
             sender_receiver_pair: Mutex::new((sender, receiver)),
@@ -176,12 +288,17 @@ impl ProcessData {
     /// Spawns a new child process
     /// Is kept alive until `Self` is dropped.
     pub fn spawn() -> Arc<Self> {
-        let (child, sender, receiver) = spawn_ipc_server_process_bytes::<IpcChannelMessage>();
+        // let (child, sender, receiver) = spawn_ipc_server_process_bytes::<IpcChannelMessage>();
+        let (child, sender, receiver) =
+            spawn_ipc_server_process::<IpcChannelMessage, IpcProcessRasterResult>();
         Arc::new(Self::new(child, sender, receiver))
     }
 
     /// Sends `message` to the worker and blocks until the response arrives.
-    pub fn send_recv_blocking(&self, message: IpcChannelMessage) -> crate::util::Result<Vec<u8>> {
+    pub fn send_recv_blocking<P: Pixel>(
+        &self,
+        message: IpcChannelMessage,
+    ) -> crate::util::Result<RasterTile2D<P>> {
         let pair = self
             .sender_receiver_pair
             .lock()
@@ -194,19 +311,16 @@ impl ProcessData {
             source: std::io::Error::other(e.to_string()),
         })?;
 
-        let bytes = receiver.recv().map_err(|e| crate::error::Error::Io {
+        let result = receiver.recv().map_err(|e| crate::error::Error::Io {
             source: std::io::Error::other(e.to_string()),
         })?;
 
-        Ok(bytes)
+        into_raster::<P>(result)
     }
 }
 
 impl Drop for ProcessData {
     fn drop(&mut self) {
-        if let Ok((sender, _receiver)) = self.sender_receiver_pair.get_mut() {
-            let _ = sender.send(IpcChannelMessage::EndConnection);
-        }
         let _ = self.child.kill();
     }
 }

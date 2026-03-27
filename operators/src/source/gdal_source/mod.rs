@@ -43,8 +43,6 @@ use geoengine_datatypes::primitives::{
 };
 use reader::{GdalReadAdvise, GridAndProperties, ReaderState};
 
-#[cfg(feature = "gdalsource-process")]
-use geoengine_datatypes::raster::arrow_ipc_file_to_raster_tile_2d;
 use geoengine_datatypes::raster::{
     ChangeGridBounds, EmptyGrid, GeoTransform, Grid, GridBlit, GridBoundingBox2D, GridOrEmpty,
     GridOrEmpty2D, GridShapeAccess, GridSize, MapElements, MaskedGrid, NoDataValueGrid, Pixel,
@@ -418,14 +416,7 @@ impl GdalRasterLoader {
             data_type: T::TYPE,
         });
 
-        let result = process_data.send_recv_blocking(message).and_then(|msg| {
-            arrow_ipc_file_to_raster_tile_2d::<T>(msg).map_err(|e| Error::Io {
-                source: std::io::Error::other(format!(
-                    "Failed to convert arrow ipc data to raster tile: {}",
-                    e
-                )),
-            })
-        });
+        let result = process_data.send_recv_blocking(message);
 
         match result {
             Ok(r) => Ok(r),
@@ -506,15 +497,10 @@ impl GdalRasterLoader {
 
         #[cfg(feature = "gdalsource-process")]
         if ret.is_ok() {
-            match std::sync::Arc::into_inner(protected_dataset_out) {
-                Some(inner) => match inner.into_inner().expect("mutex should not be poisoned") {
-                    Some(ds) => {
-                        cache.cache(path_for_cache, ds);
-                    }
-                    None => panic!("the mutex could not be into_innered"),
-                },
-                None => panic!("the arc could not be unwrapped!"),
-            }
+           let mut guard =  protected_dataset_out.lock().expect("mutex guard should not be poisoned");
+           if let Some(ds) = guard.take() {
+               cache.cache(path_for_cache, ds);
+           }
         }
 
         ret
@@ -903,12 +889,17 @@ fn clear_gdal_vsi_cache_for_path(file_path: &Path) {
     }
 }
 
-impl<T> GdalSourceProcessor<T> where T: gdal::raster::GdalType + Pixel {}
+impl<T> GdalSourceProcessor<T> where
+    T: gdal::raster::GdalType + Pixel
+{
+}
 
 #[async_trait]
 impl<P> QueryProcessor for GdalSourceProcessor<P>
 where
-    P: Pixel + gdal::raster::GdalType + FromPrimitive,
+    P: Pixel
+        + gdal::raster::GdalType
+        + FromPrimitive
 {
     type Output = RasterTile2D<P>;
     type SpatialBounds = GridBoundingBox2D;
@@ -1053,7 +1044,9 @@ where
 #[async_trait]
 impl<T> RasterQueryProcessor for GdalSourceProcessor<T>
 where
-    T: Pixel + gdal::raster::GdalType + FromPrimitive,
+    T: Pixel
+        + gdal::raster::GdalType
+        + FromPrimitive
 {
     type RasterType = T;
 
@@ -1989,25 +1982,65 @@ mod tests {
         sender.send(msg.clone()).unwrap();
         let recv = receiver.recv().unwrap();
 
-        match (msg.clone(), recv.clone()) {
-            (
-                IpcChannelMessage::RequestTileData(msg_payload),
-                IpcChannelMessage::RequestTileData(recv_payload),
-            ) => {
-                assert_eq!(msg_payload.dataset_params, recv_payload.dataset_params);
-                assert_eq!(msg_payload.tile_information, recv_payload.tile_information);
-                assert_eq!(msg_payload.tile_time, recv_payload.tile_time);
-                assert_eq!(msg_payload.read_advise, recv_payload.read_advise);
-            }
-            _ => panic!("Messages are not equal! {msg:?} != {recv:?}"),
-        }
+        assert_eq!(msg, recv);
+    }
+
+    #[test]
+    #[cfg(feature = "gdalsource-process")]
+    fn test_ipc_channel_roundtrip_tile() {
+        use process::{
+            into_raster, spawn_ipc_server_process, IpcChannelMessage, IpcChannelMessagePayload,
+            IpcProcessRasterResult,
+        };
+
+        let output_shape: GridShape2D = [8, 8].into();
+        let output_bounds =
+            SpatialPartition2D::new_unchecked((-180., 90.).into(), (-179.2, 89.2).into());
+
+        let gdal_read_advice = GdalReadAdvise {
+            gdal_read_widow: GdalReadWindow::new([0, 0].into(), output_shape),
+            read_window_bounds: GridBoundingBox2D::new([0, 0], [7, 7]).unwrap(),
+            bounds_of_target: GridBoundingBox2D::new([0, 0], [7, 7]).unwrap(),
+            flip_y: false,
+        };
+
+        let payload = IpcChannelMessagePayload {
+            data_type: RasterDataType::U8,
+            dataset_params: get_params(),
+            tile_information: tile_information_with_partition_and_shape(
+                output_bounds,
+                output_shape,
+            ),
+            tile_time: TimeInterval::default(),
+            cache_hint: CacheHint::default(),
+            read_advise: gdal_read_advice,
+        };
+
+        let msg = IpcChannelMessage::new_request_tile_message(payload);
+
+        let (mut child, sender, receiver) =
+            spawn_ipc_server_process::<IpcChannelMessage, IpcProcessRasterResult>();
+
+        sender.send(msg).unwrap();
+        let result = receiver.recv().unwrap();
+
+        let RasterTile2D { grid_array: grid, .. } = into_raster::<u8>(result).unwrap();
+
+        assert!(!grid.is_empty());
+
+        let grid = grid.into_materialized_masked_grid();
+
+        assert_eq!(grid.inner_grid.data.len(), 64);
+        assert_eq!(grid.validity_mask.data.len(), 64);
+
+        let _ = child.kill();
     }
 
     // TODO (low): name / test
     #[cfg(feature = "gdalsource-process")]
     fn load_ndvi_jan_2014_by_process(
-        output_shape: GridShape2D,
-        output_bounds: SpatialPartition2D,
+        gdal_read_advice: GdalReadAdvise,
+        tile_information: TileInformation,
         process_data: Arc<ProcessData>,
     ) -> Result<RasterTile2D<u8>> {
         let dataset_params = GdalDatasetParameters {
@@ -2052,24 +2085,11 @@ mod tests {
             retry: None,
         };
 
-        let tile_information =
-            tile_information_with_partition_and_shape(output_bounds, output_shape);
-        let ds_spatial_grid = dataset_params.spatial_grid_definition();
-        let tile_spatial_grid = tile_information.spatial_grid_definition();
-
-        let reader_mode = GdalReaderMode::OriginalResolution(ReaderState {
-            dataset_spatial_grid: ds_spatial_grid,
-        });
-
-        let gdal_read_advise = reader_mode
-            .tiling_to_dataset_read_advise(&ds_spatial_grid, &tile_spatial_grid)
-            .expect("tile should intersect dataset");
-
         GdalRasterLoader::load_tile_data_process::<u8>(
             dataset_params,
             tile_information,
             TimeInterval::default(),
-            gdal_read_advise,
+            gdal_read_advice,
             CacheHint::default(),
             &process_data,
         )
@@ -2350,7 +2370,17 @@ mod tests {
     fn test_load_tile_data_process() {
         let output_shape: GridShape2D = [8, 8].into();
         let output_bounds =
-            SpatialPartition2D::new_unchecked((-180., 90.).into(), (180., -90.).into());
+            SpatialPartition2D::new_unchecked((-180., 90.).into(), (-179.2, 89.2).into());
+
+        let gdal_read_advice = GdalReadAdvise {
+            gdal_read_widow: GdalReadWindow::new([0, 0].into(), output_shape),
+            read_window_bounds: GridBoundingBox2D::new([0, 0], [7, 7]).unwrap(),
+            bounds_of_target: GridBoundingBox2D::new([0, 0], [7, 7]).unwrap(),
+            flip_y: false,
+        };
+
+        let tile_information =
+            tile_information_with_partition_and_shape(output_bounds, output_shape);
 
         let pd = ProcessData::spawn();
 
@@ -2362,7 +2392,7 @@ mod tests {
             time: _,
             properties,
             cache_hint: _,
-        } = load_ndvi_jan_2014_by_process(output_shape, output_bounds, pd.clone()).unwrap();
+        } = load_ndvi_jan_2014_by_process(gdal_read_advice, tile_information, pd.clone()).unwrap();
 
         assert!(!grid.is_empty());
 
@@ -2372,9 +2402,9 @@ mod tests {
         assert_eq!(
             grid.inner_grid.data,
             &[
-                255, 255, 255, 255, 255, 255, 255, 255, 255, 75, 37, 255, 44, 34, 39, 32, 255, 86,
-                255, 255, 255, 30, 96, 255, 255, 255, 255, 255, 90, 255, 255, 255, 255, 255, 202,
-                255, 193, 255, 255, 255, 255, 255, 89, 255, 111, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
                 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255
             ]
         );

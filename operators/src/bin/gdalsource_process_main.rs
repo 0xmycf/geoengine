@@ -1,13 +1,15 @@
-
 use gdal::raster::GdalType;
 use geoengine_datatypes::raster::{
-    Pixel, RasterTile2D, TypedRasterTile2D, raster_tile_2d_to_arrow_ipc_file_for_ipc_channel,
+    Pixel, RasterTile2D, TypedRasterTile2D,
 };
 use geoengine_operators::source::{
-    self, GdalDatasetCache, IpcChannelMessage, IpcChannelMessagePayload, setup_client_for_bytes,
+    self, GdalDatasetCache, IpcChannelMessage, IpcChannelMessagePayload, IpcProcessError,
+    IpcProcessRasterResult, TileData, setup_client,
 };
-use ipc_channel::ipc::{IpcBytesSender, IpcError};
+use ipc_channel::ipc::IpcSender;
 use num::FromPrimitive;
+
+type Sender = IpcSender<IpcProcessRasterResult>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -23,58 +25,57 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 async fn run() -> Result<()> {
     let token = setup();
-    println!("Starting GDAL process with token: {token}");
-
-    let (sender, receiver) = setup_client_for_bytes::<IpcChannelMessage>(token);
-
+    println!("processs started with token {token:#?}");
+    let (sender, receiver) = setup_client::<IpcChannelMessage, IpcProcessRasterResult>(token);
     let mut dataset_cache = GdalDatasetCache::new();
 
     loop {
-        let message = receiver.recv().map_err(|e| {
-            match e {
-                IpcError::Bincode(ref error_kind) => {
-                    dbg!(error_kind);
-                }
-                IpcError::Io(_) | IpcError::Disconnected => (),
+        let message = match receiver.recv() {
+            Ok(msg) => msg,
+            Err(err) => {
+                if let Err(err) = sender.send(Err(IpcProcessError::from(err))) {
+                    sender.send(Err(IpcProcessError::Unknown(err.to_string())))?
+                };
+                continue;
             }
-            format!("Failed to receive message from client: {e}")
-        })?;
+        };
 
-        match message {
-            IpcChannelMessage::RequestTileData(b) => match b.data_type {
-                geoengine_datatypes::raster::RasterDataType::U8 => {
-                    handle::<u8>(*b, &mut dataset_cache, &sender).await?
-                }
-                geoengine_datatypes::raster::RasterDataType::U16 => {
-                    handle::<u16>(*b, &mut dataset_cache, &sender).await?
-                }
-                geoengine_datatypes::raster::RasterDataType::U32 => {
-                    handle::<u32>(*b, &mut dataset_cache, &sender).await?
-                }
-                geoengine_datatypes::raster::RasterDataType::U64 => {
-                    handle::<u64>(*b, &mut dataset_cache, &sender).await?
-                }
-                geoengine_datatypes::raster::RasterDataType::I8 => {
-                    handle::<i8>(*b, &mut dataset_cache, &sender).await?
-                }
-                geoengine_datatypes::raster::RasterDataType::I16 => {
-                    handle::<i16>(*b, &mut dataset_cache, &sender).await?
-                }
-                geoengine_datatypes::raster::RasterDataType::I32 => {
-                    handle::<i32>(*b, &mut dataset_cache, &sender).await?
-                }
-                geoengine_datatypes::raster::RasterDataType::I64 => {
-                    handle::<i64>(*b, &mut dataset_cache, &sender).await?
-                }
-                geoengine_datatypes::raster::RasterDataType::F32 => {
-                    handle::<f32>(*b, &mut dataset_cache, &sender).await?
-                }
-                geoengine_datatypes::raster::RasterDataType::F64 => {
-                    handle::<f64>(*b, &mut dataset_cache, &sender).await?
-                }
-            },
-            IpcChannelMessage::EndConnection => {
-                return Ok(());
+        let payload = message.0;
+        let result = match payload.data_type {
+            geoengine_datatypes::raster::RasterDataType::U8 => {
+                handle::<u8>(payload, &mut dataset_cache, &sender).await
+            }
+            geoengine_datatypes::raster::RasterDataType::U16 => {
+                handle::<u16>(payload, &mut dataset_cache, &sender).await
+            }
+            geoengine_datatypes::raster::RasterDataType::U32 => {
+                handle::<u32>(payload, &mut dataset_cache, &sender).await
+            }
+            geoengine_datatypes::raster::RasterDataType::U64 => {
+                handle::<u64>(payload, &mut dataset_cache, &sender).await
+            }
+            geoengine_datatypes::raster::RasterDataType::I8 => {
+                handle::<i8>(payload, &mut dataset_cache, &sender).await
+            }
+            geoengine_datatypes::raster::RasterDataType::I16 => {
+                handle::<i16>(payload, &mut dataset_cache, &sender).await
+            }
+            geoengine_datatypes::raster::RasterDataType::I32 => {
+                handle::<i32>(payload, &mut dataset_cache, &sender).await
+            }
+            geoengine_datatypes::raster::RasterDataType::I64 => {
+                handle::<i64>(payload, &mut dataset_cache, &sender).await
+            }
+            geoengine_datatypes::raster::RasterDataType::F32 => {
+                handle::<f32>(payload, &mut dataset_cache, &sender).await
+            }
+            geoengine_datatypes::raster::RasterDataType::F64 => {
+                handle::<f64>(payload, &mut dataset_cache, &sender).await
+            }
+        };
+        if let Err(err) = result {
+            if let Err(err) = sender.send(Err(IpcProcessError::Unknown(err.to_string()))) {
+                sender.send(Err(IpcProcessError::Unknown(err.to_string())))?;
             }
         }
     }
@@ -90,7 +91,7 @@ async fn handle<P: FromPrimitive + Pixel + GdalType>(
         data_type: _,
     }: IpcChannelMessagePayload,
     dataset_cache: &mut GdalDatasetCache,
-    sender: &IpcBytesSender,
+    sender: &IpcSender<IpcProcessRasterResult>,
 ) -> Result<()>
 where
     RasterTile2D<P>: Into<TypedRasterTile2D>,
@@ -108,18 +109,21 @@ where
     .await?;
 
     if let Err(some_err) = send_tile(tile, sender) {
-        panic!("Error sending data to client {some_err:#?}");
+        sender.send(Err(some_err))?
     }
     Ok(())
 }
 
 fn send_tile<T: Pixel + FromPrimitive + GdalType>(
     tile: RasterTile2D<T>,
-    sender: &IpcBytesSender,
-) -> Result<()> {
-    let ipc_data = raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(tile)?;
-    sender.send(&ipc_data)?;
-    Ok(())
+    sender: &Sender,
+) -> std::result::Result<(), IpcProcessError> {
+    match TileData::new(tile) {
+        Ok(td) => sender.send(Ok(td)),
+        Err(err) => sender.send(Err(IpcProcessError::from(err))),
+    }
+    .map(|_| ())
+    .map_err(|err| IpcProcessError::Bincode(err.to_string()))
 }
 
 type Token = String;

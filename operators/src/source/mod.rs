@@ -19,8 +19,9 @@ pub use self::gdal_source::{
     GdalRetryOptions, GdalSource, GdalSourceError, GdalSourceParameters, GdalSourceProcessor,
     GdalSourceTimePlaceholder, TimeReference,
     process::{
-        GdalDatasetCache, IpcChannelMessage, IpcChannelMessagePayload, ProcessData, ProcessManager,
-        setup_client, setup_client_for_bytes,
+        GdalDatasetCache, IpcChannelMessage, IpcChannelMessagePayload, IpcProcessError,
+        IpcProcessRasterResult, ProcessData, ProcessManager, TileData, setup_client,
+        setup_client_for_bytes,
     },
 };
 pub use self::multi_band_gdal_source::{
