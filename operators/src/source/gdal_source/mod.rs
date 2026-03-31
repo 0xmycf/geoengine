@@ -1515,7 +1515,9 @@ mod tests {
     use crate::util::gdal::add_ndvi_dataset;
     use float_cmp::assert_approx_eq;
     use geoengine_datatypes::hashmap;
-    use geoengine_datatypes::primitives::{AxisAlignedRectangle, SpatialPartition2D, TimeInstance};
+    use geoengine_datatypes::primitives::{
+        AxisAlignedRectangle, CacheExpiration, DateTime, SpatialPartition2D, TimeInstance,
+    };
     use geoengine_datatypes::raster::GridShape2D;
 
     use geoengine_datatypes::raster::{BoundedGrid, SpatialGridDefinition};
@@ -1757,7 +1759,12 @@ mod tests {
                 output_shape,
             ),
             tile_time: TimeInterval::default(),
-            cache_hint: CacheHint::default(),
+            cache_hint: CacheHint::with_created_and_expires(
+                DateTime::new_utc_with_millis(2026, 4, 1, 10, 0, 0, 0),
+                CacheExpiration::from(DateTime::new_utc_with_millis(
+                    2026, 4, 1, 10, 5, 0, 125,
+                )),
+            ),
             read_advise,
         };
 
