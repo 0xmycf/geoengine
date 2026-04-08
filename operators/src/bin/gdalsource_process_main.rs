@@ -1,7 +1,7 @@
+use std::fmt::Display;
+
 use gdal::raster::GdalType;
-use geoengine_datatypes::raster::{
-    Pixel, RasterTile2D, TypedRasterTile2D,
-};
+use geoengine_datatypes::raster::{Pixel, RasterTile2D, TypedRasterTile2D};
 use geoengine_operators::source::{
     self, GdalDatasetCache, IpcChannelMessage, IpcChannelMessagePayload, IpcProcessError,
     IpcProcessRasterResult, TileData, setup_client,
@@ -11,11 +11,15 @@ use num::FromPrimitive;
 
 type Sender = IpcSender<IpcProcessRasterResult>;
 
+fn exit_with_error(msg: impl Display) -> ! {
+    tracing::error!("Error: {msg}");
+    std::process::exit(1);
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     if let Err(err) = run().await {
-        eprintln!("Error: {err}");
-        std::process::exit(1);
+        exit_with_error(err)
     }
 
     Ok(())
@@ -25,8 +29,11 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 async fn run() -> Result<()> {
     let token = setup();
-    println!("processs started with token {token:#?}");
-    let (sender, receiver) = setup_client::<IpcChannelMessage, IpcProcessRasterResult>(token);
+    let (sender, receiver) = match setup_client::<IpcChannelMessage, IpcProcessRasterResult>(token)
+    {
+        Ok(pair) => pair,
+        Err(err) => exit_with_error(err),
+    };
     let mut dataset_cache = GdalDatasetCache::new();
 
     loop {
@@ -34,8 +41,8 @@ async fn run() -> Result<()> {
             Ok(msg) => msg,
             Err(err) => {
                 if let Err(err) = sender.send(Err(IpcProcessError::from(err))) {
-                    sender.send(Err(IpcProcessError::Unknown(err.to_string())))?
-                };
+                    sender.send(Err(IpcProcessError::Unknown(err.to_string())))?;
+                }
                 continue;
             }
         };
@@ -73,10 +80,10 @@ async fn run() -> Result<()> {
                 handle::<f64>(payload, &mut dataset_cache, &sender).await
             }
         };
-        if let Err(err) = result {
-            if let Err(err) = sender.send(Err(IpcProcessError::Unknown(err.to_string()))) {
-                sender.send(Err(IpcProcessError::Unknown(err.to_string())))?;
-            }
+        if let Err(err) = result
+            && let Err(err) = sender.send(Err(IpcProcessError::Unknown(err.to_string())))
+        {
+            sender.send(Err(IpcProcessError::Unknown(err.to_string())))?;
         }
     }
 }
@@ -102,14 +109,14 @@ where
         dataset_cache,
         dataset_params.clone(),
         read_advise,
-        tile_information.clone(),
+        tile_information,
         tile_time,
         cache_hint,
     )
     .await?;
 
     if let Err(some_err) = send_tile(tile, sender) {
-        sender.send(Err(some_err))?
+        sender.send(Err(some_err))?;
     }
     Ok(())
 }
@@ -122,7 +129,6 @@ fn send_tile<T: Pixel + FromPrimitive + GdalType>(
         Ok(td) => sender.send(Ok(td)),
         Err(err) => sender.send(Err(IpcProcessError::from(err))),
     }
-    .map(|_| ())
     .map_err(|err| IpcProcessError::Bincode(err.to_string()))
 }
 
@@ -130,8 +136,9 @@ type Token = String;
 
 fn setup() -> Token {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        panic!("Usage: gdalprocess-ipc-channel-server <token>");
-    }
+    assert!(
+        args.len() >= 2,
+        "Usage: gdalprocess-ipc-channel-server <token>"
+    );
     args[1].clone()
 }

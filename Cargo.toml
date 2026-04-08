@@ -4,7 +4,6 @@ members = [
     "expression",
     "macros",
     "operators",
-    "operators/gdalsource-process-bench",
     "services",
 ]
 exclude = [

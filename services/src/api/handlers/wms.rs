@@ -563,9 +563,12 @@ mod tests {
     use geoengine_datatypes::util::assert_image_equals;
     use geoengine_operators::engine::{ExecutionContext, RasterQueryProcessor};
     use geoengine_operators::source::GdalSourceProcessor;
+    use geoengine_operators::source::ProcessData;
     use geoengine_operators::util::gdal::create_ndvi_meta_data;
     use std::convert::TryInto;
     use std::marker::PhantomData;
+    use std::sync::Arc;
+    use std::sync::LazyLock;
     use tokio_postgres::NoTls;
     use xml::ParserConfig;
 
@@ -702,7 +705,7 @@ mod tests {
             meta_data: Box::new(meta_data),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
-            process_manager: None,
+            process_data: Arc::new(LazyLock::new(ProcessData::spawn))
         };
 
         let (image_bytes, _) = raster_stream_to_png_bytes(

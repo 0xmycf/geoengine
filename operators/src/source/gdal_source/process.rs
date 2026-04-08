@@ -1,7 +1,6 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 
 use gdal::Dataset as GdalDataset;
 use geoengine_datatypes::primitives::{CacheHint, TimeInterval};
@@ -10,7 +9,7 @@ use geoengine_datatypes::raster::{
     arrow_ipc_file_to_raster_tile_2d_for_ipc_channel,
     raster_tile_2d_to_arrow_ipc_file_for_ipc_channel,
 };
-use ipc_channel::ipc::{self, IpcBytesReceiver, IpcBytesSender, IpcError, IpcReceiver, IpcSender};
+use ipc_channel::ipc::{self, IpcError, IpcReceiver, IpcSender};
 
 use crate::error::Error;
 
@@ -23,7 +22,7 @@ pub struct IpcChannelMessagePayload {
     pub tile_information: TileInformation,
     pub tile_time: TimeInterval,
     pub read_advise: GdalReadAdvise,
-    /// We use this to know what type we serialize using the arrow_conversion functions
+    /// We use this to know what type we serialize using the `arrow_conversion` functions
     pub data_type: RasterDataType,
 }
 
@@ -79,12 +78,12 @@ pub fn into_raster<P: Pixel>(
         .map_err(|err| match err {
             IpcProcessError::Bincode(error_kind) => Error::GdalSource {
                 source: crate::source::GdalSourceError::ProcessInternalBincodeError {
-                    error_kind: error_kind,
+                    error_kind,
                 },
             },
-            IpcProcessError::Io(error) => Error::GdalSource {
+            IpcProcessError::Io(internal_error) => Error::GdalSource {
                 source: crate::source::GdalSourceError::ProcessInternalIoError {
-                    internal_error: error,
+                    internal_error,
                 },
             },
             IpcProcessError::Disconnected => Error::GdalSource {
@@ -118,39 +117,16 @@ pub fn spawn_ipc_server_process<S, R>() -> (Child, IpcSender<S>, IpcReceiver<R>)
     let (server, token) = ipc::IpcOneShotServer::<(IpcSender<S>, IpcReceiver<R>)>::new()
         .expect("Failed to create IPC Server");
 
-    let path: PathBuf = std::env::var("GDAL_SOURCE_PROCESS_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
+    let path: PathBuf = std::env::var("GDAL_SOURCE_PROCESS_PATH").map_or_else(
+        |_| {
             std::env::current_exe()
                 .expect("failed to get current executable path")
                 .parent()
                 .expect("executable has no parent directory")
                 .join("gdalsource-process")
-        });
-
-    let child = Command::new(path)
-        .arg(token)
-        .spawn()
-        .expect("failed to spawn ipc server process");
-
-    let (_rx, channels) = server.accept().expect("accept failed to receive message");
-    (child, channels.0, channels.1)
-}
-
-#[allow(unused)] // TODO (high): remove if not needed
-pub fn spawn_ipc_server_process_bytes<S>() -> (Child, IpcSender<S>, IpcBytesReceiver) {
-    let (server, token) = ipc::IpcOneShotServer::<(IpcSender<S>, IpcBytesReceiver)>::new()
-        .expect("Failed to create IPC Server");
-
-    let path: PathBuf = std::env::var("GDAL_SOURCE_PROCESS_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::current_exe()
-                .expect("failed to get current executable path")
-                .parent()
-                .expect("executable has no parent directory")
-                .join("gdalsource-process")
-        });
+        },
+        PathBuf::from,
+    );
 
     let child = Command::new(path)
         .arg(token)
@@ -165,102 +141,42 @@ pub fn spawn_ipc_server_process_bytes<S>() -> (Child, IpcSender<S>, IpcBytesRece
 /// sending the channels to the server, so that communication can be established.
 ///
 /// Assumes that the server is already running and listening for connections.
-pub fn setup_client<S, C>(token: String) -> (IpcSender<C>, IpcReceiver<S>)
+pub fn setup_client<S, C>(token: String) -> crate::util::Result<(IpcSender<C>, IpcReceiver<S>)>
 where
     S: for<'de> serde::Deserialize<'de> + serde::Serialize,
     C: for<'de> serde::Deserialize<'de> + serde::Serialize,
 {
     let (server_sender, client_reciever) =
-        ipc::channel::<S>().expect("Failed to create IPC channel");
+        ipc::channel::<S>().map_err(|err| Error::GdalSource {
+            source: crate::source::GdalSourceError::ProcessSetupFailed {
+                reason: err.to_string(),
+            },
+        })?;
     let (client_sender, server_reciever) =
-        ipc::channel::<C>().expect("Failed to create IPC channel");
+        ipc::channel::<C>().map_err(|err| Error::GdalSource {
+            source: crate::source::GdalSourceError::ProcessSetupFailed {
+                reason: err.to_string(),
+            },
+        })?;
 
-    let sender = ipc::IpcSender::<(IpcSender<S>, IpcReceiver<C>)>::connect(token)
-        .expect("Failed to connect to IPC Server");
+    let sender =
+        ipc::IpcSender::<(IpcSender<S>, IpcReceiver<C>)>::connect(token).map_err(|err| {
+            Error::GdalSource {
+                source: crate::source::GdalSourceError::ProcessSetupFailed {
+                    reason: err.to_string(),
+                },
+            }
+        })?;
 
     sender
         .send((server_sender, server_reciever))
-        .expect("Failed to send sender to server");
+        .map_err(|err| Error::GdalSource {
+            source: crate::source::GdalSourceError::ProcessSetupFailed {
+                reason: crate::source::GdalSourceError::IpcSendError { error: *err }.to_string(),
+            },
+        })?;
 
-    (client_sender, client_reciever)
-}
-
-/// Creates channels and connects to the IPC server with the given token,
-/// sending the channels to the server, so that communication can be established.
-///
-/// Assumes that the server is already running and listening for connections.
-pub fn setup_client_for_bytes<S>(token: String) -> (IpcBytesSender, IpcReceiver<S>)
-where
-    S: for<'de> serde::Deserialize<'de> + serde::Serialize,
-{
-    let (server_sender, client_reciever) =
-        ipc::channel::<S>().expect("Failed to create IPC channel");
-    let (client_sender, server_reciever) =
-        ipc::bytes_channel().expect("Failed to create IPC byte channel");
-
-    let sender = ipc::IpcSender::<(IpcSender<S>, IpcBytesReceiver)>::connect(token)
-        .expect("Failed to connect to IPC Server");
-
-    sender
-        .send((server_sender, server_reciever))
-        .expect("Failed to send sender to server");
-
-    (client_sender, client_reciever)
-}
-
-/// Worker pool of multiple processes
-/// RoundRobin by default, but if a [`RaterTile2D`] is requested that is already
-/// in cache use the corresponding process instead.
-///
-/// The workers are only started once requested.
-pub struct ProcessManager {
-    rr_index: usize,
-    pool: Vec<LazyLock<Arc<ProcessData>>>,
-    cache: HashMap<PathBuf, Arc<ProcessData>>,
-}
-
-impl ProcessManager {
-    /// Creates a new [`ProcessManager`] with `size` many workers
-    pub fn new(size: usize) -> Self {
-        let pool = (0..size)
-            .map(|_| LazyLock::new(ProcessData::spawn as fn() -> Arc<ProcessData>))
-            .collect();
-
-        Self {
-            rr_index: 0,
-            pool,
-            cache: HashMap::with_capacity(size),
-        }
-    }
-
-    #[inline]
-    pub fn new_with_arc_mutex(size: usize) -> Arc<tokio::sync::Mutex<Self>> {
-        Arc::new(tokio::sync::Mutex::new(Self::new(size)))
-    }
-
-    /// Returns the next process from the pool using round-robin scheduling,
-    /// advancing the index for the next call.
-    fn next_rr(&mut self) -> Arc<ProcessData> {
-        let process = Arc::clone(&*self.pool[self.rr_index]);
-        self.rr_index = (self.rr_index + 1) % self.pool.len();
-        process
-    }
-
-    /// Acquires a process for the given file `path`.
-    ///
-    /// If the path is already in the cache, the previously assigned process is
-    /// returned so that the worker that already has the file open handles the
-    /// request. Otherwise the next round-robin process is selected, recorded in
-    /// the cache, and returned.
-    pub fn acquire(&mut self, path: &PathBuf) -> Arc<ProcessData> {
-        if let Some(process) = self.cache.get(path) {
-            return Arc::clone(process);
-        }
-
-        let process = self.next_rr();
-        self.cache.insert(path.clone(), Arc::clone(&process));
-        process
-    }
+    Ok((client_sender, client_reciever))
 }
 
 pub struct ProcessData {
@@ -302,17 +218,21 @@ impl ProcessData {
         let pair = self
             .sender_receiver_pair
             .lock()
-            .expect("lock should not be poisoned");
+            .map_err(|err| Error::GdalSource {
+                source: crate::source::GdalSourceError::ProcessLockPoisoned {
+                    error: err.to_string(),
+                },
+            })?;
 
         let sender = &pair.0;
         let receiver = &pair.1;
 
-        sender.send(message).map_err(|e| crate::error::Error::Io {
-            source: std::io::Error::other(e.to_string()),
+        sender.send(message).map_err(|e| Error::GdalSource {
+            source: crate::source::GdalSourceError::IpcSendError { error: *e },
         })?;
 
-        let result = receiver.recv().map_err(|e| crate::error::Error::Io {
-            source: std::io::Error::other(e.to_string()),
+        let result = receiver.recv().map_err(|e| Error::GdalSource {
+            source: crate::source::GdalSourceError::IpcReceiveError { error: e },
         })?;
 
         into_raster::<P>(result)
@@ -326,6 +246,7 @@ impl Drop for ProcessData {
 }
 
 /// A simple, single-entry cache for an open GDAL dataset tile.
+#[derive(Default)]
 pub struct GdalDatasetCache {
     path: Option<PathBuf>,
     dataset: Option<GdalDataset>,
@@ -349,7 +270,7 @@ impl GdalDatasetCache {
         self.dataset = None;
     }
 
-    /// Moves the GdalDataset because it does not implement clone()
+    /// Moves the `GdalDataset` because it does not implement `clone()`
     pub fn take(&mut self, input_path: &PathBuf) -> Option<GdalDataset> {
         if let Some(path_ref) = self.path.as_ref()
             && *path_ref == *input_path
@@ -362,7 +283,6 @@ impl GdalDatasetCache {
     pub fn contains(&self, input_path: &PathBuf) -> bool {
         self.path
             .as_ref()
-            .map(|path_ref| *path_ref == *input_path)
-            .unwrap_or_default()
+            .is_some_and(|path_ref| *path_ref == *input_path)
     }
 }

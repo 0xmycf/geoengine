@@ -9,7 +9,6 @@ pub use self::csv::{
 
 // __private has a deprecation warning, but must be exported for the bin
 #[allow(deprecated)]
-#[cfg(feature = "gdalsource-process")]
 pub use self::gdal_source::__private;
 
 pub use self::gdal_source::{
@@ -20,8 +19,7 @@ pub use self::gdal_source::{
     GdalSourceTimePlaceholder, TimeReference,
     process::{
         GdalDatasetCache, IpcChannelMessage, IpcChannelMessagePayload, IpcProcessError,
-        IpcProcessRasterResult, ProcessData, ProcessManager, TileData, setup_client,
-        setup_client_for_bytes,
+        IpcProcessRasterResult, ProcessData, TileData, setup_client,
     },
 };
 pub use self::multi_band_gdal_source::{

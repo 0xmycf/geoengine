@@ -11,13 +11,6 @@ repository.workspace = true
 [[bin]]
 name = "gdalsource-process"
 path = "src/bin/gdalsource_process_main.rs"
-required-features = ["gdalsource-process"]
-
-[features]
-default = []
-
-# uses the new process thing instead of the default execution model
-gdalsource-process = []
 
 [dependencies]
 arrow = { workspace = true }
@@ -103,9 +96,6 @@ harness = false
 [[bench]]
 name = "gdal_source_operator_bench"
 harness = false
-
-# the bench for the gdalsource-process feature is located
-# in a sub-crate: <roo>/operators/gdalsource_process_bench/benches
 
 [lints]
 workspace = true

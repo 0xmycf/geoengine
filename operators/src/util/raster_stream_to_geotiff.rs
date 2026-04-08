@@ -1059,10 +1059,10 @@ fn geotiff_to_cog(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "gdalsource-process")]
-    use crate::source::ProcessManager;
+    use crate::source::ProcessData;
     use std::marker::PhantomData;
     use std::ops::Add;
+    use std::sync::{Arc, LazyLock};
 
     use crate::engine::{MockExecutionContext, RasterResultDescriptor, TimeDescriptor};
     use crate::mock::MockRasterSourceProcessor;
@@ -1093,12 +1093,7 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
-            #[cfg(feature = "gdalsource-process")]
-            process_manager: Some(ProcessManager::new_with_arc_mutex(
-                4, /* TODO configurable / some const / static default? */
-            )),
-            #[cfg(not(feature = "gdalsource-process"))]
-            process_manager: None,
+            process_data: Arc::new(LazyLock::new(ProcessData::spawn)),
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1152,12 +1147,7 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
-            #[cfg(feature = "gdalsource-process")]
-            process_manager: Some(ProcessManager::new_with_arc_mutex(
-                4, /* TODO configurable / some const / static default? */
-            )),
-            #[cfg(not(feature = "gdalsource-process"))]
-            process_manager: None,
+            process_data: Arc::new(LazyLock::new(ProcessData::spawn)),
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1206,12 +1196,7 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
-            #[cfg(feature = "gdalsource-process")]
-            process_manager: Some(ProcessManager::new_with_arc_mutex(
-                4, /* TODO configurable / some const / static default? */
-            )),
-            #[cfg(not(feature = "gdalsource-process"))]
-            process_manager: None,
+            process_data: Arc::new(LazyLock::new(ProcessData::spawn)),
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1265,12 +1250,7 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
-            #[cfg(feature = "gdalsource-process")]
-            process_manager: Some(ProcessManager::new_with_arc_mutex(
-                4, /* TODO configurable / some const / static default? */
-            )),
-            #[cfg(not(feature = "gdalsource-process"))]
-            process_manager: None,
+            process_data: Arc::new(LazyLock::new(ProcessData::spawn)),
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1326,12 +1306,7 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
-            #[cfg(feature = "gdalsource-process")]
-            process_manager: Some(ProcessManager::new_with_arc_mutex(
-                4, /* TODO configurable / some const / static default? */
-            )),
-            #[cfg(not(feature = "gdalsource-process"))]
-            process_manager: None,
+            process_data: Arc::new(LazyLock::new(ProcessData::spawn)),
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1387,12 +1362,7 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
-            #[cfg(feature = "gdalsource-process")]
-            process_manager: Some(ProcessManager::new_with_arc_mutex(
-                4, /* TODO configurable / some const / static default? */
-            )),
-            #[cfg(not(feature = "gdalsource-process"))]
-            process_manager: None,
+            process_data: Arc::new(LazyLock::new(ProcessData::spawn)),
         };
 
         let mut bytes = raster_stream_to_geotiff_bytes(
@@ -1468,12 +1438,7 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
-            #[cfg(feature = "gdalsource-process")]
-            process_manager: Some(ProcessManager::new_with_arc_mutex(
-                4, /* TODO configurable / some const / static default? */
-            )),
-            #[cfg(not(feature = "gdalsource-process"))]
-            process_manager: None,
+            process_data: Arc::new(LazyLock::new(ProcessData::spawn)),
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1517,12 +1482,7 @@ mod tests {
             meta_data: Box::new(metadata),
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
-            #[cfg(feature = "gdalsource-process")]
-            process_manager: Some(ProcessManager::new_with_arc_mutex(
-                4, /* TODO configurable / some const / static default? */
-            )),
-            #[cfg(not(feature = "gdalsource-process"))]
-            process_manager: None,
+            process_data: Arc::new(LazyLock::new(ProcessData::spawn)),
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1577,12 +1537,7 @@ mod tests {
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
 
-            #[cfg(feature = "gdalsource-process")]
-            process_manager: Some(ProcessManager::new_with_arc_mutex(
-                4, /* TODO configurable / some const / static default? */
-            )),
-            #[cfg(not(feature = "gdalsource-process"))]
-            process_manager: None,
+            process_data: Arc::new(LazyLock::new(ProcessData::spawn)),
         };
 
         let bytes = single_timestep_raster_stream_to_geotiff_bytes(
@@ -1805,12 +1760,7 @@ mod tests {
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
 
-            #[cfg(feature = "gdalsource-process")]
-            process_manager: Some(ProcessManager::new_with_arc_mutex(
-                4, /* TODO configurable / some const / static default? */
-            )),
-            #[cfg(not(feature = "gdalsource-process"))]
-            process_manager: None,
+            process_data: Arc::new(LazyLock::new(ProcessData::spawn)),
         };
 
         let (mut bytes, _) = raster_stream_to_multiband_geotiff_bytes(

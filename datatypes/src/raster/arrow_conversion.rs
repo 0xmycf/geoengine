@@ -52,9 +52,7 @@ pub fn raster_tile_2d_to_arrow_ipc_file_for_ipc_channel<P: Pixel>(
 }
 
 pub fn arrow_ipc_file_to_raster_tile_2d<P>(tile: Vec<u8>) -> Result<RasterTile2D<P>>
-// {{{
 where
-    // TODO (high): tests for this
     P: Pixel,
 {
     arrow_ipc_file_to_raster_tile_2d_impl(tile)
@@ -75,7 +73,6 @@ where
     let reader = FileReader::try_new(cursor, None)?;
 
     // the writer only writes one batch
-    // => I could change this to be more clear on the intent here
     if let Some(batch) = reader.flatten().next() {
         let schema = batch.schema();
         let metadata = schema.metadata();
@@ -88,11 +85,6 @@ where
             serde_json::from_str(metadata[X_SIZE_KEY].as_str()).expect("invalid x size");
         let y_size: usize =
             serde_json::from_str(metadata[Y_SIZE_KEY].as_str()).expect("invalid y size");
-
-        // TODO (high): investigate this error / necessity
-        // let spatial_ref: SpatialReferenceOption =
-        //     serde_json::from_str(metadata[SPATIAL_REF_KEY].as_str()).expect("invalid spatial ref");
-        // println!("spatial_ref {}:", spatial_ref);
 
         let band: usize = serde_json::from_str(metadata[BAND_KEY].as_str()).expect("invalid band");
 
@@ -114,8 +106,6 @@ where
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_else(raster_properties::RasterProperties::default);
 
-        // debug_assert_ne!(properties, raster_properties::RasterProperties::default());
-
         let cache_hint = CacheHint::default();
 
         let raster_tile_2d = RasterTile2D::new_with_properties(
@@ -133,7 +123,7 @@ where
     Err(error::Error::ArrowInternal {
         source: ArrowError::IpcError("no record batch found in arrow ipc file".to_string()),
     })
-} // }}}
+}
 
 fn arrow_array_to_grid_2d<P>(
     arr: &ArrayRef,
@@ -157,10 +147,10 @@ where
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::unwrap_used)]
 fn arrow_array_ref_to_values_and_validity<P: Pixel>(arr: &ArrayRef) -> (Vec<P>, Vec<bool>) {
     let validity = (0..arr.len()).map(|i| arr.is_valid(i)).collect();
     match arr.data_type() {
-        // TODO (low): make more general
         arrow::datatypes::DataType::UInt8 => {
             let arr = arr
                 .as_any()
@@ -273,7 +263,7 @@ fn arrow_array_ref_to_values_and_validity<P: Pixel>(arr: &ArrayRef) -> (Vec<P>, 
         }
         _ => panic!("unsupported data type"), // remove panic and return some other type
     }
-} // }}}
+}
 
 pub fn raster_tile_2d_to_arrow_ipc_file<P: Pixel>(
     tile: RasterTile2D<P>,
@@ -546,7 +536,6 @@ mod tests {
         );
         assert_eq!(schema.metadata()[X_SIZE_KEY], "2");
         assert_eq!(schema.metadata()[Y_SIZE_KEY], "3");
-        // TODO (high): this fails now!?
         assert_eq!(
             schema.metadata()[TIME_KEY],
             "{\"start\":-8334601228800000,\"end\":8210266876799999}"
@@ -596,7 +585,6 @@ mod tests {
         );
         assert_eq!(schema.metadata()[X_SIZE_KEY], "2");
         assert_eq!(schema.metadata()[Y_SIZE_KEY], "3");
-        // TODO (high): this fails now!?
         assert_eq!(
             schema.metadata()[TIME_KEY],
             "{\"start\":-8334601228800000,\"end\":8210266876799999}"

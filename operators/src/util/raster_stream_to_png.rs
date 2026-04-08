@@ -342,9 +342,9 @@ mod tests {
     use std::marker::PhantomData;
 
     use crate::engine::{MockExecutionContext, RasterQueryProcessor};
-    #[cfg(feature = "gdalsource-process")]
-    use crate::source::ProcessManager;
+    use crate::source::ProcessData;
     use crate::{source::GdalSourceProcessor, util::gdal::create_ndvi_meta_data};
+    use std::sync::{Arc, LazyLock};
     use geoengine_datatypes::primitives::{DateTime, TimeInstance};
     use geoengine_datatypes::{
         primitives::BandSelection,
@@ -386,12 +386,7 @@ mod tests {
             original_resolution_spatial_grid: None,
             _phantom_data: PhantomData,
 
-            #[cfg(feature = "gdalsource-process")]
-            process_manager: Some(ProcessManager::new_with_arc_mutex(
-                4, /* TODO configurable / some const / static default? */
-            )),
-            #[cfg(not(feature = "gdalsource-process"))]
-            process_manager: None,
+            process_data: Arc::new(LazyLock::new(ProcessData::spawn)),
         };
 
         let query = RasterQueryRectangle::new(
