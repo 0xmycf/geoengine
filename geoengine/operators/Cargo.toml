@@ -65,5 +65,9 @@ rand = { workspace = true }
 name = "ci_operators"
 harness = false
 
+[[bench]]
+name = "new_raster_cache"
+harness = false
+
 [lints]
 workspace = true
