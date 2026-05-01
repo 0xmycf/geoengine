@@ -716,6 +716,7 @@ mod tests {
             Some(tile_cache),
             None,
             None,
+            None,
         );
 
         // query the first two bands

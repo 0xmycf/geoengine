@@ -1,6 +1,7 @@
-use crate::cache::cache_tiles::CompressedRasterTile2D;
-use crate::cache::cache_tiles::CompressedRasterTileExt;
+pub mod anticache;
+
 use crate::cache::error::CacheError;
+use crate::cache::new_raster_cache::anticache::{ArrowIpcStorageFormat, OnDiskStore};
 use crate::engine::{
     BoxRasterQueryProcessor, CanonicOperatorName, InitializedRasterOperator, QueryContext,
     QueryProcessor, RasterOperator, RasterQueryProcessor, RasterResultDescriptor,
@@ -19,15 +20,13 @@ use geoengine_datatypes::primitives::{
 use geoengine_datatypes::raster::{
     GridBoundingBox2D, GridIdx2D, Pixel, RasterTile2D, TileInformation,
 };
-use geoengine_datatypes::util::ByteSize;
 use geoengine_datatypes::util::test::TestDefault;
 use itertools::FoldWhile::{Continue, Done};
 use itertools::Itertools;
-use std::any::Any;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::collections::HashMap;
 use std::fs::File;
-use std::hash::{Hash, Hasher};
-use std::io::{Read, Write};
+use std::io::{Read as _, Write};
 use std::iter;
 use std::marker::Sync;
 use std::pin::Pin;
@@ -39,15 +38,16 @@ pub struct NewRasterCache<Store: CacheStore> {
 }
 
 pub enum NewRasterCacheEnum {
-    OnDiskMockFifo(
-        NewRasterCache<MockOnDiskCacheStore<MockOnDiskStorageFormat, FifoEvictionStrategy>>,
-    ),
+    // OnDiskMockFifo(
+    //     NewRasterCache<MockOnDiskCacheStore<MockOnDiskStorageFormat, FifoEvictionStrategy>>,
+    // ),
+    OnDiskMockFifo(NewRasterCache<OnDiskStore<ArrowIpcStorageFormat, FifoEvictionStrategy>>),
 }
 
 impl TestDefault for NewRasterCacheEnum {
     fn test_default() -> Self {
         Self::OnDiskMockFifo(NewRasterCache {
-            store: MockOnDiskCacheStore {
+            store: OnDiskStore {
                 cache: RwLock::new(HashMap::new()),
                 eviction_strategy: RwLock::new(FifoEvictionStrategy::new(8_589_934_592)),
             },
@@ -132,7 +132,7 @@ impl EvictionStrategy for FifoEvictionStrategy {
         self.size += size;
     }
 
-    fn record_hit(&mut self, key: &CacheKey) {
+    fn record_hit(&mut self, _key: &CacheKey) {
         // Nothing to do here
     }
 
@@ -191,24 +191,26 @@ pub struct MockOnDiskStorageFormat {
     tile: TypedRasterTile2D,
 }
 
+#[async_trait]
 impl StorageFormat for MockOnDiskStorageFormat {
-    fn store(tile: TypedRasterTile2D) -> Result<Self> {
-        let mut file = File::create("foo.txt")?;
-        file.write_all(&[67 as u8])?;
+    async fn store(tile: TypedRasterTile2D) -> Result<Self> {
+        let mut file = tokio::fs::File::create("foo.txt").await?;
+        file.write_all(&[67 as u8]).await?;
         Ok(Self { tile })
     }
 
-    fn load(&self) -> Result<TypedRasterTile2D> {
-        let mut file = File::open("foo.txt")?;
+    async fn load(&self) -> Result<TypedRasterTile2D> {
+        let mut file = tokio::fs::File::open("foo.txt").await?;
         let mut buf = vec![];
-        file.read_to_end(&mut buf)?;
+        file.read_to_end(&mut buf).await?;
         Ok(self.tile.clone())
     }
 
-    fn byte_size(&self) -> Result<usize> {
-        let mut file = File::open("foo.txt")?;
+    async fn byte_size(&self) -> Result<usize> {
+        let mut file = tokio::fs::File::open("foo.txt").await?;
         let mut buf = vec![];
         file.read_to_end(&mut buf)
+            .await
             .map_err(|_| crate::error::Error::Cache {
                 source: CacheError::Unspecified,
             })
@@ -224,12 +226,13 @@ type CacheKey = (CanonicOperatorName, Band, TimeInterval, TileIndex);
 type Band = u32;
 type TileIndex = GridIdx2D;
 
-trait StorageFormat: Send + Sync + Sized + 'static {
-    fn store(tile: TypedRasterTile2D) -> Result<Self>;
+#[async_trait]
+pub trait StorageFormat: Send + Sync + Sized + 'static {
+    async fn store(tile: TypedRasterTile2D) -> Result<Self>;
 
-    fn load(&self) -> Result<TypedRasterTile2D>;
+    async fn load(&self) -> Result<TypedRasterTile2D>;
 
-    fn byte_size(&self) -> Result<usize>;
+    async fn byte_size(&self) -> Result<usize>;
 }
 
 #[derive(Clone)]
@@ -267,8 +270,8 @@ where
     }
 
     async fn insert(&self, key: CacheKey, tile: TypedRasterTile2D) -> Result<()> {
-        let stored_tile = Arc::new(SF::store(tile)?);
-        let required_space = stored_tile.byte_size()?;
+        let stored_tile = Arc::new(SF::store(tile).await?);
+        let required_space = stored_tile.byte_size().await?;
 
         let mut cache = self.cache.write().await;
         let mut eviction_strategy = self.eviction_strategy.write().await;
@@ -325,7 +328,7 @@ where
         let source_qp = self
             .source
             .query_processor()
-            .map_err(|err| CacheError::Unspecified)?;
+            .map_err(|_err| CacheError::Unspecified)?;
 
         Ok(match source_qp {
             TypedRasterQueryProcessor::U8(s) => TypedRasterQueryProcessor::U8(
@@ -453,7 +456,7 @@ where
                     if let Ok(stored_tile) = cache_store.get(&key).await
                     {
                         //println!("Cache hit for key {hash_key:?}!");
-                        let tile = stored_tile.load();
+                        let tile = stored_tile.load().await;
 
                         let tile: Result<RasterTile2D<T>> = match tile {
                             Ok(tile) => T::map_enum_to_tile(tile),
@@ -492,6 +495,7 @@ where
         ))
     }
 }
+
 #[async_trait]
 impl<T> QueryProcessor for RasterCacheQueryProcessor<T>
 where

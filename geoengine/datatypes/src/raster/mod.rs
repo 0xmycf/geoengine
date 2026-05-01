@@ -31,7 +31,10 @@ pub use self::tiling::{TileInformation, TileInformationIter, TilingSpecification
 pub use self::typed_raster_conversion::TypedRasterConversion;
 pub use self::typed_raster_tile::{TypedRasterTile2D, TypedRasterTile3D};
 pub use self::{grid_traits::ChangeGridBounds, grid_traits::GridShapeAccess};
-pub use arrow_conversion::raster_tile_2d_to_arrow_ipc_file;
+pub use arrow_conversion::{
+    arrow_ipc_file_to_raster_tile_2d_for_ipc_channel, raster_tile_2d_to_arrow_ipc_file,
+    raster_tile_2d_to_arrow_ipc_file_for_ipc_channel,
+};
 pub use db_types::GridBoundingBox2DDbType;
 pub use grid_spatial::{SpatialGridDefinition, TilingSpatialGridDefinition};
 pub use masked_grid::{MaskedGrid, MaskedGrid1D, MaskedGrid2D, MaskedGrid3D};
