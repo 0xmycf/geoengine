@@ -66,6 +66,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 typetag = { workspace = true }
 uuid = { workspace = true }
 strum = { workspace = true }
+xdg = { workspace = true }
 
 [dev-dependencies]
 async-stream = { workspace = true }

@@ -1,6 +1,8 @@
-use crate::cache::cache_tiles::CompressedRasterTile2D;
-use crate::cache::cache_tiles::CompressedRasterTileExt;
+pub mod anticache;
+
+use crate::cache::cache_tiles::{CompressedRasterTile2D, CompressedRasterTileExt};
 use crate::cache::error::CacheError;
+use crate::cache::new_raster_cache::anticache::{ArrowIpcStorageFormat, OnDiskStore};
 use crate::engine::{
     BoxRasterQueryProcessor, CanonicOperatorName, InitializedRasterOperator, QueryContext,
     QueryProcessor, RasterOperator, RasterQueryProcessor, RasterResultDescriptor,
@@ -19,14 +21,19 @@ use geoengine_datatypes::primitives::{
 use geoengine_datatypes::raster::{
     GridBoundingBox2D, GridIdx2D, Pixel, RasterTile2D, TileInformation,
 };
-use geoengine_datatypes::util::ByteSize;
+use geoengine_datatypes::util::ByteSize as _;
 use geoengine_datatypes::util::test::TestDefault;
+use itertools::Itertools;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fs::File;
+use std::hash::Hasher;
+use std::io::{Read as _, Write};
 use std::iter;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
 pub struct NewRasterCache<Store> {
@@ -40,11 +47,16 @@ pub enum NewRasterCacheEnum {
     InMemoryCompressedRasterTile2DLru(
         NewRasterCache<InMemoryCacheStore<TypedCompressedRasterTile2D, LruEvictionStrategy>>,
     ),
+    // OnDiskMockFifo(
+    //     NewRasterCache<MockOnDiskCacheStore<MockOnDiskStorageFormat, FifoEvictionStrategy>>,
+    // ),
+    OnDiskMockFifo(NewRasterCache<OnDiskStore<ArrowIpcStorageFormat, FifoEvictionStrategy>>),
 }
 
 impl TestDefault for NewRasterCacheEnum {
     fn test_default() -> Self {
         Self::InMemoryCompressedRasterTile2DFifo(NewRasterCache {
+            // TODO (crit): Make sure that the tests expect exactly this! Also is this sensible?
             store: InMemoryCacheStore {
                 cache: RwLock::new(HashMap::new()),
                 eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(8_589_934_592))),
@@ -86,6 +98,9 @@ impl NewRasterCacheEnum {
             NewRasterCacheEnum::InMemoryCompressedRasterTile2DLru(cache) => {
                 cache.store.get(key).await
             }
+            NewRasterCacheEnum::OnDiskMockFifo(_cache) => {
+                todo!("TODO (crit): make this work again: change types in the anticache file")
+            }
         }
     }
 
@@ -98,6 +113,9 @@ impl NewRasterCacheEnum {
             NewRasterCacheEnum::InMemoryCompressedRasterTile2DLru(cache) => {
                 cache.store.insert(key, tile).await
             }
+            NewRasterCacheEnum::OnDiskMockFifo(_cache) => {
+                todo!("TODO (crit): see above")
+            }
         }
     }
 
@@ -109,6 +127,7 @@ impl NewRasterCacheEnum {
             NewRasterCacheEnum::InMemoryCompressedRasterTile2DLru(cache) => {
                 cache.store.total_size.load(Ordering::SeqCst)
             }
+            NewRasterCacheEnum::OnDiskMockFifo(_cache) => todo!("TODO (crit): see above"),
         }
     }
 }
@@ -176,6 +195,7 @@ impl EvictionStrategy for FifoEvictionStrategy {
             size,
             cache_hint,
         });
+        // self.size += size;
     }
 
     fn record_removal(&mut self, key: &Arc<CacheKey>) {
@@ -604,14 +624,15 @@ fn cache_key_byte_size(key: &CacheKey) -> usize {
     std::mem::size_of_val(key) + key.0.heap_byte_size()
 }
 
+#[async_trait]
 trait StorageFormat: Send + Sync + Sized + 'static {
-    fn store(tile: TypedRasterTile2D) -> impl std::future::Future<Output = Result<Self>> + Send;
+    async fn store(tile: TypedRasterTile2D) -> Result<Self>;
 
-    fn load(&self) -> impl std::future::Future<Output = Result<TypedRasterTile2D>> + Send;
+    async fn load(&self) -> Result<TypedRasterTile2D>;
 
-    fn byte_size(&self) -> impl std::future::Future<Output = Result<usize>> + Send;
+    async fn byte_size(&self) -> Result<usize>;
 
-    fn is_expired(&self) -> impl std::future::Future<Output = bool> + Send;
+    async fn is_expired(&self) -> bool;
 }
 
 #[derive(Clone)]
@@ -659,6 +680,7 @@ pub enum TypedCompressedRasterTile2D {
     F64(CompressedRasterTile2D<f64>),
 }
 
+#[async_trait]
 impl StorageFormat for TypedCompressedRasterTile2D {
     async fn store(tile: TypedRasterTile2D) -> Result<Self> {
         tokio::task::spawn_blocking(move || match tile {
@@ -1060,6 +1082,7 @@ where
         ))
     }
 }
+
 #[async_trait]
 impl<T> QueryProcessor for RasterCacheQueryProcessor<T>
 where
