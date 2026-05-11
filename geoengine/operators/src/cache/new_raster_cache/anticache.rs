@@ -1,9 +1,11 @@
 #![allow(unused)]
 use std::{
+    fmt::Write,
     fs,
-    io::{self, ErrorKind},
+    io::{self, ErrorKind, Write as IoWrite},
     ops::Deref,
     path::PathBuf,
+    sync::OnceLock,
 };
 
 use geoengine_datatypes::raster::{
@@ -11,7 +13,9 @@ use geoengine_datatypes::raster::{
     raster_tile_2d_to_arrow_ipc_file_for_ipc_channel,
 };
 use tokio::{
-    fs::{create_dir, remove_file}, io::AsyncReadExt, sync::RwLock
+    fs::{create_dir, remove_file},
+    io::AsyncReadExt,
+    sync::RwLock,
 };
 use uuid::Uuid;
 
@@ -133,15 +137,24 @@ pub struct ArrowIpcStorageFormat {
     byte_size: usize,
 }
 
-fn cache_dir() -> PathBuf {
-    /*
-    The `xdg` crate specifies, that they only support unix and that
-    getting the home dir (which we implicitly do here) is problamatic (only) on windows.
+static RASTER_CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-    TODO (low): remove xdg and do it by hand instead?
-    */
-    let base_dirs = xdg::BaseDirectories::with_prefix("geoengine");
-    base_dirs.get_cache_home().expect("HOME not set")
+pub fn set_raster_cache_dir(path: PathBuf) -> Result<()> {
+    RASTER_CACHE_DIR.set(path).map_err(|err| Error::MustNotHappen { message: "RASTER_CACHE_DIR should only be set once during startup".to_string() })?;
+    Ok(())
+}
+
+/// Returns the `RASTER_CACHE_DIR` config setting if it is set,
+/// if is not, then return then return the xdg-cache dir
+fn cache_dir() -> PathBuf {
+    RASTER_CACHE_DIR
+        .get()
+        .map(|x| x.to_path_buf())
+        .unwrap_or_else(|| {
+            let home = std::env::home_dir()
+                .expect("Either 'RASTER_CACHE_DIR' or 'HOME' dir should be set");
+            home.join(".cache").join("geoengine")
+        })
 }
 
 impl OnDiskStorageFormat for ArrowIpcStorageFormat {
@@ -230,14 +243,19 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::util::test::assert_eq_raster_operator_res_and_list_of_tiles_u8;
+
     use super::*;
-    use gdal_sys::CPLFormCIFilename;
+    use gdal_sys::{CPLFormCIFilename, VSIGetCanonicalFilename};
+    use geoengine_datatypes::hashmap;
     use geoengine_datatypes::primitives::{CacheHint, TimeInterval};
     use geoengine_datatypes::raster::{Grid2D, RasterTile2D, TileInformation};
     use geoengine_datatypes::util::test::TestDefault;
+    use serde::de::Expected;
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
+    use std::str::FromStr;
 
     use tokio::sync::RwLock;
 
@@ -301,7 +319,6 @@ mod tests {
         //     .expect("it should be possible to delete the file from the disk");
     }
 
-    #[tokio::test(flavor = "current_thread")]
     async fn on_disk_storage_insert_and_get_with_arrow_ipc() {
         let cache_root = cache_dir();
         fs::create_dir_all(&cache_root).unwrap();
@@ -342,5 +359,22 @@ mod tests {
         let path = stored.path.clone();
         drop(stored);
         fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn cache_dir_from_home() {
+        let dir = cache_dir();
+        let home = std::env::home_dir().expect("HOME should be set");
+        assert_eq!(format!("{}/.cache/geoengine/", home.to_str().unwrap()), dir);
+    }
+
+    #[test]
+    fn set_then_read_raster_cache_dir() {
+        let expected = PathBuf::from_str("/tmp/something").unwrap();
+        if let Err(err) = set_raster_cache_dir(expected.clone()) {
+            panic!("{err}");
+        }
+        let actual = cache_dir();
+        assert_eq!(expected, actual);
     }
 }

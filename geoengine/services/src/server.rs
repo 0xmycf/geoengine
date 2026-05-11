@@ -1,6 +1,6 @@
 use crate::api::apidoc::ApiDoc;
 use crate::api::handlers;
-use crate::config::{self, get_config_element};
+use crate::config::{self, get_config, get_config_element};
 use crate::contexts::ApplicationContext;
 use crate::contexts::PostgresContext;
 use crate::error::{Error, Result};
@@ -15,10 +15,12 @@ use actix_files::Files;
 use actix_web::{App, FromRequest, HttpServer, http, middleware, web};
 use bb8_postgres::tokio_postgres::NoTls;
 use geoengine_datatypes::raster::TilingSpecification;
+use geoengine_operators::cache::new_raster_cache::anticache::set_raster_cache_dir;
 use geoengine_operators::engine::ChunkByteSize;
 use geoengine_operators::util::gdal::register_gdal_drivers_from_list;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use tokio::fs::create_dir_all;
 use tracing::info;
 use tracing_actix_web::TracingLogger;
 use utoipa::OpenApi;
@@ -170,6 +172,21 @@ pub async fn start_server(static_files_dir: Option<PathBuf>) -> Result<()> {
     let tiling_spec = config::get_config_element::<config::TilingSpecification>()?.into();
 
     register_gdal_drivers_from_list(config::get_config_element::<config::Gdal>()?.allowed_drivers);
+
+    let raster_cache_dir_config: crate::config::RasterCache = get_config_element()?;
+
+    {
+        if let Err(err) = set_raster_cache_dir(raster_cache_dir_config.path.clone()) {
+            panic!("Bug: {err}"); // TODO (low): the panic here is probably not what we actually want; ie. return error
+        }
+        if let Err(err) = create_dir_all(raster_cache_dir_config.path.clone()).await {
+            panic!("Cache path could not be created: {err:?}"); // TODO (low): the panic here is probably not what we actually want; ie. return error
+        }
+        info!(
+            "cache dir for raster data is set to {:?}",
+            &raster_cache_dir_config.path.canonicalize()?
+        );
+    }
 
     start_postgres(
         data_path_config,
