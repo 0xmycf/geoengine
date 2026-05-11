@@ -625,8 +625,8 @@ fn cache_key_byte_size(key: &CacheKey) -> usize {
 }
 
 #[async_trait]
-trait StorageFormat: Send + Sync + Sized + 'static {
-    async fn store(tile: TypedRasterTile2D) -> Result<Self>;
+pub trait StorageFormat: Send + Sync + Sized + 'static {
+    async fn store(tile: TypedRasterTile2D, key: Arc<CacheKey>) -> Result<Self>;
 
     async fn load(&self) -> Result<TypedRasterTile2D>;
 
@@ -682,7 +682,7 @@ pub enum TypedCompressedRasterTile2D {
 
 #[async_trait]
 impl StorageFormat for TypedCompressedRasterTile2D {
-    async fn store(tile: TypedRasterTile2D) -> Result<Self> {
+    async fn store(tile: TypedRasterTile2D, _key: Arc<CacheKey>) -> Result<Self> {
         tokio::task::spawn_blocking(move || match tile {
             TypedRasterTile2D::I8(tile) => Ok(TypedCompressedRasterTile2D::I8(
                 CompressedRasterTile2D::compress_tile(tile),
@@ -834,7 +834,7 @@ where
         }
 
         let cache_hint = tile.cache_hint();
-        let value = SF::store(tile).await?;
+        let value = SF::store(tile, key.clone()).await?;
         let value_size = value.byte_size().await?;
 
         let key_size = cache_key_byte_size(&key);
