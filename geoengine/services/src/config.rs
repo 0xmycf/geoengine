@@ -676,6 +676,15 @@ impl ConfigElement for ProviderCache {
     const KEY: &'static str = "provider_cache";
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct RasterCache {
+    pub path: PathBuf,
+}
+
+impl ConfigElement for RasterCache {
+    const KEY: &'static str = "raster_cache";
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct Wildlive {
     pub api_endpoint: Url,
