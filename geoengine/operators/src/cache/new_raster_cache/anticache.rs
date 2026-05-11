@@ -1,11 +1,6 @@
 #![allow(unused)]
 use std::{
-    fmt::Write,
-    fs,
-    io::{self, ErrorKind, Write as IoWrite},
-    ops::Deref,
-    path::PathBuf,
-    sync::OnceLock,
+    fmt::Write, fs, io::{self, ErrorKind, Write as IoWrite}, ops::Deref, path::PathBuf, str::FromStr, sync::OnceLock
 };
 
 use geoengine_datatypes::raster::{
@@ -61,11 +56,10 @@ impl<SF: OnDiskStorageFormat> Drop for PendingFile<SF> {
     }
 }
 
-
 #[async_trait]
 pub trait OnDiskStorageFormat: StorageFormat {
-    async fn write(tile: TypedRasterTile2D) -> Result<PendingFile<Self>> {
-        let store = Self::store(tile).await?;
+    async fn write(tile: TypedRasterTile2D, key: CacheKey) -> Result<PendingFile<Self>> {
+        let store = Self::store(tile, key).await?;
         let pending_file = PendingFile::new(store);
         Ok(pending_file)
     }
@@ -100,7 +94,7 @@ where
         without actually being inserted in the cache / index later on.
         Otherwise we will have orphaned files.
         */
-        let stored_tile = SF::write(tile).await?;
+        let stored_tile = SF::write(tile, key.clone()).await?;
         let required_space = stored_tile.byte_size().await?;
 
         let mut cache = self.cache.write().await;
@@ -163,13 +157,35 @@ impl OnDiskStorageFormat for ArrowIpcStorageFormat {
     }
 }
 
+fn index_to_string(idx: &TileIndex) -> String {
+    let mut sb = String::new();
+    let mut iter = idx.as_slice().iter();
+    while let Some(value) = iter.next() {
+        sb.write_str(&format!("{}-", value));
+    }
+    sb[0..sb.len() - 1].to_string()
+}
+
+/// returns the path to the directory (does not create) as the first element
+///         and the filepath as the second element.
+async fn path_for_cache_key(key: &CacheKey) -> Result<(PathBuf, PathBuf)> {
+    let cache_dir = cache_dir();
+    let ops_dir_name = key.0.to_string();
+    let file_name = format!(
+        "band_{}-timeinterval_{}-grididx_{}.raster_cache.ipc",
+        key.1,
+        key.2,
+        index_to_string(&key.3),
+    );
+    tokio::fs::create_dir_all(&cache_dir).await?;
+    Ok((cache_dir, PathBuf::from_str(&file_name).expect("it to be a valid pathbuf")))
+}
+
 #[async_trait]
 impl StorageFormat for ArrowIpcStorageFormat {
-    async fn store(tile: TypedRasterTile2D) -> Result<Self> {
-        let cache_dir = cache_dir();
-        tokio::fs::create_dir_all(&cache_dir).await?;
-        let uuid = Uuid::new_v4();
-        let file_path = PathBuf::from(format!("{uuid}.raster_cache.ipc"));
+    async fn store(tile: TypedRasterTile2D, key: CacheKey) -> Result<Self> {
+        let (cache_dir, file_path) = path_for_cache_key(&key).await?;
+        tokio::fs::create_dir_all(cache_dir.clone()).await?;
         let cache_path = cache_dir.join(file_path);
 
         let bytes = typed_raster_tile_to_arrow_ipc(tile.clone())?; // is cloning here necessary?
@@ -285,40 +301,46 @@ mod tests {
         TypedRasterTile2D::U8(raster_tile)
     }
 
-    #[test]
-    fn arrow_ipc_storage_format_store_and_load() {
-        panic!("not implemented");
-        // let cache_root = cache_dir();
-        // fs::create_dir_all(&cache_root).unwrap();
+    #[tokio::test]
+    async fn arrow_ipc_storage_format_store_and_load() {
+        let cache_root = cache_dir();
+        fs::create_dir_all(&cache_root).unwrap();
 
-        // let tile = test_tile_u8();
-        // let stored = ArrowIpcStorageFormat::store(tile.clone())
-        //     .expect("it should be possible to store the tile.");
+        let tile = test_tile_u8();
+        let stored = ArrowIpcStorageFormat::store(tile.clone(), test_key(0))
+            .await
+            .expect("it should be possible to store the tile.");
 
-        // let path = &stored.path;
-        // let metadata = fs::metadata(&stored.path).expect(&format!("File should be at {path:#?}"));
-        // assert_eq!(stored.byte_size().unwrap() as u64, metadata.len());
+        let path = stored.path.clone();
+        let metadata = fs::metadata(&path).expect(&format!("File should be at {path:#?}"));
+        let byte_size = stored
+            .byte_size()
+            .await
+            .expect("it should be possible to get the stored byte size.");
+        assert_eq!(byte_size as u64, metadata.len());
 
-        // let loaded = stored
-        //     .load()
-        //     .expect(&format!("File '{path:#?}' should loadable as a RasterTile"));
-        // match loaded {
-        //     TypedRasterTile2D::U8(loaded_tile) => {
-        //         if let TypedRasterTile2D::U8(original_tile) = tile {
-        //             assert_eq!(
-        //                 loaded_tile, original_tile,
-        //                 "Tiles are not the same after on-disk cache"
-        //             );
-        //         } else {
-        //             panic!("expected u8 tile");
-        //         }
-        //     }
-        //     _ => panic!("expected u8 tile"),
-        // }
-        // fs::remove_file(&stored.path)
-        //     .expect("it should be possible to delete the file from the disk");
+        let loaded = stored
+            .load()
+            .await
+            .expect(&format!("File '{path:#?}' should loadable as a RasterTile"));
+        match loaded {
+            TypedRasterTile2D::U8(loaded_tile) => {
+                if let TypedRasterTile2D::U8(original_tile) = tile {
+                    assert_eq!(
+                        loaded_tile, original_tile,
+                        "Tiles are not the same after on-disk cache"
+                    );
+                } else {
+                    panic!("expected u8 tile");
+                }
+            }
+            _ => panic!("expected u8 tile"),
+        }
+
+        fs::remove_file(&path).expect("it should be possible to delete the file from the disk");
     }
 
+    #[tokio::test]
     async fn on_disk_storage_insert_and_get_with_arrow_ipc() {
         let cache_root = cache_dir();
         fs::create_dir_all(&cache_root).unwrap();
@@ -376,5 +398,20 @@ mod tests {
         }
         let actual = cache_dir();
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn cache_key_formatting() {
+        let cases = hashmap! {
+            [1, 2].into() => "1-2".to_string(),
+            [-1, -2].into() => "-1--2".to_string(),
+            [0, -1].into() => "0--1".to_string(),
+            [0, 1].into() => "0-1".to_string(),
+        };
+        for case in cases {
+            let actual = index_to_string(&case.0);
+            let expected = case.1;
+            assert_eq!(expected, actual)
+        }
     }
 }

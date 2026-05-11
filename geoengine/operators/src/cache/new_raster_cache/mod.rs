@@ -193,7 +193,7 @@ pub struct MockOnDiskStorageFormat {
 
 #[async_trait]
 impl StorageFormat for MockOnDiskStorageFormat {
-    async fn store(tile: TypedRasterTile2D) -> Result<Self> {
+    async fn store(tile: TypedRasterTile2D, key: CacheKey) -> Result<Self> {
         let mut file = tokio::fs::File::create("foo.txt").await?;
         file.write_all(&[67 as u8]).await?;
         Ok(Self { tile })
@@ -228,7 +228,7 @@ type TileIndex = GridIdx2D;
 
 #[async_trait]
 pub trait StorageFormat: Send + Sync + Sized + 'static {
-    async fn store(tile: TypedRasterTile2D) -> Result<Self>;
+    async fn store(tile: TypedRasterTile2D, key: CacheKey) -> Result<Self>;
 
     async fn load(&self) -> Result<TypedRasterTile2D>;
 
@@ -270,7 +270,7 @@ where
     }
 
     async fn insert(&self, key: CacheKey, tile: TypedRasterTile2D) -> Result<()> {
-        let stored_tile = Arc::new(SF::store(tile).await?);
+        let stored_tile = Arc::new(SF::store(tile, key.clone()).await?);
         let required_space = stored_tile.byte_size().await?;
 
         let mut cache = self.cache.write().await;
