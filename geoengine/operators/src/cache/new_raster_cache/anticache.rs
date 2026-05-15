@@ -1,11 +1,20 @@
 #![allow(unused)]
 use std::{
-    fmt::Write, fs, io::{self, ErrorKind, Write as IoWrite}, ops::Deref, path::PathBuf, str::FromStr, sync::OnceLock
+    fmt::Write,
+    fs,
+    io::{self, ErrorKind, Write as IoWrite},
+    ops::Deref,
+    path::PathBuf,
+    str::FromStr,
+    sync::OnceLock,
 };
 
-use geoengine_datatypes::raster::{
-    arrow_ipc_file_to_raster_tile_2d_for_ipc_channel,
-    raster_tile_2d_to_arrow_ipc_file_for_ipc_channel,
+use geoengine_datatypes::{
+    primitives::DateTimeParseFormat,
+    raster::{
+        arrow_ipc_file_to_raster_tile_2d_for_ipc_channel,
+        raster_tile_2d_to_arrow_ipc_file_for_ipc_channel,
+    },
 };
 use tokio::{
     fs::{create_dir, remove_file},
@@ -134,7 +143,11 @@ pub struct ArrowIpcStorageFormat {
 static RASTER_CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn set_raster_cache_dir(path: PathBuf) -> Result<()> {
-    RASTER_CACHE_DIR.set(path).map_err(|err| Error::MustNotHappen { message: "RASTER_CACHE_DIR should only be set once during startup".to_string() })?;
+    RASTER_CACHE_DIR
+        .set(path)
+        .map_err(|err| Error::MustNotHappen {
+            message: "RASTER_CACHE_DIR should only be set once during startup".to_string(),
+        })?;
     Ok(())
 }
 
@@ -166,6 +179,15 @@ fn index_to_string(idx: &TileIndex) -> String {
     sb[0..sb.len() - 1].to_string()
 }
 
+fn time_interval_to_path_safe_iso(time: &TimeInterval) -> String {
+    let fmt = &DateTimeParseFormat::custom("%Y-%m-%dT%H-%M-%S%.3fZ".to_string());
+    format!(
+        "{}_to_{}",
+        time.start().as_date_time().unwrap().format(fmt),
+        time.end().as_date_time().unwrap().format(fmt)
+    )
+}
+
 /// returns the path to the directory (does not create) as the first element
 ///         and the filepath as the second element.
 async fn path_for_cache_key(key: &CacheKey) -> Result<(PathBuf, PathBuf)> {
@@ -174,11 +196,14 @@ async fn path_for_cache_key(key: &CacheKey) -> Result<(PathBuf, PathBuf)> {
     let file_name = format!(
         "band_{}-timeinterval_{}-grididx_{}.raster_cache.ipc",
         key.1,
-        key.2,
+        time_interval_to_path_safe_iso(&key.2),
         index_to_string(&key.3),
     );
     tokio::fs::create_dir_all(&cache_dir).await?;
-    Ok((cache_dir, PathBuf::from_str(&file_name).expect("it to be a valid pathbuf")))
+    Ok((
+        cache_dir,
+        PathBuf::from_str(&file_name).expect("it to be a valid pathbuf"),
+    ))
 }
 
 #[async_trait]
@@ -264,7 +289,7 @@ mod tests {
     use super::*;
     use gdal_sys::{CPLFormCIFilename, VSIGetCanonicalFilename};
     use geoengine_datatypes::hashmap;
-    use geoengine_datatypes::primitives::{CacheHint, TimeInterval};
+    use geoengine_datatypes::primitives::{CacheHint, DateTimeParseFormat, TimeInterval};
     use geoengine_datatypes::raster::{Grid2D, RasterTile2D, TileInformation};
     use geoengine_datatypes::util::test::TestDefault;
     use serde::de::Expected;
@@ -413,5 +438,13 @@ mod tests {
             let expected = case.1;
             assert_eq!(expected, actual)
         }
+    }
+
+    #[test]
+    fn time_interval_to_iso_test() {
+        let time = TimeInterval::new(0, 2).expect("it should be valid");
+        let expected = "1970-01-01T00-00-00Z_to_1970-01-01T00-00-00.002Z";
+        let actual = time_interval_to_path_safe_iso(&time);
+        assert_eq!(expected, actual);
     }
 }
