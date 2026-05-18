@@ -225,5 +225,5 @@ vergen-gitcl = "9.1"
 walkdir = "2.4"
 wkt = "0.14"
 xml = "1.2"
-zarrs = "0.23.12"
+zarrs ={ version = "0.23.12", features = ["filesystem", "async"] } # Note: <https://book.zarrs.dev/stores.html#the-sync-and-async-api>
 zip = "8.2"

@@ -12,18 +12,33 @@ use std::{
 use geoengine_datatypes::{
     primitives::DateTimeParseFormat,
     raster::{
+        Grid, GridOrEmpty, GridShapeAccess, MaskedGrid2D, TypedGrid, TypedGrid2D,
         arrow_ipc_file_to_raster_tile_2d_for_ipc_channel,
         raster_tile_2d_to_arrow_ipc_file_for_ipc_channel,
     },
+    util::ByteSize,
 };
+use serde_json::json;
 use tokio::{
     fs::{create_dir, remove_file},
     io::AsyncReadExt,
     sync::RwLock,
 };
 use uuid::Uuid;
+use zarrs::{
+    array::{
+        Array, ArrayBuilder, ArrayCreateError, IntoArrayBytes, builder::ArrayBuilderFillValue,
+        data_type,
+    },
+    filesystem::FilesystemStore,
+    group::GroupBuilder,
+};
 
-use crate::{cache::new_raster_cache::*, error::Error};
+use crate::{
+    cache::{self, new_raster_cache::*},
+    call_generic_typed_raster_tile_2d_cache,
+    error::Error,
+};
 
 pub struct OnDiskStore<SF: StorageFormat, ES: EvictionStrategy> {
     pub(crate) cache: RwLock<HashMap<CacheKey, Arc<SF>>>,
@@ -138,6 +153,279 @@ pub struct ArrowIpcStorageFormat {
     tile: TypedRasterTile2D,
     /// The cached bytesize of the file ins storage
     byte_size: usize,
+}
+
+// How it is stored:
+// The grid is stored as raw bytes (gotta figure out how, exactly)
+// the rest is stored as metadata in the zarr file / zarr.json
+pub struct ZarrsStorageFormat {
+    path: String,
+    tile: TypedRasterTile2D,
+    byte_size: usize,
+    chunk_indices: [u64; 2],
+    // TODO (high): FLEGMON I need to put the indicies in here
+    // key: CacheKey,
+    // operator? path? group?
+}
+
+struct ZarrsArrayPath {
+    /// the path to the tiles array
+    tiles: String,
+    /// the path to the metadata array
+    metadata: String,
+}
+
+impl ZarrsStorageFormat {
+    fn path_name_from_cache_key(
+        (operator_name, band, time_interval, tile_index): &CacheKey,
+    ) -> ZarrsArrayPath {
+        let time = time_interval_to_path_safe_iso(time_interval);
+        format!("/{operator_name}/band_{band}/{time}/tiles")
+    }
+}
+
+/// Opens or creates a new array at "/{operator_name}/band_{band}/{time}/tiles".
+/// Stores the metadata of the array if a new one is created.
+fn build_array_and_prepare_insert(
+    key @ (operator_name, band, time_interval, tile_index): &CacheKey,
+    store: Arc<FilesystemStore>,
+    tile: &TypedRasterTile2D,
+) -> Result<(zarrs::array::Array<FilesystemStore>, String), zarrs::array::ArrayCreateError> {
+    let [tile_height, tile_width] = tile.grid_shape_array();
+    let path = ZarrsStorageFormat::path_name_from_cache_key(key);
+
+    let attributes = build_attributes(tile);
+
+    match Array::open(store.clone(), &path) {
+        Ok(array) => Ok((array, path)),
+        Err(_) => {
+            let array = ArrayBuilder::new(
+                vec![tile_height as u64, tile_width as u64], // TODO (high): this seems incorrect
+                vec![tile_height as u64, tile_width as u64],
+                zarrs_data_type(tile),
+                filler_value(tile),
+            )
+            .attributes(attributes)
+            .build(store.clone(), &path)?;
+            array.store_metadata()?;
+            Ok((array, path))
+        }
+    }
+}
+
+fn build_attributes(tile: &TypedRasterTile2D) -> serde_json::Map<String, serde_json::Value> {
+    use serde_json::Value::*;
+    let mut map = serde_json::Map::new();
+    let (time, tile_position, band, global_geo_transform, properties, cache_hint) =
+        call_generic_typed_raster_tile_2d_cache!(tile, |base_tile| (
+            base_tile.time,
+            base_tile.tile_position,
+            base_tile.band,
+            base_tile.global_geo_transform,
+            base_tile.properties.clone(),
+            base_tile.cache_hint
+        ));
+    // TODO (mid): error handling
+    map.insert(
+        "time".to_string(),
+        serde_json::to_value(time).expect("it to be serialisable"),
+    );
+    map.insert(
+        "tile_position".to_string(),
+        serde_json::to_value(time).expect("it to be serialisable"),
+    );
+    map
+}
+
+// TODO (mid): Are those NAN / filler values actually the right ones? Should they be made configurable?
+fn filler_value(tile: &TypedRasterTile2D) -> ArrayBuilderFillValue {
+    match tile {
+        TypedRasterTile2D::I8(_)
+        | TypedRasterTile2D::I16(_)
+        | TypedRasterTile2D::I32(_)
+        | TypedRasterTile2D::I64(_)
+        | TypedRasterTile2D::U8(_)
+        | TypedRasterTile2D::U16(_)
+        | TypedRasterTile2D::U32(_)
+        | TypedRasterTile2D::U64(_) => 0.into(),
+        TypedRasterTile2D::F32(_) => f32::NAN.into(),
+        TypedRasterTile2D::F64(_) => f64::NAN.into(),
+    }
+}
+
+fn zarrs_data_type(tile: &TypedRasterTile2D) -> zarrs::array::DataType {
+    use zarrs::array;
+    match tile {
+        TypedRasterTile2D::I8(base_tile) => data_type::int8(),
+        TypedRasterTile2D::I16(base_tile) => data_type::int16(),
+        TypedRasterTile2D::I32(base_tile) => data_type::int32(),
+        TypedRasterTile2D::I64(base_tile) => data_type::int64(),
+        TypedRasterTile2D::U8(base_tile) => data_type::uint8(),
+        TypedRasterTile2D::U16(base_tile) => data_type::uint16(),
+        TypedRasterTile2D::U32(base_tile) => data_type::uint32(),
+        TypedRasterTile2D::U64(base_tile) => data_type::uint64(),
+        TypedRasterTile2D::F32(base_tile) => data_type::float32(),
+        TypedRasterTile2D::F64(base_tile) => data_type::float64(),
+    }
+}
+
+fn open_zarrs_filesystemstore() -> Result<Arc<FilesystemStore>> {
+    let cache_dir = cache_dir();
+    let zarrs = zarrs::filesystem::FilesystemStore::new(cache_dir.join("zarr_cache"))
+        // TODO (mid): see if the error handling is okay like that
+        .map_err(|err| Error::ZarrFilesystemError { source: err })?;
+    Ok(Arc::new(zarrs))
+}
+
+#[async_trait]
+impl StorageFormat for ZarrsStorageFormat {
+    async fn store(
+        tile: TypedRasterTile2D,
+        (operator_name, band, time_interval, tile_index): CacheKey,
+    ) -> Result<Self> {
+        let store = open_zarrs_filesystemstore()?;
+
+        let (array, path) = build_array_and_prepare_insert(
+            &(operator_name, band, time_interval, tile_index),
+            store.clone(),
+            &tile,
+        )
+        .map_err(|source| Error::ZarrArrayCreateError { source })?;
+    array.store_metadata_opt(options)
+
+        let chunk_indices = tile_index
+            .as_slice()
+            .iter()
+            .map(|x| *x as u64)
+            .collect::<Vec<u64>>();
+        let byte_size = store_tile_data(tile.clone(), store, &array, &chunk_indices)
+            .map_err(|source| Error::ZarrArrayError { source })?;
+
+        Ok(ZarrsStorageFormat {
+            path,
+            tile,
+            byte_size,
+            chunk_indices: [chunk_indices[0], chunk_indices[1]],
+        })
+    }
+
+    async fn load(&self) -> Result<TypedRasterTile2D> {
+        let ZarrsStorageFormat {
+            path,
+            tile,
+            byte_size,
+            chunk_indices,
+        } = self;
+        let store = open_zarrs_filesystemstore()?;
+        let array = Array::open(store.clone(), path)
+            .map_err(|source| Error::ZarrArrayCreateError { source })?;
+        match tile {
+            // TODO (mid): this is kinda stupid, no? in this case we could easily just return the "tile" field
+            // from the storage format...
+            //
+            // it should probably not always be in RAM, but should be ignored on some condition
+            TypedRasterTile2D::I8(_) => {
+                let raw_data: Vec<i8> = array
+                    .retrieve_chunk(chunk_indices)
+                    .map_err(|source| Error::ZarrArrayError { source })?;
+                let data = GridOrEmpty::new_grid(MaskedGrid2D::new_with_data(
+                    Grid::new([1, 2].into() /* TODO */, raw_data)
+                        .expect("it to have the correct shape"),
+                ));
+                let time = todo!();
+                let tile_position = todo!();
+                let band = todo!();
+                let global_geo_transform = todo!();
+                let cache_hint = todo!();
+                Ok(TypedRasterTile2D::I8(RasterTile2D::new(
+                    // TODO (high): FLEGMON these must be saved in the metadata of the zarr array (?) -- the grid shape above too
+                    time,
+                    tile_position,
+                    band,
+                    global_geo_transform,
+                    data,
+                    cache_hint,
+                )))
+            }
+            TypedRasterTile2D::I16(_) => todo!(),
+            TypedRasterTile2D::I32(_) => todo!(),
+            TypedRasterTile2D::I64(_) => todo!(),
+            TypedRasterTile2D::U8(_) => todo!(),
+            TypedRasterTile2D::U16(_) => todo!(),
+            TypedRasterTile2D::U32(_) => todo!(),
+            TypedRasterTile2D::U64(_) => todo!(),
+            TypedRasterTile2D::F32(_) => todo!(),
+            TypedRasterTile2D::F64(_) => todo!(),
+        }
+    }
+
+    async fn byte_size(&self) -> Result<usize> {
+        Ok(self.byte_size)
+    }
+}
+
+/// returns the amount of bytes written
+fn store_tile_data(
+    tile: TypedRasterTile2D,
+    store: Arc<FilesystemStore>,
+    array: &Array<FilesystemStore>,
+    chunk_indices: &[u64],
+) -> std::result::Result<usize, zarrs::array::ArrayError> {
+    match TypedGrid2D::try_from(tile) {
+        Err(()) => Ok(0), // TODO (high): evalulate if writing nothinig is actually what we want, or if it would be better to write empty data tiles
+        Ok(typed_grid) => match typed_grid {
+            TypedGrid::U8(grid) => {
+                let ret = grid.data.byte_size();
+                array.store_chunk(chunk_indices, grid.data)?;
+                Ok(ret)
+            }
+            TypedGrid::U16(grid) => {
+                let ret = grid.data.byte_size();
+                array.store_chunk(chunk_indices, grid.data)?;
+                Ok(ret)
+            }
+            TypedGrid::U32(grid) => {
+                let ret = grid.data.byte_size();
+                array.store_chunk(chunk_indices, grid.data)?;
+                Ok(ret)
+            }
+            TypedGrid::U64(grid) => {
+                let ret = grid.data.byte_size();
+                array.store_chunk(chunk_indices, grid.data)?;
+                Ok(ret)
+            }
+            TypedGrid::I8(grid) => {
+                let ret = grid.data.byte_size();
+                array.store_chunk(chunk_indices, grid.data)?;
+                Ok(ret)
+            }
+            TypedGrid::I16(grid) => {
+                let ret = grid.data.byte_size();
+                array.store_chunk(chunk_indices, grid.data)?;
+                Ok(ret)
+            }
+            TypedGrid::I32(grid) => {
+                let ret = grid.data.byte_size();
+                array.store_chunk(chunk_indices, grid.data)?;
+                Ok(ret)
+            }
+            TypedGrid::I64(grid) => {
+                let ret = grid.data.byte_size();
+                array.store_chunk(chunk_indices, grid.data)?;
+                Ok(ret)
+            }
+            TypedGrid::F32(grid) => {
+                let ret = grid.data.byte_size();
+                array.store_chunk(chunk_indices, grid.data)?;
+                Ok(ret)
+            }
+            TypedGrid::F64(grid) => {
+                let ret = grid.data.byte_size();
+                array.store_chunk(chunk_indices, grid.data)?;
+                Ok(ret)
+            }
+        },
+    }
 }
 
 static RASTER_CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();

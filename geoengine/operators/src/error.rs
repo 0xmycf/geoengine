@@ -545,6 +545,20 @@ pub enum Error {
     SimpleRasterStacker {
         source: SimpleRasterStackerError,
     },
+
+    #[snafu(display("Error in the Zarr filesystem StorageFromat: {source}"))]
+    ZarrFilesystemError {
+        source: zarrs::filesystem::FilesystemStoreCreateError,
+    },
+
+    #[snafu(display("Error while creating an array with zarrs: {source}"))]
+    ZarrArrayCreateError {
+        source: zarrs::array::ArrayCreateError,
+    },
+    #[snafu(display("Error while working on an array with zarrs: {source}"))]
+    ZarrArrayError {
+        source: zarrs::array::ArrayError,
+    },
 }
 
 impl From<crate::mock::MockRasterSourceError> for Error {
