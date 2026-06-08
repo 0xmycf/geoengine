@@ -12,8 +12,8 @@ use std::{
 use geoengine_datatypes::{
     primitives::DateTimeParseFormat,
     raster::{
-        Grid, GridOrEmpty, GridShapeAccess, MaskedGrid2D, TypedGrid, TypedGrid2D,
-        arrow_ipc_file_to_raster_tile_2d_for_ipc_channel,
+        GeoTransform, Grid, GridOrEmpty, GridShapeAccess, MaskedGrid2D, RasterProperties,
+        TypedGrid, TypedGrid2D, arrow_ipc_file_to_raster_tile_2d_for_ipc_channel,
         raster_tile_2d_to_arrow_ipc_file_for_ipc_channel,
     },
     util::ByteSize,
@@ -27,7 +27,8 @@ use tokio::{
 use uuid::Uuid;
 use zarrs::{
     array::{
-        Array, ArrayBuilder, ArrayCreateError, IntoArrayBytes, builder::ArrayBuilderFillValue,
+        Array, ArrayBuilder, ArrayBytes, ArrayCreateError, ArrayShape, IntoArrayBytes,
+        builder::{ArrayBuilderChunkGridMetadata, ArrayBuilderFillValue},
         data_type,
     },
     filesystem::FilesystemStore,
@@ -170,9 +171,42 @@ pub struct ZarrsStorageFormat {
 
 struct ZarrsArrayPath {
     /// the path to the tiles array
-    tiles: String,
+    pub tiles: String,
     /// the path to the metadata array
-    metadata: String,
+    pub metadata: String,
+}
+
+struct ZarrsArrayAccess {
+    pub tiles: zarrs::array::Array<zarrs::filesystem::FilesystemStore>,
+    pub metadata: zarrs::array::Array<zarrs::filesystem::FilesystemStore>,
+}
+
+impl ZarrsArrayAccess {
+    fn store_chunk(&self) {}
+    fn retreive_chunk(&self) {}
+}
+
+// TODO (high): Not sure if this is actually the best way to do this...
+//  it might be actually okay to not have this second array and instead
+//  safe this information once for the whole array if everything is identical.
+
+/// The fields from [`BaseTile`] which are not in the tiles array
+/// and cannot be infered from other info (i.e. the cache key)
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ZarrsMetaDataChunk {
+    pub tile_position: GridIdx2D, // not sure if this is needed
+    // pub global_geo_transform: GeoTransform, // can be saved in the array instead
+    pub properties: RasterProperties, // properties are not necessarily unique across tiles from one raster/file
+}
+
+impl<'a> IntoArrayBytes<'a> for ZarrsMetaDataChunk {
+    fn into_array_bytes(
+        self,
+        data_type: &zarrs::array::DataType,
+    ) -> std::result::Result<zarrs::array::ArrayBytes<'a>, zarrs::array::ElementError> {
+        let self_as_json = serde_json::to_string(&self).expect("it works");
+        Ok(ArrayBytes::new_flen(self_as_json.into_bytes()))
+    }
 }
 
 impl ZarrsStorageFormat {
@@ -180,7 +214,38 @@ impl ZarrsStorageFormat {
         (operator_name, band, time_interval, tile_index): &CacheKey,
     ) -> ZarrsArrayPath {
         let time = time_interval_to_path_safe_iso(time_interval);
-        format!("/{operator_name}/band_{band}/{time}/tiles")
+        let tiles = format!("/{operator_name}/band_{band}/{time}/tiles");
+        let metadata = format!("/{operator_name}/band_{band}/{time}/metadata");
+
+        ZarrsArrayPath { tiles, metadata }
+    }
+}
+
+fn open_or_create_new_zarrs_array(
+    path: String,
+    store: Arc<FilesystemStore>,
+    shape: impl Into<ArrayShape>,
+    chunk_grid_metadata: impl Into<ArrayBuilderChunkGridMetadata>,
+    data_type: zarrs::array::DataType,
+    filler_value: ArrayBuilderFillValue,
+    attributes: Option<serde_json::Map<String, serde_json::Value>>,
+) -> std::result::Result<
+    zarrs::array::Array<zarrs::filesystem::FilesystemStore>,
+    zarrs::array::ArrayCreateError,
+> {
+    match Array::open(store.clone(), &path) {
+        Ok(array) => Ok(array),
+        Err(_) => {
+            let array = {
+                let tmp = ArrayBuilder::new(shape, chunk_grid_metadata, data_type, filler_value);
+                if let Some(attrs) = attributes {
+                    tmp.attributes(attrs);
+                }
+                tmp.build(store.clone(), &path)?
+            };
+            array.store_metadata()?;
+            Ok(array)
+        } // FLEGMON replace the open / create logic in the next function with this to prepare for the additional metadata array
     }
 }
 
@@ -190,13 +255,14 @@ fn build_array_and_prepare_insert(
     key @ (operator_name, band, time_interval, tile_index): &CacheKey,
     store: Arc<FilesystemStore>,
     tile: &TypedRasterTile2D,
-) -> Result<(zarrs::array::Array<FilesystemStore>, String), zarrs::array::ArrayCreateError> {
+) -> Result<(ZarrsArrayAccess, ZarrsArrayPath), zarrs::array::ArrayCreateError> {
     let [tile_height, tile_width] = tile.grid_shape_array();
-    let path = ZarrsStorageFormat::path_name_from_cache_key(key);
+    let path @ ZarrsArrayPath { tiles, metadata } =
+        ZarrsStorageFormat::path_name_from_cache_key(key);
 
     let attributes = build_attributes(tile);
 
-    match Array::open(store.clone(), &path) {
+    match Array::open(store.clone(), &tiles) {
         Ok(array) => Ok((array, path)),
         Err(_) => {
             let array = ArrayBuilder::new(
@@ -206,7 +272,7 @@ fn build_array_and_prepare_insert(
                 filler_value(tile),
             )
             .attributes(attributes)
-            .build(store.clone(), &path)?;
+            .build(store.clone(), &tiles)?;
             array.store_metadata()?;
             Ok((array, path))
         }
@@ -291,7 +357,7 @@ impl StorageFormat for ZarrsStorageFormat {
             &tile,
         )
         .map_err(|source| Error::ZarrArrayCreateError { source })?;
-    array.store_metadata_opt(options)
+        // array.store_metadata_opt(options)
 
         let chunk_indices = tile_index
             .as_slice()
