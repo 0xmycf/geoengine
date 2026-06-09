@@ -10,9 +10,9 @@ use std::{
 };
 
 use geoengine_datatypes::{
-    primitives::DateTimeParseFormat,
+    primitives::{CacheHint, DateTimeParseFormat},
     raster::{
-        GeoTransform, Grid, GridOrEmpty, GridShapeAccess, MaskedGrid2D, RasterProperties,
+        GeoTransform, Grid, GridOrEmpty, GridShapeAccess, GridSize, MaskedGrid2D, RasterProperties,
         TypedGrid, TypedGrid2D, arrow_ipc_file_to_raster_tile_2d_for_ipc_channel,
         raster_tile_2d_to_arrow_ipc_file_for_ipc_channel,
     },
@@ -20,14 +20,15 @@ use geoengine_datatypes::{
 };
 use serde_json::json;
 use tokio::{
-    fs::{create_dir, remove_file},
+    fs::{create_dir, metadata, remove_file},
     io::AsyncReadExt,
     sync::RwLock,
 };
 use uuid::Uuid;
 use zarrs::{
     array::{
-        Array, ArrayBuilder, ArrayBytes, ArrayCreateError, ArrayShape, IntoArrayBytes,
+        Array, ArrayBuilder, ArrayBytes, ArrayCreateError, ArrayShape, FromArrayBytes,
+        IntoArrayBytes,
         builder::{ArrayBuilderChunkGridMetadata, ArrayBuilderFillValue},
         data_type,
     },
@@ -160,30 +161,88 @@ pub struct ArrowIpcStorageFormat {
 // The grid is stored as raw bytes (gotta figure out how, exactly)
 // the rest is stored as metadata in the zarr file / zarr.json
 pub struct ZarrsStorageFormat {
-    path: String,
+    paths: ZarrsArrayPath,
     tile: TypedRasterTile2D,
     byte_size: usize,
     chunk_indices: [u64; 2],
-    // TODO (high): FLEGMON I need to put the indicies in here
     // key: CacheKey,
     // operator? path? group?
 }
 
 struct ZarrsArrayPath {
-    /// the path to the tiles array
-    pub tiles: String,
-    /// the path to the metadata array
-    pub metadata: String,
+    // /// the path to the tiles array
+    // pub tiles: String,
+    // /// the path to the metadata array
+    // pub metadata: String,
+    key: (CanonicOperatorName, Band, TimeInterval),
 }
+
+impl ZarrsArrayPath {
+    pub fn new_from_cache_key((operator_name, band, time_interval, tile_index): &CacheKey) -> Self {
+        // let time = time_interval_to_path_safe_iso(time_interval);
+        // let tiles = format!("/{operator_name}/band_{band}/{time}/tiles");
+        // let metadata = format!("/{operator_name}/band_{band}/{time}/metadata");
+
+        // ZarrsArrayPath { tiles, metadata }
+        ZarrsArrayPath {
+            key: (operator_name.clone(), band.clone(), time_interval.clone()),
+        }
+    }
+
+    pub fn time_interval(&self) -> TimeInterval {
+        self.key.2.clone()
+    }
+
+    pub fn band(&self) -> Band {
+        self.key.1
+    }
+
+    pub fn operator_name(&self) -> CanonicOperatorName {
+        self.key.0.clone()
+    }
+
+    pub fn tiles(&self) -> String {
+        let (operator_name, band, interval) = &self.key;
+        let time = time_interval_to_path_safe_iso(interval);
+        format!("/{operator_name}/band_{band}/{time}/tiles")
+    }
+
+    pub fn metadata(&self) -> String {
+        let (operator_name, band, interval) = &self.key;
+        let time = time_interval_to_path_safe_iso(interval);
+        format!("/{operator_name}/band_{band}/{time}/metadata")
+    }
+
+    fn open(&self, store: Arc<FilesystemStore>) -> Result<ZarrsArrayAccess> {
+        let tiles_array = Array::open(store.clone(), &self.tiles())
+            .map_err(|source| Error::ZarrArrayCreateError { source })?;
+        let metadata_array = Array::open(store.clone(), &self.metadata())
+            .map_err(|source| Error::ZarrArrayCreateError { source })?;
+
+        Ok(ZarrsArrayAccess {
+            tiles: tiles_array,
+            metadata: metadata_array,
+        })
+    }
+}
+
+type TileStore = zarrs::array::Array<FilesystemStore>;
+type MetaDataStore = zarrs::array::Array<FilesystemStore>;
 
 struct ZarrsArrayAccess {
-    pub tiles: zarrs::array::Array<zarrs::filesystem::FilesystemStore>,
-    pub metadata: zarrs::array::Array<zarrs::filesystem::FilesystemStore>,
+    pub tiles: TileStore,
+    pub metadata: MetaDataStore,
 }
 
+// TODO (mid): refactor the other functions to use this instead
 impl ZarrsArrayAccess {
     fn store_chunk(&self) {}
     fn retreive_chunk(&self) {}
+
+    fn shape(self: &Self) -> GridShape<[usize; 2]> {
+        let shape = self.tiles.shape();
+        [shape[0] as usize, shape[1] as usize].into()
+    }
 }
 
 // TODO (high): Not sure if this is actually the best way to do this...
@@ -194,6 +253,7 @@ impl ZarrsArrayAccess {
 /// and cannot be infered from other info (i.e. the cache key)
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct ZarrsMetaDataChunk {
+    /// this is equiv to tile.tile_position
     pub tile_position: GridIdx2D, // not sure if this is needed
     // pub global_geo_transform: GeoTransform, // can be saved in the array instead
     pub properties: RasterProperties, // properties are not necessarily unique across tiles from one raster/file
@@ -209,20 +269,21 @@ impl<'a> IntoArrayBytes<'a> for ZarrsMetaDataChunk {
     }
 }
 
-impl ZarrsStorageFormat {
-    fn path_name_from_cache_key(
-        (operator_name, band, time_interval, tile_index): &CacheKey,
-    ) -> ZarrsArrayPath {
-        let time = time_interval_to_path_safe_iso(time_interval);
-        let tiles = format!("/{operator_name}/band_{band}/{time}/tiles");
-        let metadata = format!("/{operator_name}/band_{band}/{time}/metadata");
-
-        ZarrsArrayPath { tiles, metadata }
+impl FromArrayBytes for ZarrsMetaDataChunk {
+    fn from_array_bytes(
+        bytes: ArrayBytes<'static>,
+        shape: &[u64],
+        data_type: &zarrs::array::DataType,
+    ) -> std::prelude::v1::Result<Self, zarrs::array::ArrayError> {
+        let fixed = bytes
+            .into_fixed()
+            .expect("it to be a fixed array by construction in IntoArrayBytes");
+        Ok(serde_json::from_slice(&fixed).expect("it to be valid metadata"))
     }
 }
 
 fn open_or_create_new_zarrs_array(
-    path: String,
+    path: &str,
     store: Arc<FilesystemStore>,
     shape: impl Into<ArrayShape>,
     chunk_grid_metadata: impl Into<ArrayBuilderChunkGridMetadata>,
@@ -233,19 +294,21 @@ fn open_or_create_new_zarrs_array(
     zarrs::array::Array<zarrs::filesystem::FilesystemStore>,
     zarrs::array::ArrayCreateError,
 > {
-    match Array::open(store.clone(), &path) {
+    // TODO (mid): tests
+    match Array::open(store.clone(), path) {
         Ok(array) => Ok(array),
         Err(_) => {
             let array = {
-                let tmp = ArrayBuilder::new(shape, chunk_grid_metadata, data_type, filler_value);
+                let mut builder =
+                    ArrayBuilder::new(shape, chunk_grid_metadata, data_type, filler_value);
                 if let Some(attrs) = attributes {
-                    tmp.attributes(attrs);
+                    builder.attributes(attrs);
                 }
-                tmp.build(store.clone(), &path)?
+                builder.build(store.clone(), path)?
             };
             array.store_metadata()?;
             Ok(array)
-        } // FLEGMON replace the open / create logic in the next function with this to prepare for the additional metadata array
+        }
     }
 }
 
@@ -257,26 +320,39 @@ fn build_array_and_prepare_insert(
     tile: &TypedRasterTile2D,
 ) -> Result<(ZarrsArrayAccess, ZarrsArrayPath), zarrs::array::ArrayCreateError> {
     let [tile_height, tile_width] = tile.grid_shape_array();
-    let path @ ZarrsArrayPath { tiles, metadata } =
-        ZarrsStorageFormat::path_name_from_cache_key(key);
+    let paths = ZarrsArrayPath::new_from_cache_key(key);
 
     let attributes = build_attributes(tile);
 
-    match Array::open(store.clone(), &tiles) {
-        Ok(array) => Ok((array, path)),
-        Err(_) => {
-            let array = ArrayBuilder::new(
-                vec![tile_height as u64, tile_width as u64], // TODO (high): this seems incorrect
-                vec![tile_height as u64, tile_width as u64],
-                zarrs_data_type(tile),
-                filler_value(tile),
-            )
-            .attributes(attributes)
-            .build(store.clone(), &tiles)?;
-            array.store_metadata()?;
-            Ok((array, path))
-        }
-    }
+    let shape = vec![tile_height as u64, tile_width as u64];
+
+    let data_arr = open_or_create_new_zarrs_array(
+        &paths.tiles(),
+        store.clone(),
+        shape.clone(),
+        vec![tile_height as u64, tile_width as u64], // TODO (high): this seems incorrect (same as below)
+        zarrs_data_type(tile),
+        filler_value(tile),
+        Some(attributes),
+    )?;
+
+    let metadata_arr = open_or_create_new_zarrs_array(
+        &paths.metadata(),
+        store.clone(),
+        shape.clone(),
+        shape.clone(),                   // TODO (high): there is no way this is correct
+        zarrs::array::data_type::int8(), // TODO (mid): figure out what the correct value here is or if it even matters
+        0.into(), // TODO (mid): figure the correct filler value out and figure out why we need this at all ( when the filler value is used )
+        None,
+    )?;
+
+    Ok((
+        ZarrsArrayAccess {
+            tiles: data_arr,
+            metadata: metadata_arr,
+        },
+        paths,
+    ))
 }
 
 fn build_attributes(tile: &TypedRasterTile2D) -> serde_json::Map<String, serde_json::Value> {
@@ -351,24 +427,36 @@ impl StorageFormat for ZarrsStorageFormat {
     ) -> Result<Self> {
         let store = open_zarrs_filesystemstore()?;
 
-        let (array, path) = build_array_and_prepare_insert(
+        let (arrays, paths) = build_array_and_prepare_insert(
             &(operator_name, band, time_interval, tile_index),
             store.clone(),
             &tile,
         )
         .map_err(|source| Error::ZarrArrayCreateError { source })?;
-        // array.store_metadata_opt(options)
 
         let chunk_indices = tile_index
             .as_slice()
             .iter()
             .map(|x| *x as u64)
             .collect::<Vec<u64>>();
-        let byte_size = store_tile_data(tile.clone(), store, &array, &chunk_indices)
+        let byte_size = store_tile_data(tile.clone(), store, &arrays.tiles, &chunk_indices)
+            .map_err(|source| Error::ZarrArrayError { source })?;
+        let () = arrays
+            .metadata
+            .store_chunk(
+                &chunk_indices,
+                ZarrsMetaDataChunk {
+                    tile_position: call_generic_typed_raster_tile_2d_cache!(&tile, |tile| tile
+                        .tile_position),
+                    properties: call_generic_typed_raster_tile_2d_cache!(&tile, |tile| tile
+                        .properties
+                        .clone()),
+                },
+            )
             .map_err(|source| Error::ZarrArrayError { source })?;
 
         Ok(ZarrsStorageFormat {
-            path,
+            paths,
             tile,
             byte_size,
             chunk_indices: [chunk_indices[0], chunk_indices[1]],
@@ -377,32 +465,42 @@ impl StorageFormat for ZarrsStorageFormat {
 
     async fn load(&self) -> Result<TypedRasterTile2D> {
         let ZarrsStorageFormat {
-            path,
+            paths,
             tile,
             byte_size,
             chunk_indices,
         } = self;
         let store = open_zarrs_filesystemstore()?;
-        let array = Array::open(store.clone(), path)
-            .map_err(|source| Error::ZarrArrayCreateError { source })?;
+        let arrays = paths.open(store.clone())?;
         match tile {
+            // FLEGMON implement this thing
             // TODO (mid): this is kinda stupid, no? in this case we could easily just return the "tile" field
             // from the storage format...
             //
             // it should probably not always be in RAM, but should be ignored on some condition
             TypedRasterTile2D::I8(_) => {
-                let raw_data: Vec<i8> = array
+                let raw_data: Vec<i8> = arrays
+                    .tiles
+                    .retrieve_chunk(chunk_indices)
+                    .map_err(|source| Error::ZarrArrayError { source })?;
+                let metadata_chunk: ZarrsMetaDataChunk = arrays
+                    .metadata
                     .retrieve_chunk(chunk_indices)
                     .map_err(|source| Error::ZarrArrayError { source })?;
                 let data = GridOrEmpty::new_grid(MaskedGrid2D::new_with_data(
-                    Grid::new([1, 2].into() /* TODO */, raw_data)
-                        .expect("it to have the correct shape"),
+                    Grid::new(
+                        // TODO (low): do we care about 32 bit systems at all?
+                        arrays.shape(), /* TODO (mid): check if this is correct */
+                        raw_data,
+                    )
+                    .expect("it to have the correct shape"),
                 ));
-                let time = todo!();
-                let tile_position = todo!();
-                let band = todo!();
-                let global_geo_transform = todo!();
-                let cache_hint = todo!();
+                let time = paths.time_interval();
+                let tile_position = metadata_chunk.tile_position;
+                let band = paths.band();
+                let global_geo_transform =
+                    todo!("read from array (decide if to store on array in the metadata_chunk)");
+                let cache_hint = CacheHint::default(); // TODO (high): what should I use here? What is the proper default value for these datachunks that are retreived from the on-disk cache?
                 Ok(TypedRasterTile2D::I8(RasterTile2D::new(
                     // TODO (high): FLEGMON these must be saved in the metadata of the zarr array (?) -- the grid shape above too
                     time,
@@ -430,6 +528,10 @@ impl StorageFormat for ZarrsStorageFormat {
     }
 }
 
+fn get_tile_position(tile: &TypedRasterTile2D) -> GridIdx2D {
+    call_generic_typed_raster_tile_2d_cache!(tile, |tile| tile.tile_position)
+}
+
 /// returns the amount of bytes written
 fn store_tile_data(
     tile: TypedRasterTile2D,
@@ -438,10 +540,10 @@ fn store_tile_data(
     chunk_indices: &[u64],
 ) -> std::result::Result<usize, zarrs::array::ArrayError> {
     match TypedGrid2D::try_from(tile) {
-        Err(()) => Ok(0), // TODO (high): evalulate if writing nothinig is actually what we want, or if it would be better to write empty data tiles
+        Err(()) => Ok(0), // TODO (high): evalulate if writing nothinig is actually what we want ∧ if returning 0 is the good return value, or if it would be better to write empty data tiles
         Ok(typed_grid) => match typed_grid {
             TypedGrid::U8(grid) => {
-                let ret = grid.data.byte_size();
+                let ret = grid.data.byte_size(); // TODO (mid): figure out if this will return the correct size.
                 array.store_chunk(chunk_indices, grid.data)?;
                 Ok(ret)
             }
