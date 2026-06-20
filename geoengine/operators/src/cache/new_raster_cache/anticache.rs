@@ -1,4 +1,6 @@
 #![allow(unused)]
+#[cfg(test)]
+use std::sync::LazyLock;
 use std::{
     fmt::Write,
     fs,
@@ -9,6 +11,10 @@ use std::{
     sync::OnceLock,
 };
 
+use chrono::offset;
+#[cfg(test)]
+use futures::executor::block_on;
+use futures::task::UnsafeFutureObj;
 use geoengine_datatypes::{
     primitives::{CacheHint, DateTimeParseFormat},
     raster::{
@@ -20,16 +26,20 @@ use geoengine_datatypes::{
     util::ByteSize,
 };
 use serde_json::{Value, json};
+#[cfg(test)]
+use tokio::sync::Mutex;
 use tokio::{
     fs::{create_dir, metadata, remove_file},
     io::AsyncReadExt,
     sync::RwLock,
 };
 use uuid::Uuid;
+#[cfg(test)]
+use zarrs::array::CodecError::ExpectedFixedLengthBytes;
 use zarrs::{
     array::{
-        Array, ArrayBuilder, ArrayBytes, ArrayCreateError, ArrayShape, ElementOwned,
-        FromArrayBytes, IntoArrayBytes,
+        Array, ArrayBuilder, ArrayBytes, ArrayBytesOffsets, ArrayCreateError, ArrayShape,
+        ElementOwned, FromArrayBytes, IntoArrayBytes,
         builder::{ArrayBuilderChunkGridMetadata, ArrayBuilderFillValue},
         data_type,
     },
@@ -40,12 +50,15 @@ use zarrs::{
 use crate::{
     cache::{self, new_raster_cache::*},
     call_generic_typed_raster_tile_2d_cache,
-    error::Error,
+    error::{
+        Error,
+        WhichTile::{Metadata, Tiles},
+    },
 };
 
 const GLOBAL_GEOTRANSFORM_KEY: &'static str = "global_geo_transform";
 
-pub struct OnDiskStore<SF: StorageFormat, ES: EvictionStrategy> {
+pub(crate) struct OnDiskStore<SF: StorageFormat, ES: EvictionStrategy> {
     pub(crate) cache: RwLock<HashMap<CacheKey, Arc<SF>>>,
     pub(crate) eviction_strategy: RwLock<ES>,
 }
@@ -66,14 +79,18 @@ impl<SF: OnDiskStorageFormat> PendingFile<SF> {
 
     pub fn commit(mut self) -> SF {
         self.commited = true;
-        self.inner.take().unwrap()
+        self.inner
+            .take()
+            .expect("taking the inner value of a pending file should be valid")
     }
 }
 
 impl<SF: OnDiskStorageFormat> Deref for PendingFile<SF> {
     type Target = SF;
     fn deref(&self) -> &Self::Target {
-        self.inner.as_ref().unwrap()
+        self.inner
+            .as_ref()
+            .expect("deref the inner value of a pending file to the storage format.")
     }
 }
 
@@ -200,16 +217,28 @@ impl ZarrsArrayPath {
         self.key.0.clone()
     }
 
+    fn operator_name_pathable(&self) -> String {
+        let op = self.operator_name().to_string();
+        let name: serde_json::Value = serde_json::from_str(&op).expect("it to work");
+        name.get("type")
+            .expect("the operator name to have a type value")
+            .as_str()
+            .expect("it to be a string")
+            .to_string()
+    }
+
     pub fn tiles(&self) -> String {
         let (operator_name, band, interval) = &self.key;
         let time = time_interval_to_path_safe_iso(interval);
-        format!("/{operator_name}/band_{band}/{time}/tiles")
+        let op = self.operator_name_pathable();
+        format!("/{op}/band_{band}/{time}/tiles")
     }
 
     pub fn metadata(&self) -> String {
         let (operator_name, band, interval) = &self.key;
         let time = time_interval_to_path_safe_iso(interval);
-        format!("/{operator_name}/band_{band}/{time}/metadata")
+        let op = self.operator_name_pathable();
+        format!("/{op}/band_{band}/{time}/metadata")
     }
 
     fn open(&self, store: Arc<FilesystemStore>) -> Result<ZarrsArrayAccess> {
@@ -277,8 +306,11 @@ impl<'a> IntoArrayBytes<'a> for ZarrsMetaDataChunk {
         self,
         data_type: &zarrs::array::DataType,
     ) -> std::result::Result<zarrs::array::ArrayBytes<'a>, zarrs::array::ElementError> {
-        let self_as_json = serde_json::to_string(&self).expect("it works");
-        Ok(ArrayBytes::new_flen(self_as_json.into_bytes()))
+        let self_as_json = serde_json::to_vec(&self).expect("it works");
+        // one metadata chunk is exactly one element (hopefully this is fine)
+        // TODO (mid): check that this is indeed fine
+        let offsets = unsafe { ArrayBytesOffsets::new_unchecked(vec![0, self_as_json.len()]) };
+        Ok(ArrayBytes::new_vlen(self_as_json, offsets).expect("it works"))
     }
 }
 
@@ -288,10 +320,10 @@ impl FromArrayBytes for ZarrsMetaDataChunk {
         shape: &[u64],
         data_type: &zarrs::array::DataType,
     ) -> std::prelude::v1::Result<Self, zarrs::array::ArrayError> {
-        let fixed = bytes
-            .into_fixed()
+        let variable = bytes
+            .into_variable()
             .expect("it to be a fixed array by construction in IntoArrayBytes");
-        Ok(serde_json::from_slice(&fixed).expect("it to be valid metadata"))
+        Ok(serde_json::from_slice(variable.bytes()).expect("it to be valid metadata"))
     }
 }
 
@@ -307,7 +339,6 @@ fn open_or_create_new_zarrs_array(
     zarrs::array::Array<zarrs::filesystem::FilesystemStore>,
     zarrs::array::ArrayCreateError,
 > {
-    // TODO (mid): tests
     match Array::open(store.clone(), path) {
         Ok(array) => Ok(array),
         Err(_) => {
@@ -365,9 +396,9 @@ fn build_array_and_prepare_insert(
         &paths.metadata(),
         store.clone(),
         shape.clone(),
-        shape.clone(),                   // TODO (high): there is no way this is correct
-        zarrs::array::data_type::int8(), // TODO (mid): figure out what the correct value here is or if it even matters
-        0.into(), // TODO (mid): figure the correct filler value out and figure out why we need this at all ( when the filler value is used )
+        vec![1, 1],
+        zarrs::array::data_type::bytes(),
+        Vec::<u8>::new().into(),
         None,
     )?;
 
@@ -435,6 +466,14 @@ fn from_raster(tile: &TypedRasterTile2D) -> RasterDataType {
     }
 }
 
+impl OnDiskStorageFormat for ZarrsStorageFormat {
+    fn cleanup(&mut self) {
+        todo!(
+            "figure out the correct semantics for this (cannot just delete the files, as they might have data from other tiles in them no?)"
+        )
+    }
+}
+
 #[async_trait]
 impl StorageFormat for ZarrsStorageFormat {
     async fn store(
@@ -456,7 +495,10 @@ impl StorageFormat for ZarrsStorageFormat {
             .map(|x| *x as u64)
             .collect::<Vec<u64>>();
         let byte_size = store_tile_data(tile.clone(), store, &arrays.tiles, &chunk_indices)
-            .map_err(|source| Error::ZarrArrayError { source })?;
+            .map_err(|source| Error::ZarrArrayStoreError {
+                source,
+                storage: Tiles,
+            })?;
         let () = arrays
             .metadata
             .store_chunk(
@@ -469,7 +511,10 @@ impl StorageFormat for ZarrsStorageFormat {
                         .clone()),
                 },
             )
-            .map_err(|source| Error::ZarrArrayError { source })?;
+            .map_err(|source| Error::ZarrArrayStoreError {
+                source,
+                storage: Metadata,
+            })?;
 
         let data_type = from_raster(&tile);
         Ok(ZarrsStorageFormat {
@@ -594,8 +639,14 @@ fn store_tile_data(
     }
 }
 
+#[cfg(not(test))]
 static RASTER_CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+#[cfg(test)]
+static RASTER_CACHE_DIR: LazyLock<std::sync::Mutex<Option<PathBuf>>> =
+    LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(not(test))]
 pub fn set_raster_cache_dir(path: PathBuf) -> Result<()> {
     RASTER_CACHE_DIR
         .set(path)
@@ -605,8 +656,16 @@ pub fn set_raster_cache_dir(path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+pub fn set_raster_cache_dir(path: PathBuf) -> Result<()> {
+    /* here */
+    *RASTER_CACHE_DIR.lock().expect("it to be not poisoned") = Some(path);
+    Ok(())
+}
+
 /// Returns the `RASTER_CACHE_DIR` config setting if it is set,
 /// if is not, then return then return the xdg-cache dir
+#[cfg(not(test))]
 fn cache_dir() -> PathBuf {
     RASTER_CACHE_DIR
         .get()
@@ -616,6 +675,19 @@ fn cache_dir() -> PathBuf {
                 .expect("Either 'RASTER_CACHE_DIR' or 'HOME' dir should be set");
             home.join(".cache").join("geoengine")
         })
+}
+
+/// Returns the `RASTER_CACHE_DIR` config setting if it is set,
+/// if is not, then return then return the xdg-cache dir
+#[cfg(test)]
+fn cache_dir() -> PathBuf {
+    RASTER_CACHE_DIR
+        .lock()
+        .as_ref()
+        .expect("locking the mutex is possible") /* here is the other one */
+        .as_ref()
+        .cloned()
+        .expect("the path to be present")
 }
 
 impl OnDiskStorageFormat for ArrowIpcStorageFormat {
@@ -637,8 +709,14 @@ fn time_interval_to_path_safe_iso(time: &TimeInterval) -> String {
     let fmt = &DateTimeParseFormat::custom("%Y-%m-%dT%H-%M-%S%.3fZ".to_string());
     format!(
         "{}_to_{}",
-        time.start().as_date_time().unwrap().format(fmt),
-        time.end().as_date_time().unwrap().format(fmt)
+        time.start()
+            .as_date_time()
+            .expect("it to be a valid datetime")
+            .format(fmt),
+        time.end()
+            .as_date_time()
+            .expect("it to be a valid datetime")
+            .format(fmt)
     )
 }
 
@@ -744,26 +822,32 @@ mod tests {
     use gdal_sys::{CPLFormCIFilename, VSIGetCanonicalFilename};
     use geoengine_datatypes::hashmap;
     use geoengine_datatypes::primitives::{CacheHint, DateTimeParseFormat, TimeInterval};
-    use geoengine_datatypes::raster::{Grid2D, RasterTile2D, TileInformation};
+    use geoengine_datatypes::raster::{
+        Grid2D, RasterTile2D, TileInformation, TilesEqualIgnoringCacheHint,
+    };
     use geoengine_datatypes::util::test::TestDefault;
+    use httptest::matchers::key;
     use serde::de::Expected;
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
     use std::str::FromStr;
+    use std::sync::LazyLock;
+    use tempfile::tempdir;
 
-    use tokio::sync::RwLock;
+    use tokio::sync::{OnceCell, RwLock};
 
-    fn test_key(idx: i32) -> CacheKey {
+    fn test_key(idx: u32) -> CacheKey {
         (
-            CanonicOperatorName::new_unchecked(&json!({ "operator_name": "CacheOperator" })),
-            idx as u32,
+            // TODO (mid): Not sure what this looks like in reality
+            CanonicOperatorName::new_unchecked(&json!({ "type": "CacheOperator", "params": {} })),
+            idx,
             TimeInterval::default(),
             [idx as isize, 0].into(),
         )
     }
 
-    fn test_tile_u8() -> TypedRasterTile2D {
+    fn test_tile_u8(band: u32) -> TypedRasterTile2D {
         let values: Vec<u8> = (0_u8..64).collect();
         let raster_tile = RasterTile2D::new_with_tile_info(
             TimeInterval::default(),
@@ -772,8 +856,10 @@ mod tests {
                 global_tile_position: [0, 0].into(),
                 tile_size_in_pixels: [8, 8].into(),
             },
-            0,
-            Grid2D::new([8, 8].into(), values).unwrap().into(),
+            band,
+            Grid2D::new([8, 8].into(), values)
+                .expect("it to be a valid Grid2D")
+                .into(),
             CacheHint::default(),
         );
 
@@ -783,10 +869,12 @@ mod tests {
     #[tokio::test]
     async fn arrow_ipc_storage_format_store_and_load() {
         let cache_root = cache_dir();
-        fs::create_dir_all(&cache_root).unwrap();
+        fs::create_dir_all(&cache_root).expect("creating the cache dir should be possible");
 
-        let tile = test_tile_u8();
-        let stored = ArrowIpcStorageFormat::store(tile.clone(), test_key(0))
+        let band = 0;
+        let key = test_key(band);
+        let tile = test_tile_u8(band);
+        let stored = ArrowIpcStorageFormat::store(tile.clone(), key)
             .await
             .expect("it should be possible to store the tile.");
 
@@ -822,15 +910,16 @@ mod tests {
     #[tokio::test]
     async fn on_disk_storage_insert_and_get_with_arrow_ipc() {
         let cache_root = cache_dir();
-        fs::create_dir_all(&cache_root).unwrap();
+        fs::create_dir_all(&cache_root).expect("creating the dir should be possible");
 
         let store = OnDiskStore {
             cache: RwLock::new(HashMap::new()),
             eviction_strategy: RwLock::new(FifoEvictionStrategy::new(usize::MAX)),
         };
 
-        let key = test_key(1);
-        let tile = test_tile_u8();
+        let band = 1;
+        let key = test_key(band);
+        let tile = test_tile_u8(band);
         let expected_tile = tile.clone();
 
         store
@@ -859,103 +948,117 @@ mod tests {
 
         let path = stored.path.clone();
         drop(stored);
-        fs::remove_file(&path).unwrap();
+        // TODO (high): use tempdir instead
+        fs::remove_file(&path).expect("removing the file should be possible");
     }
 
-    #[tokio::test]
+    /*
+    thread 'cache::new_raster_cache::anticache::tests::zarrs_storage_format_store_and_load' (229534) panicked at operators/src/cache/new_raster_cache/anticache.rs:921:14:
+    it should be possible to store the tile.: ZarrArrayError
+        { source: CodecError(UnexpectedChunkDecodedSize(InvalidBytesLengthError
+            { len: 103, expected_len: 64 })) }
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+    ---- cache::new_raster_cache::anticache::tests::zarrs_storage_format_insert_and_get stdout ----
+
+    thread 'cache::new_raster_cache::anticache::tests::zarrs_storage_format_insert_and_get' (229533) panicked at operators/src/cache/new_raster_cache/anticache.rs:974:14:
+    it should be possible to insert the tile into the OnDiskStorage.: ZarrArrayError
+        { source: CodecError(UnexpectedChunkDecodedSize(InvalidBytesLengthError
+            { len: 103, expected_len: 64 })) }
+    */
+
+    // set_raster_cache_dir requires that we only set the path once!
+    #[tokio::test(flavor = "current_thread")]
     async fn zarrs_storage_format_store_and_load() {
-        unimplemented!()
-        // let cache_root = cache_dir();
-        // fs::create_dir_all(&cache_root).unwrap();
+        let temp_dir = tempdir().expect("tempdir to work in the test");
+        let () = set_raster_cache_dir(temp_dir.path().to_owned())
+            .expect("the cache dir setter to work fine");
 
-        // let tile = test_tile_u8();
-        // let stored = ArrowIpcStorageFormat::store(tile.clone(), test_key(0))
-        //     .await
-        //     .expect("it should be possible to store the tile.");
+        let band = 0;
+        let key = test_key(band);
+        let tile = test_tile_u8(band);
+        let stored = ZarrsStorageFormat::store(tile.clone(), key)
+            .await
+            .expect("it should be possible to store the tile.");
 
-        // let path = stored.path.clone();
-        // let metadata = fs::metadata(&path).expect(&format!("File should be at {path:#?}"));
-        // let byte_size = stored
-        //     .byte_size()
-        //     .await
-        //     .expect("it should be possible to get the stored byte size.");
-        // assert_eq!(byte_size as u64, metadata.len());
+        {
+            // check if the zarrs thing is there
+            let full_path = temp_dir.path().join(PathBuf::from("zarr_cache"));
+            let _ = fs::metadata(&full_path).expect(&format!("File should be at {full_path:#?}"));
+        }
 
-        // let loaded = stored
-        //     .load()
-        //     .await
-        //     .expect(&format!("File '{path:#?}' should loadable as a RasterTile"));
-        // match loaded {
-        //     TypedRasterTile2D::U8(loaded_tile) => {
-        //         if let TypedRasterTile2D::U8(original_tile) = tile {
-        //             assert_eq!(
-        //                 loaded_tile, original_tile,
-        //                 "Tiles are not the same after on-disk cache"
-        //             );
-        //         } else {
-        //             panic!("expected u8 tile");
-        //         }
-        //     }
-        //     _ => panic!("expected u8 tile"),
-        // }
+        let loaded = stored
+            .load()
+            .await
+            .expect(&format!("File should loadable as a TypedRasterTile"));
 
-        // fs::remove_file(&path).expect("it should be possible to delete the file from the disk");
+        match loaded {
+            TypedRasterTile2D::U8(loaded_tile) => {
+                if let TypedRasterTile2D::U8(original_tile) = tile {
+                    assert!(
+                        loaded_tile.tiles_equal_ignoring_cache_hint(&original_tile),
+                        "Tiles are not the same after on-disk zarrs cache\nLoaded: {:#?}\nOrig: {:#?}",
+                        loaded_tile,
+                        original_tile
+                    );
+                } else {
+                    panic!("expected u8 tile");
+                }
+            }
+            _ => panic!("expected u8 tile"),
+        }
     }
 
-    #[tokio::test]
+    // set_raster_cache_dir requires that we only set the path once!
+    #[tokio::test(flavor = "current_thread")]
     async fn zarrs_storage_format_insert_and_get() {
-        unimplemented!()
-        // let cache_root = cache_dir();
-        // fs::create_dir_all(&cache_root).unwrap();
+        let temp_dir = tempdir().expect("tempdir to work in the test");
+        let () = set_raster_cache_dir(temp_dir.path().to_owned())
+            .expect("the cache dir setter to work fine");
 
-        // let store = OnDiskStore {
-        //     cache: RwLock::new(HashMap::new()),
-        //     eviction_strategy: RwLock::new(FifoEvictionStrategy::new(usize::MAX)),
-        // };
+        let store = OnDiskStore {
+            cache: RwLock::new(HashMap::new()),
+            eviction_strategy: RwLock::new(FifoEvictionStrategy::new(usize::MAX)),
+        };
 
-        // let key = test_key(1);
-        // let tile = test_tile_u8();
-        // let expected_tile = tile.clone();
+        let band = 1;
+        let key = test_key(band);
+        let tile = test_tile_u8(band);
+        let expected_tile = tile.clone();
 
-        // store
-        //     .insert(key.clone(), tile)
-        //     .await
-        //     .expect("it should be possible to insert the tile into the OnDiskStorage.");
-        // let stored: Arc<ArrowIpcStorageFormat> = store
-        //     .get(&key)
-        //     .await
-        //     .expect("it should be possible to extract the tile-ref from the cache.");
-        // let loaded = stored
-        //     .load()
-        //     .await
-        //     .expect("it should be possible to load the tile via the tile-ref.");
+        store
+            .insert(key.clone(), tile)
+            .await
+            .expect("it should be possible to insert the tile into the OnDiskStorage.");
+        let stored: Arc<ZarrsStorageFormat> = store
+            .get(&key)
+            .await
+            .expect("it should be possible to extract the tile-ref from the cache.");
+        let loaded = stored
+            .load()
+            .await
+            .expect("it should be possible to load the tile via the tile-ref.");
 
-        // match loaded {
-        //     TypedRasterTile2D::U8(loaded_tile) => {
-        //         if let TypedRasterTile2D::U8(original_tile) = expected_tile {
-        //             assert_eq!(loaded_tile, original_tile, "Tiles differ after cache.");
-        //         } else {
-        //             panic!("expected u8 tile");
-        //         }
-        //     }
-        //     _ => panic!("expected u8 tile"),
-        // }
-
-        // let path = stored.path.clone();
-        // drop(stored);
-        // fs::remove_file(&path).unwrap();
-    }
-
-    #[test]
-    fn cache_dir_from_home() {
-        let dir = cache_dir();
-        let home = std::env::home_dir().expect("HOME should be set");
-        assert_eq!(format!("{}/.cache/geoengine/", home.to_str().unwrap()), dir);
+        match loaded {
+            TypedRasterTile2D::U8(loaded_tile) => {
+                if let TypedRasterTile2D::U8(original_tile) = expected_tile {
+                    assert!(
+                        loaded_tile.tiles_equal_ignoring_cache_hint(&original_tile),
+                        "Tiles are not the same after on-disk zarrs cache\nLoaded: {:#?}\nOrig: {:#?}",
+                        loaded_tile,
+                        original_tile
+                    );
+                } else {
+                    panic!("expected u8 tile");
+                }
+            }
+            _ => panic!("expected u8 tile"),
+        }
     }
 
     #[test]
     fn set_then_read_raster_cache_dir() {
-        let expected = PathBuf::from_str("/tmp/something").unwrap();
+        let expected = PathBuf::from_str("/tmp/something").expect("it to be a valid pathbuf");
         if let Err(err) = set_raster_cache_dir(expected.clone()) {
             panic!("{err}");
         }
@@ -984,5 +1087,45 @@ mod tests {
         let expected = "1970-01-01T00-00-00Z_to_1970-01-01T00-00-00.002Z";
         let actual = time_interval_to_path_safe_iso(&time);
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn zarrs_array_path_operator_name_pathable() {
+        let path = ZarrsArrayPath::new_from_cache_key(&test_key(0));
+        let tiles_path = path.operator_name_pathable();
+        assert_eq!("CacheOperator".to_string(), tiles_path);
+    }
+
+    #[test]
+    fn get_tiles_path() {
+        let path = ZarrsArrayPath::new_from_cache_key(&test_key(0));
+        let tiles_path = path.tiles();
+        let time = time_interval_to_path_safe_iso(&path.time_interval());
+        assert_eq!(
+            "/CacheOperator/band_0/-262143-01-01T00-00-00Z_to_+262142-12-31T23-59-59.999Z/tiles"
+                .to_string(),
+            tiles_path
+        );
+    }
+
+    #[test]
+    fn get_metadata_path() {
+        let path = ZarrsArrayPath::new_from_cache_key(&test_key(0));
+        let metadata_path = path.metadata();
+        let time = time_interval_to_path_safe_iso(&path.time_interval());
+        assert_eq!(
+            "/CacheOperator/band_0/-262143-01-01T00-00-00Z_to_+262142-12-31T23-59-59.999Z/metadata"
+                .to_string(),
+            metadata_path
+        );
+    }
+
+    #[test]
+    fn metadata_and_tiles_are_valid_node_paths() {
+        let paths = ZarrsArrayPath::new_from_cache_key(&test_key(0));
+        let _ =
+            zarrs::node::NodePath::try_from(paths.tiles().as_str()).expect("it to be a valid path");
+        let _ = zarrs::node::NodePath::try_from(paths.metadata().as_str())
+            .expect("it to be a valid path");
     }
 }

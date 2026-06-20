@@ -559,6 +559,26 @@ pub enum Error {
     ZarrArrayError {
         source: zarrs::array::ArrayError,
     },
+    #[snafu(display("Error while inserting on an array with zarrs: {source} for {storage}."))]
+    ZarrArrayStoreError {
+        storage: WhichTile,
+        source: zarrs::array::ArrayError,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WhichTile {
+    Tiles,
+    Metadata,
+}
+
+impl std::fmt::Display for WhichTile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WhichTile::Tiles => f.write_str("Tiles"),
+            WhichTile::Metadata => f.write_str("Metadata"),
+        }
+    }
 }
 
 impl From<crate::mock::MockRasterSourceError> for Error {
