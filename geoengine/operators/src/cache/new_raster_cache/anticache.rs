@@ -41,7 +41,7 @@ use zarrs::{
         Array, ArrayBuilder, ArrayBytes, ArrayBytesOffsets, ArrayCreateError, ArrayShape,
         ElementOwned, FromArrayBytes, IntoArrayBytes,
         builder::{ArrayBuilderChunkGridMetadata, ArrayBuilderFillValue},
-        data_type,
+        chunk_shape_to_array_shape, data_type,
     },
     filesystem::FilesystemStore,
     group::GroupBuilder,
@@ -50,10 +50,12 @@ use zarrs::{
 use crate::{
     cache::{self, new_raster_cache::*},
     call_generic_typed_raster_tile_2d_cache,
+    engine::OperatorName,
     error::{
         Error,
         WhichTile::{Metadata, Tiles},
     },
+    util::gdal::create_ndvi_meta_data,
 };
 
 const GLOBAL_GEOTRANSFORM_KEY: &'static str = "global_geo_transform";
@@ -187,6 +189,7 @@ pub struct ZarrsStorageFormat {
     // operator? path? group?
 }
 
+#[derive(Debug)]
 struct ZarrsArrayPath {
     // /// the path to the tiles array
     // pub tiles: String,
@@ -215,13 +218,7 @@ impl ZarrsArrayPath {
     }
 
     fn operator_name_pathable(&self) -> String {
-        let op = self.operator_name().to_string();
-        let name: serde_json::Value = serde_json::from_str(&op).expect("it to work");
-        name.get("type")
-            .expect("the operator name to have a type value")
-            .as_str()
-            .expect("it to be a string")
-            .to_string()
+        self.operator_name().as_sha256()
     }
 
     pub fn tiles(&self) -> String {
@@ -266,9 +263,55 @@ impl ZarrsArrayAccess {
     fn store_chunk(&self) {}
     fn retreive_chunk(&self) {}
 
-    fn shape(self: &Self) -> GridShape<[usize; 2]> {
+    fn tiles_shape(self: &Self) -> GridShape<[usize; 2]> {
         let shape = self.tiles.shape();
         [shape[0] as usize, shape[1] as usize].into()
+    }
+
+    fn should_grow(&self) -> bool {
+        todo!()
+        // let tiles_shape = self.tiles.shape();
+        // self.tiles.chunk
+        // tiles_shape[0] < 1 && tiles_shape[1] < 1
+    }
+
+    fn grow_shape(shape: &[u64], factor: f64) -> Vec<u64> {
+        shape
+            .iter()
+            .map(|&x| (x as f64 * factor).ceil() as u64)
+            .collect()
+    }
+
+    /// Tries to grow the tiles and metadata array by a factor of 1.5
+    /// TODO (high): see if this is actually correct (I suspect that we need to respect the chunk_grid_size somehow)
+    fn try_grow(&mut self) -> Result<()> {
+        {
+            let tiles_current_shape = self.tiles.shape();
+            let new_shape = Self::grow_shape(tiles_current_shape, 1.5);
+            self.tiles
+                .set_shape(new_shape)
+                .map_err(|source| Error::ZarrArrayCreateError { source })?;
+        }
+        {
+            let metadata_current_shape = self.metadata.shape();
+            let new_shape = Self::grow_shape(metadata_current_shape, 1.5);
+            self.metadata
+                .set_shape(new_shape)
+                .map_err(|source| Error::ZarrArrayCreateError { source })?;
+        }
+
+        self.tiles
+            .store_metadata()
+            .map_err(|source| Error::ZarrArrayCreateError {
+                source: source.into(),
+            });
+        self.metadata
+            .store_metadata()
+            .map_err(|source| Error::ZarrArrayCreateError {
+                source: source.into(),
+            });
+
+        Ok(())
     }
 
     fn read_global_geo_transform(&self) -> GeoTransform {
@@ -365,7 +408,7 @@ fn geotransform_to_attributes_map(tile: &TypedRasterTile2D) -> serde_json::Map<S
     map
 }
 
-/// Opens or creates a new array at "/{operator_name}/band_{band}/{time}/tiles".
+/// Opens or creates a new array at `/{operator_name}/band_{band}/{time}/tiles`.
 /// Stores the metadata of the array if a new one is created.
 fn build_array_and_prepare_insert(
     key @ (operator_name, band, time_interval, tile_index): &CacheKey,
@@ -383,7 +426,7 @@ fn build_array_and_prepare_insert(
         &paths.tiles(),
         store.clone(),
         shape.clone(),
-        vec![tile_height as u64, tile_width as u64], // TODO (high): this seems incorrect (same as below)
+        shape.clone(), // TODO (high): this seems incorrect (same as below)
         zarrs_data_type(tile),
         filler_value(tile),
         Some(attributes),
@@ -393,6 +436,7 @@ fn build_array_and_prepare_insert(
         &paths.metadata(),
         store.clone(),
         shape.clone(),
+        // vec![10, 10], // create an array that can hold exacly 100 metadata elements
         vec![1, 1],
         zarrs::array::data_type::bytes(),
         Vec::<u8>::new().into(),
@@ -448,7 +492,7 @@ fn open_zarrs_filesystemstore() -> Result<Arc<FilesystemStore>> {
     Ok(Arc::new(zarrs))
 }
 
-fn from_raster(tile: &TypedRasterTile2D) -> RasterDataType {
+fn datatype_from_raster(tile: &TypedRasterTile2D) -> RasterDataType {
     match tile {
         TypedRasterTile2D::I8(_) => RasterDataType::I8,
         TypedRasterTile2D::I16(_) => RasterDataType::I16,
@@ -479,6 +523,7 @@ impl StorageFormat for ZarrsStorageFormat {
         cache_key: Arc<CacheKey>,
     ) -> Result<Self> {
         let store = open_zarrs_filesystemstore()?;
+        // dbg!(&tile_index);
 
         let (arrays, paths) = build_array_and_prepare_insert(&cache_key, store.clone(), &tile)
             .map_err(|source| Error::ZarrArrayCreateError { source })?;
@@ -511,7 +556,7 @@ impl StorageFormat for ZarrsStorageFormat {
                 storage: Metadata,
             })?;
 
-        let data_type = from_raster(&tile);
+        let data_type = datatype_from_raster(&tile);
         Ok(ZarrsStorageFormat {
             paths,
             tile,
@@ -531,6 +576,7 @@ impl StorageFormat for ZarrsStorageFormat {
         } = self;
         let store = open_zarrs_filesystemstore()?;
         let arrays = paths.open(store.clone())?;
+        // dbg!("loading tile ", paths);
         Ok(load_tile(arrays, &self.paths, chunk_indices, *data_type)?)
     }
 
@@ -570,7 +616,7 @@ fn load_tile(
             let data = GridOrEmpty::new_grid(MaskedGrid2D::new_with_data(
                 Grid::new(
                     // TODO (low): do we care about 32 bit systems at all? <- why is that even relevant?
-                    arrays.shape(), /* TODO (mid): check if this is correct */
+                    arrays.tiles_shape(), /* TODO (mid): check if this is correct */
                     raw_data,
                 )
                 .expect("it to have the correct shape"),
@@ -641,6 +687,9 @@ fn store_tile_data(
 #[cfg(not(test))]
 static RASTER_CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+// TODO (mid): this causes a race condition when running multiple tests at once
+// either the inner thing must be held as long as the test is running (s.t. we dont write another tempdir in test_02 and then get confused in test_01)
+// or by just having some kind of map that associates thread/test -> tempdir
 #[cfg(test)]
 static RASTER_CACHE_DIR: LazyLock<std::sync::Mutex<Option<PathBuf>>> =
     LazyLock::new(|| std::sync::Mutex::new(None));
@@ -657,7 +706,6 @@ pub fn set_raster_cache_dir(path: PathBuf) -> Result<()> {
 
 #[cfg(test)]
 pub fn set_raster_cache_dir(path: PathBuf) -> Result<()> {
-    /* here */
     *RASTER_CACHE_DIR.lock().expect("it to be not poisoned") = Some(path);
     Ok(())
 }
@@ -683,7 +731,7 @@ fn cache_dir() -> PathBuf {
     RASTER_CACHE_DIR
         .lock()
         .as_ref()
-        .expect("locking the mutex is possible") /* here is the other one */
+        .expect("locking the mutex is possible")
         .as_ref()
         .cloned()
         .expect("the path to be present")
@@ -774,38 +822,9 @@ impl StorageFormat for ArrowIpcStorageFormat {
 }
 
 fn typed_raster_tile_to_arrow_ipc(tile: TypedRasterTile2D) -> Result<Vec<u8>> {
-    match tile {
-        TypedRasterTile2D::I8(base_tile) => {
-            raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(base_tile)
-        }
-        TypedRasterTile2D::I16(base_tile) => {
-            raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(base_tile)
-        }
-        TypedRasterTile2D::I32(base_tile) => {
-            raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(base_tile)
-        }
-        TypedRasterTile2D::I64(base_tile) => {
-            raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(base_tile)
-        }
-        TypedRasterTile2D::U8(base_tile) => {
-            raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(base_tile)
-        }
-        TypedRasterTile2D::U16(base_tile) => {
-            raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(base_tile)
-        }
-        TypedRasterTile2D::U32(base_tile) => {
-            raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(base_tile)
-        }
-        TypedRasterTile2D::U64(base_tile) => {
-            raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(base_tile)
-        }
-        TypedRasterTile2D::F32(base_tile) => {
-            raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(base_tile)
-        }
-        TypedRasterTile2D::F64(base_tile) => {
-            raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(base_tile)
-        }
-    }
+    call_generic_typed_raster_tile_2d_cache!(tile, |tile| {
+        raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(tile)
+    })
     .map_err(|err| crate::error::Error::DataType { source: err })
 }
 
@@ -823,6 +842,7 @@ mod tests {
 
     use super::*;
     use gdal_sys::{CPLFormCIFilename, VSIGetCanonicalFilename};
+    use geo::k_nearest_concave_hull;
     use geoengine_datatypes::hashmap;
     use geoengine_datatypes::primitives::{CacheHint, DateTimeParseFormat, TimeInterval};
     use geoengine_datatypes::raster::{
@@ -1064,7 +1084,10 @@ mod tests {
     fn zarrs_array_path_operator_name_pathable() {
         let path = ZarrsArrayPath::new_from_cache_key(&test_key(0));
         let tiles_path = path.operator_name_pathable();
-        assert_eq!("CacheOperator".to_string(), tiles_path);
+        assert_eq!(
+            "05643c4ac1135b60c1e9b65c47fc77d7ccd550b05485dc4f5597ac3d067f065d".to_string(),
+            tiles_path
+        );
     }
 
     #[test]
@@ -1073,7 +1096,7 @@ mod tests {
         let tiles_path = path.tiles();
         let time = time_interval_to_path_safe_iso(&path.time_interval());
         assert_eq!(
-            "/CacheOperator/band_0/-262143-01-01T00-00-00Z_to_+262142-12-31T23-59-59.999Z/tiles"
+            "/05643c4ac1135b60c1e9b65c47fc77d7ccd550b05485dc4f5597ac3d067f065d/band_0/-262143-01-01T00-00-00Z_to_+262142-12-31T23-59-59.999Z/tiles"
                 .to_string(),
             tiles_path
         );
@@ -1085,7 +1108,7 @@ mod tests {
         let metadata_path = path.metadata();
         let time = time_interval_to_path_safe_iso(&path.time_interval());
         assert_eq!(
-            "/CacheOperator/band_0/-262143-01-01T00-00-00Z_to_+262142-12-31T23-59-59.999Z/metadata"
+            "/05643c4ac1135b60c1e9b65c47fc77d7ccd550b05485dc4f5597ac3d067f065d/band_0/-262143-01-01T00-00-00Z_to_+262142-12-31T23-59-59.999Z/metadata"
                 .to_string(),
             metadata_path
         );

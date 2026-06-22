@@ -2,7 +2,9 @@ pub mod anticache;
 
 use crate::cache::cache_tiles::{CompressedRasterTile2D, CompressedRasterTileExt};
 use crate::cache::error::CacheError;
-use crate::cache::new_raster_cache::anticache::{ArrowIpcStorageFormat, OnDiskStore};
+use crate::cache::new_raster_cache::anticache::{
+    ArrowIpcStorageFormat, OnDiskStore, ZarrsStorageFormat,
+};
 use crate::engine::{
     BoxRasterQueryProcessor, CanonicOperatorName, InitializedRasterOperator, QueryContext,
     QueryProcessor, RasterOperator, RasterQueryProcessor, RasterResultDescriptor,
@@ -47,7 +49,8 @@ pub enum NewRasterCacheEnum {
     // OnDiskMockFifo(
     //     NewRasterCache<MockOnDiskCacheStore<MockOnDiskStorageFormat, FifoEvictionStrategy>>,
     // ),
-    OnDiskMockFifo(NewRasterCache<OnDiskStore<ArrowIpcStorageFormat, FifoEvictionStrategy>>),
+    OnDiskMockFifoIpc(NewRasterCache<OnDiskStore<ArrowIpcStorageFormat, FifoEvictionStrategy>>),
+    OnDiskMockFifoZarr(NewRasterCache<OnDiskStore<ZarrsStorageFormat, FifoEvictionStrategy>>),
 }
 
 impl TestDefault for NewRasterCacheEnum {
@@ -55,6 +58,9 @@ impl TestDefault for NewRasterCacheEnum {
         Self::InMemoryCompressedRasterTile2DFifo(NewRasterCache {
             // TODO (crit): Make sure that the tests expect exactly this! Also is this sensible?
             store: InMemoryCacheStore {
+                // +++++++ rwnvztyr 590846a4 "fix: make zarrs array rezisable" (rebased revision)
+                // Self::OnDiskMockFifoZarr(NewRasterCache { // TODO (crit): Rework this for the tests
+                //     store: OnDiskStore {
                 cache: RwLock::new(HashMap::new()),
                 eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(8_589_934_592))),
                 total_size: Arc::new(AtomicUsize::new(0)),
@@ -95,8 +101,13 @@ impl NewRasterCacheEnum {
             NewRasterCacheEnum::InMemoryCompressedRasterTile2DLru(cache) => {
                 cache.store.get(key).await
             }
-            NewRasterCacheEnum::OnDiskMockFifo(_cache) => {
+            NewRasterCacheEnum::OnDiskMockFifoIpc(_cache) => {
                 todo!("TODO (crit): make this work again: change types in the anticache file")
+                // cache.store.get(key).await
+            }
+            NewRasterCacheEnum::OnDiskMockFifoZarr(_cache) => {
+                todo!("TODO (crit): make this work again: change types in the anticache file")
+                // cache.store.get(key).await
             }
         }
     }
@@ -110,7 +121,10 @@ impl NewRasterCacheEnum {
             NewRasterCacheEnum::InMemoryCompressedRasterTile2DLru(cache) => {
                 cache.store.insert(key, tile).await
             }
-            NewRasterCacheEnum::OnDiskMockFifo(_cache) => {
+            NewRasterCacheEnum::OnDiskMockFifoIpc(_cache) => {
+                todo!("TODO (crit): see above")
+            }
+            NewRasterCacheEnum::OnDiskMockFifoZarr(_cache) => {
                 todo!("TODO (crit): see above")
             }
         }
@@ -124,7 +138,10 @@ impl NewRasterCacheEnum {
             NewRasterCacheEnum::InMemoryCompressedRasterTile2DLru(cache) => {
                 cache.store.total_size.load(Ordering::SeqCst)
             }
-            NewRasterCacheEnum::OnDiskMockFifo(_cache) => todo!("TODO (crit): see above"),
+            NewRasterCacheEnum::OnDiskMockFifoIpc(_cache) => todo!("TODO (crit): see above"),
+            // NewRasterCacheEnum::OnDiskMockFifo(cache) => cache.store.insert(key, tile).await,
+            NewRasterCacheEnum::OnDiskMockFifoZarr(_cache) => todo!("TODO (crit): see above"),
+            // NewRasterCacheEnum::OnDiskMockFifoZarr(cache) => cache.store.insert(key, tile).await,
         }
     }
 }
