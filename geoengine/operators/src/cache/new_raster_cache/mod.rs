@@ -24,17 +24,13 @@ use geoengine_datatypes::raster::{
 };
 use geoengine_datatypes::util::ByteSize as _;
 use geoengine_datatypes::util::test::TestDefault;
-use itertools::Itertools;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::File;
-use std::hash::Hasher;
-use std::io::{Read as _, Write};
 use std::iter;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
 pub struct NewRasterCache<Store> {
@@ -134,7 +130,7 @@ impl NewRasterCacheEnum {
 }
 
 #[async_trait]
-trait CacheStore: Send + Sync + 'static {
+pub trait CacheStore: Send + Sync + 'static {
     type SF: Send + Sync + 'static;
     type ES: EvictionStrategy;
 
@@ -143,7 +139,7 @@ trait CacheStore: Send + Sync + 'static {
     async fn insert(&self, key: Arc<CacheKey>, tile: TypedRasterTile2D) -> Result<()>;
 }
 
-trait EvictionStrategy: Send + Sync + 'static {
+pub trait EvictionStrategy: Send + Sync + 'static {
     fn record_access(&mut self, key: &Arc<CacheKey>, size: usize, cache_hint: CacheHint);
     fn record_removal(&mut self, key: &Arc<CacheKey>);
 
@@ -164,7 +160,7 @@ trait EvictionStrategy: Send + Sync + 'static {
         F: FnMut(&Arc<CacheKey>) -> bool;
 }
 
-struct EvictionPlan {
+pub struct EvictionPlan {
     keys_to_remove: Vec<Arc<CacheKey>>,
     freed_bytes: usize,
 }
@@ -174,7 +170,7 @@ pub struct FifoEvictionStrategy {
     capacity: usize,
 }
 
-struct EvictionStrategyItem {
+pub struct EvictionStrategyItem {
     key: Arc<CacheKey>,
     size: usize,
     cache_hint: CacheHint,
@@ -580,7 +576,7 @@ mod eviction_strategy_tests {
     }
 }
 
-struct SizeTrackedEntry<SF> {
+pub struct SizeTrackedEntry<SF> {
     value: SF,
     size: usize,
     total_size: Arc<AtomicUsize>,
