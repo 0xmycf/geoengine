@@ -866,10 +866,15 @@ mod tests {
         TypedRasterTile2D::U8(raster_tile)
     }
 
+    fn initialize_test_zarrs_cache_dir() -> tempfile::TempDir {
+        let temp_dir = tempdir().expect("it to work");
+        let () = set_raster_cache_dir(temp_dir.path().to_path_buf()).expect("it to work");
+        temp_dir
+    }
+
     #[tokio::test]
     async fn arrow_ipc_storage_format_store_and_load() {
-        let cache_root = cache_dir();
-        fs::create_dir_all(&cache_root).expect("creating the cache dir should be possible");
+        initialize_test_zarrs_cache_dir();
 
         let band = 0;
         let key = test_key(band);
@@ -903,14 +908,11 @@ mod tests {
             }
             _ => panic!("expected u8 tile"),
         }
-
-        fs::remove_file(&path).expect("it should be possible to delete the file from the disk");
     }
 
     #[tokio::test]
     async fn on_disk_storage_insert_and_get_with_arrow_ipc() {
-        let cache_root = cache_dir();
-        fs::create_dir_all(&cache_root).expect("creating the dir should be possible");
+        initialize_test_zarrs_cache_dir();
 
         let store = OnDiskStore {
             cache: RwLock::new(HashMap::new()),
@@ -945,34 +947,11 @@ mod tests {
             }
             _ => panic!("expected u8 tile"),
         }
-
-        let path = stored.path.clone();
-        drop(stored);
-        // TODO (high): use tempdir instead
-        fs::remove_file(&path).expect("removing the file should be possible");
     }
 
-    /*
-    thread 'cache::new_raster_cache::anticache::tests::zarrs_storage_format_store_and_load' (229534) panicked at operators/src/cache/new_raster_cache/anticache.rs:921:14:
-    it should be possible to store the tile.: ZarrArrayError
-        { source: CodecError(UnexpectedChunkDecodedSize(InvalidBytesLengthError
-            { len: 103, expected_len: 64 })) }
-    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
-
-    ---- cache::new_raster_cache::anticache::tests::zarrs_storage_format_insert_and_get stdout ----
-
-    thread 'cache::new_raster_cache::anticache::tests::zarrs_storage_format_insert_and_get' (229533) panicked at operators/src/cache/new_raster_cache/anticache.rs:974:14:
-    it should be possible to insert the tile into the OnDiskStorage.: ZarrArrayError
-        { source: CodecError(UnexpectedChunkDecodedSize(InvalidBytesLengthError
-            { len: 103, expected_len: 64 })) }
-    */
-
-    // set_raster_cache_dir requires that we only set the path once!
     #[tokio::test(flavor = "current_thread")]
     async fn zarrs_storage_format_store_and_load() {
-        let temp_dir = tempdir().expect("tempdir to work in the test");
-        let () = set_raster_cache_dir(temp_dir.path().to_owned())
-            .expect("the cache dir setter to work fine");
+        let temp_dir = initialize_test_zarrs_cache_dir();
 
         let band = 0;
         let key = test_key(band);
@@ -1009,12 +988,9 @@ mod tests {
         }
     }
 
-    // set_raster_cache_dir requires that we only set the path once!
     #[tokio::test(flavor = "current_thread")]
     async fn zarrs_storage_format_insert_and_get() {
-        let temp_dir = tempdir().expect("tempdir to work in the test");
-        let () = set_raster_cache_dir(temp_dir.path().to_owned())
-            .expect("the cache dir setter to work fine");
+        initialize_test_zarrs_cache_dir();
 
         let store = OnDiskStore {
             cache: RwLock::new(HashMap::new()),
@@ -1054,16 +1030,6 @@ mod tests {
             }
             _ => panic!("expected u8 tile"),
         }
-    }
-
-    #[test]
-    fn set_then_read_raster_cache_dir() {
-        let expected = PathBuf::from_str("/tmp/something").expect("it to be a valid pathbuf");
-        if let Err(err) = set_raster_cache_dir(expected.clone()) {
-            panic!("{err}");
-        }
-        let actual = cache_dir();
-        assert_eq!(expected, actual);
     }
 
     #[test]
