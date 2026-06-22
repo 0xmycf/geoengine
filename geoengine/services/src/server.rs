@@ -1,6 +1,6 @@
 use crate::api::apidoc::ApiDoc;
 use crate::api::handlers;
-use crate::config::{self, get_config, get_config_element};
+use crate::config::{self, get_config_element};
 use crate::contexts::ApplicationContext;
 use crate::contexts::PostgresContext;
 use crate::error::{Error, Result};

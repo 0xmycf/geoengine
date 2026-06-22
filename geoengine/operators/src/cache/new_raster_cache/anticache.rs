@@ -58,9 +58,9 @@ use crate::{
 
 const GLOBAL_GEOTRANSFORM_KEY: &'static str = "global_geo_transform";
 
-pub(crate) struct OnDiskStore<SF: StorageFormat, ES: EvictionStrategy> {
-    pub(crate) cache: RwLock<HashMap<CacheKey, Arc<SF>>>,
-    pub(crate) eviction_strategy: RwLock<ES>,
+pub struct OnDiskStore<SF: StorageFormat, ES: EvictionStrategy> {
+    pub cache: RwLock<HashMap<CacheKey, Arc<SF>>>,
+    pub eviction_strategy: RwLock<ES>,
 }
 
 pub struct PendingFile<SF: OnDiskStorageFormat> {

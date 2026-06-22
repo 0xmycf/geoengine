@@ -26,7 +26,6 @@ use itertools::FoldWhile::{Continue, Done};
 use itertools::Itertools;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read as _, Write};
 use std::iter;
 use std::marker::Sync;
 use std::pin::Pin;
@@ -71,7 +70,7 @@ impl NewRasterCacheEnum {
 }
 
 #[async_trait]
-trait CacheStore: Send + Sync + 'static {
+pub trait CacheStore: Send + Sync + 'static {
     type SF: StorageFormat;
     type ES: EvictionStrategy;
 
@@ -80,7 +79,7 @@ trait CacheStore: Send + Sync + 'static {
     async fn insert(&self, key: CacheKey, tile: TypedRasterTile2D) -> Result<()>;
 }
 
-trait EvictionStrategy: Send + Sync + 'static {
+pub trait EvictionStrategy: Send + Sync + 'static {
     fn record_access(&mut self, key: &CacheKey, weight: f64, size: usize);
     fn record_hit(&mut self, key: &CacheKey);
     fn record_removal(&mut self, key: &CacheKey);
@@ -95,7 +94,7 @@ trait EvictionStrategy: Send + Sync + 'static {
         F: FnMut(&CacheKey) -> bool;
 }
 
-struct EvictionPlan {
+pub struct EvictionPlan {
     keys_to_remove: Vec<CacheKey>,
     freed_bytes: usize,
 }
@@ -106,7 +105,8 @@ pub struct FifoEvictionStrategy {
     capacity: usize,
 }
 
-struct EvictionStrategyItem {
+#[allow(unused)]
+pub struct EvictionStrategyItem {
     key: CacheKey,
     weight: f64,
     size: usize,

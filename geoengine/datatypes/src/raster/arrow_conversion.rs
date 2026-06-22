@@ -51,6 +51,7 @@ pub fn raster_tile_2d_to_arrow_ipc_file_for_ipc_channel<P: Pixel>(
     Ok(file_writer.into_inner()?)
 }
 
+#[allow(unused)]
 pub fn arrow_ipc_file_to_raster_tile_2d<P>(tile: Vec<u8>) -> Result<RasterTile2D<P>>
 where
     P: Pixel,
