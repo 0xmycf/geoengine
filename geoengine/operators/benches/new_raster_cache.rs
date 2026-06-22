@@ -27,6 +27,8 @@ use std::hint::black_box;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 
+static EXE_CTX: OnceLock<Mutex<MockExecutionContext>> = OnceLock::new();
+
 async fn setup(cache: bool) -> (Arc<BoxRasterQueryProcessor<u8>>, MockQueryContext) {
     let exe_ctx = EXE_CTX.get_or_init(|| Mutex::new(MockExecutionContext::test_default()));
     let mut exe_ctx = exe_ctx.lock().unwrap();
@@ -111,9 +113,11 @@ async fn query(processor: Arc<BoxRasterQueryProcessor<u8>>, query_ctx: &MockQuer
     black_box(tiles);
 }
 
-static EXE_CTX: OnceLock<Mutex<MockExecutionContext>> = OnceLock::new();
-
+// TODO (high): build in some test / verification to see if the tiles match / are correct.
 fn benchmark(c: &mut Criterion) {
+    let () = rayon::ThreadPoolBuilder::new()
+        .build_global()
+        .expect("the builder to be created globally");
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

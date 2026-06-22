@@ -1,4 +1,7 @@
+use std::hash::{Hash, Hasher};
+
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use snafu::ResultExt;
 use tracing::debug;
 
@@ -242,6 +245,11 @@ impl CanonicOperatorName {
     ///
     pub fn new_unchecked<T: Serialize>(value: &T) -> Self {
         CanonicOperatorName(serde_json::to_vec(&value).expect("it should be checked by the caller"))
+    }
+
+    pub fn as_sha256(&self) -> String {
+        let sha256 = Sha256::digest(&self.0);
+        format!("{sha256:x}")
     }
 }
 

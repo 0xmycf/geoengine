@@ -1,7 +1,9 @@
 pub mod anticache;
 
 use crate::cache::error::CacheError;
-use crate::cache::new_raster_cache::anticache::{ArrowIpcStorageFormat, OnDiskStore};
+use crate::cache::new_raster_cache::anticache::{
+    ArrowIpcStorageFormat, OnDiskStore, ZarrsStorageFormat,
+};
 use crate::engine::{
     BoxRasterQueryProcessor, CanonicOperatorName, InitializedRasterOperator, QueryContext,
     QueryProcessor, RasterOperator, RasterQueryProcessor, RasterResultDescriptor,
@@ -26,6 +28,7 @@ use itertools::FoldWhile::{Continue, Done};
 use itertools::Itertools;
 use std::collections::HashMap;
 use std::fs::File;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::iter;
 use std::marker::Sync;
 use std::pin::Pin;
@@ -41,12 +44,13 @@ pub enum NewRasterCacheEnum {
     // OnDiskMockFifo(
     //     NewRasterCache<MockOnDiskCacheStore<MockOnDiskStorageFormat, FifoEvictionStrategy>>,
     // ),
-    OnDiskMockFifo(NewRasterCache<OnDiskStore<ArrowIpcStorageFormat, FifoEvictionStrategy>>),
+    OnDiskMockFifoIpc(NewRasterCache<OnDiskStore<ArrowIpcStorageFormat, FifoEvictionStrategy>>),
+    OnDiskMockFifoZarr(NewRasterCache<OnDiskStore<ZarrsStorageFormat, FifoEvictionStrategy>>),
 }
 
 impl TestDefault for NewRasterCacheEnum {
     fn test_default() -> Self {
-        Self::OnDiskMockFifo(NewRasterCache {
+        Self::OnDiskMockFifoZarr(NewRasterCache {
             store: OnDiskStore {
                 cache: RwLock::new(HashMap::new()),
                 eviction_strategy: RwLock::new(FifoEvictionStrategy::new(8_589_934_592)),
@@ -58,13 +62,15 @@ impl TestDefault for NewRasterCacheEnum {
 impl NewRasterCacheEnum {
     async fn get(&self, key: &CacheKey) -> Result<Arc<impl StorageFormat>> {
         match self {
-            NewRasterCacheEnum::OnDiskMockFifo(cache) => cache.store.get(key).await,
+            NewRasterCacheEnum::OnDiskMockFifoZarr(cache) => cache.store.get(key).await,
+            _ => todo!(),
         }
     }
 
     async fn insert(&self, key: CacheKey, tile: TypedRasterTile2D) -> Result<()> {
         match self {
-            NewRasterCacheEnum::OnDiskMockFifo(cache) => cache.store.insert(key, tile).await,
+            NewRasterCacheEnum::OnDiskMockFifoZarr(cache) => cache.store.insert(key, tile).await,
+            _ => todo!(),
         }
     }
 }
@@ -532,19 +538,19 @@ where
                         .new_raster_cache()
                         .expect("Cache should have been created for this operator");
 
-                    /*let mut s = DefaultHasher::new();
-                    key.0.hash(&mut s);
-                    key.1.hash(&mut s);
-                    key.2.hash(&mut s);
-                    key.3.hash(&mut s);
-                    let hash_key = s.finish();
+                    // let mut s = DefaultHasher::new();
+                    // key.0.hash(&mut s);
+                    // key.1.hash(&mut s);
+                    // key.2.hash(&mut s);
+                    // key.3.hash(&mut s);
+                    // let hash_key = s.finish();
 
 
-                    println!("Cache query for key {hash_key:?}!");*/
+                    // println!("Cache query for key {hash_key:?}!");
 
                     if let Ok(stored_tile) = cache_store.get(&key).await
                     {
-                        //println!("Cache hit for key {hash_key:?}!");
+                        // println!("Cache hit for key {hash_key:?}!");
                         let tile = stored_tile.load().await;
 
                         let tile: Result<RasterTile2D<T>> = match tile {
@@ -557,7 +563,7 @@ where
                             (work, idx + 1),
                         ))
                     } else {
-                        //println!("Cache miss for key {hash_key:?}!");
+                        // println!("Cache miss for key {hash_key:?}!");
 
                         let source_query = self.source.query(
                             RasterQueryRectangle::new(job.tile_info.global_pixel_bounds(), time_interval, BandSelection::new_single(job.band)),
@@ -567,7 +573,7 @@ where
 
                         if let Ok(mut stream) = source_query {
                             if let Some(Ok(tile)) = stream.next().await {
-                                // TODO tokio::spawn
+                                // TODO (low): tokio::spawn
                                 let _ = cache_store.insert(key, T::map_tile_to_enum(tile.clone())).await;
 
                                 return Some((Ok(tile), (work, idx + 1)));
