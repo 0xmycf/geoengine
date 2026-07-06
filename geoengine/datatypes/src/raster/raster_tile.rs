@@ -177,31 +177,41 @@ where
             match (iter_self.next(), iter_other.next()) {
                 (Some(a), Some(b)) => {
                     if a.time != b.time {
+                        dbg!("time not identical");
                         return false;
                     }
                     if a.tile_position != b.tile_position {
+                        dbg!("tile_position not identical");
                         return false;
                     }
                     if a.band != b.band {
+                        dbg!("band not identical");
                         return false;
                     }
                     if !approx_eq!(GeoTransform, a.global_geo_transform, b.global_geo_transform) {
+                        dbg!("geo transoform not approx identical");
                         return false;
                     }
                     if a.global_geo_transform != b.global_geo_transform {
+                        dbg!("geo transform not identical");
                         return false;
                     }
                     if a.properties != b.properties {
+                        dbg!("properties not identical");
                         return false;
                     }
                     if a.grid_array != b.grid_array {
+                        dbg!("gird_array not identical");
                         return false;
                     }
                 }
                 // both iterators are exhausted
                 (None, None) => return true,
                 // one iterator is exhausted, the other is not, so they are not equal
-                _ => return false,
+                _ => {
+                    dbg!("one iterator is exhauseted, while the other is not");
+                    return false
+                },
             }
         }
     }

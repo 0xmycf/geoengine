@@ -8,7 +8,9 @@ use geoengine_datatypes::{
     raster::GridBoundingBox2D,
     util::test::TestDefault,
 };
-use geoengine_operators::cache::new_raster_cache::{NewRasterCacheEnum, RasterCacheOperator};
+use geoengine_operators::cache::new_raster_cache::{
+    NewRasterCacheEnum, RasterCacheOperator, test_default_fifo_arrow_ipc, test_default_fifo_zarr,
+};
 use geoengine_operators::engine::{BoxRasterQueryProcessor, MockQueryContext};
 use geoengine_operators::{
     engine::{
@@ -29,7 +31,21 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 static EXE_CTX: OnceLock<Mutex<MockExecutionContext>> = OnceLock::new();
 
-async fn setup(cache: bool) -> (Arc<BoxRasterQueryProcessor<u8>>, MockQueryContext) {
+enum CacheOperatorType {
+    ArrowIPC,
+    Zarrs,
+}
+
+fn new_raster_cache_enum(cache: CacheOperatorType) -> NewRasterCacheEnum {
+    match cache {
+        CacheOperatorType::ArrowIPC => test_default_fifo_arrow_ipc(),
+        CacheOperatorType::Zarrs => test_default_fifo_zarr(),
+    }
+}
+
+async fn setup(
+    cache: Option<CacheOperatorType>,
+) -> (Arc<BoxRasterQueryProcessor<u8>>, MockQueryContext) {
     let exe_ctx = EXE_CTX.get_or_init(|| Mutex::new(MockExecutionContext::test_default()));
     let mut exe_ctx = exe_ctx.lock().unwrap();
 
@@ -54,11 +70,11 @@ async fn setup(cache: bool) -> (Arc<BoxRasterQueryProcessor<u8>>, MockQueryConte
     .await
     .unwrap();
 
-    if cache {
+    if let Some(cache_op_type) = cache {
         let cached_op = RasterCacheOperator::wrap_operator(operator);
 
         // TODO (crit): need to rewrite this so it fits in with the new structure (after rebase)
-        let tile_cache = Arc::new(NewRasterCacheEnum::test_default());
+        let tile_cache = Arc::new(new_raster_cache_enum(cache_op_type));
 
         let query_ctx = exe_ctx.mock_query_context_with_query_extensions(
             ChunkByteSize::test_default(),
@@ -127,7 +143,7 @@ fn benchmark(c: &mut Criterion) {
     g.sample_size(10);
 
     // uncached
-    let (uncached_processor, uncached_query_ctx) = runtime.block_on(async { setup(false).await });
+    let (uncached_processor, uncached_query_ctx) = runtime.block_on(async { setup(None).await });
     let uncached_query_ctx = Arc::new(uncached_query_ctx);
     g.bench_function("without_cache", |b| {
         let proc = uncached_processor.clone();
@@ -141,10 +157,27 @@ fn benchmark(c: &mut Criterion) {
         })
     });
 
-    // cached
-    let (cached_processor, cached_query_ctx) = runtime.block_on(async { setup(true).await });
+    // cached (arrow-ipc)
+    let (cached_processor, cached_query_ctx) =
+        runtime.block_on(async { setup(Some(CacheOperatorType::ArrowIPC)).await });
     let cached_query_ctx = Arc::new(cached_query_ctx);
-    g.bench_function("with_cache", |b| {
+    g.bench_function("with_arrow-ipc_cache", |b| {
+        let proc = cached_processor.clone();
+        let ctx = cached_query_ctx.clone();
+        b.to_async(&runtime).iter(|| {
+            let proc = proc.clone();
+            let ctx = ctx.clone();
+            async move {
+                query(proc, &*ctx).await;
+            }
+        })
+    });
+
+    // cached (zarrs)
+    let (cached_processor, cached_query_ctx) =
+        runtime.block_on(async { setup(Some(CacheOperatorType::Zarrs)).await });
+    let cached_query_ctx = Arc::new(cached_query_ctx);
+    g.bench_function("with_zarrs_cache", |b| {
         let proc = cached_processor.clone();
         let ctx = cached_query_ctx.clone();
         b.to_async(&runtime).iter(|| {

@@ -572,6 +572,7 @@ pub enum Error {
 #[derive(Debug, PartialEq, Eq)]
 pub enum WhichTile {
     Tiles,
+    Validity,
     Metadata,
 }
 
@@ -580,6 +581,7 @@ impl std::fmt::Display for WhichTile {
         match self {
             WhichTile::Tiles => f.write_str("Tiles"),
             WhichTile::Metadata => f.write_str("Metadata"),
+            WhichTile::Validity => f.write_str("Validity"),
         }
     }
 }
