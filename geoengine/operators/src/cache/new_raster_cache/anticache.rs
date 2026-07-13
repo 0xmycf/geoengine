@@ -7,6 +7,7 @@ use std::{
     io::{self, ErrorKind, Write as IoWrite},
     ops::Deref,
     path::PathBuf,
+    result,
     str::FromStr,
     sync::OnceLock,
 };
@@ -107,8 +108,12 @@ impl<SF: OnDiskStorageFormat> Drop for PendingFile<SF> {
 
 #[async_trait]
 pub trait OnDiskStorageFormat: StorageFormat {
-    async fn write(tile: TypedRasterTile2D, key: Arc<CacheKey>) -> Result<PendingFile<Self>> {
-        let store = Self::store(tile, key).await?;
+    async fn write(
+        tile: TypedRasterTile2D,
+        key: Arc<CacheKey>,
+        result_descriptor: &RasterResultDescriptor,
+    ) -> Result<PendingFile<Self>> {
+        let store = Self::store(tile, key, result_descriptor).await?;
         let pending_file = PendingFile::new(store);
         Ok(pending_file)
     }
@@ -134,13 +139,19 @@ where
         }
     }
 
-    async fn insert(&self, key: Arc<CacheKey>, tile: TypedRasterTile2D) -> Result<()> {
+    // TODO (crit): this function probably not right anymore, the base has changed a lot. fix it! after rebase
+    async fn insert(
+        &self,
+        key: Arc<CacheKey>,
+        tile: TypedRasterTile2D,
+        raster_result_descriptor: /* TODO (crit): must be used */ &RasterResultDescriptor,
+    ) -> Result<()> {
         /*
         We need to make sure that the file is not just written to the disk
         without actually being inserted in the cache / index later on.
         Otherwise we will have orphaned files.
         */
-        let stored_tile = SF::write(tile, key.clone()).await?;
+        let stored_tile = SF::write(tile, key.clone(), raster_result_descriptor).await?;
         let required_space = stored_tile.byte_size().await?;
 
         let mut cache = self.cache.write().await;
@@ -190,6 +201,13 @@ pub struct ZarrsStorageFormat {
     // operator? path? group?
 }
 
+/// using the `time_interval` in the `key` field does not work in all cases
+/// there are instances where the tile has a different time_interval:
+///
+///     [operators/src/cache/new_raster_cache/mod.rs:702:33] tile.time == time_interval = false
+///     [operators/src/cache/new_raster_cache/mod.rs:702:33] &tile.time = TimeInterval [1404172800000, 8210266876799999)
+///     [operators/src/cache/new_raster_cache/mod.rs:702:33] time_interval = TimeInterval [1417392000000, 1420070400000)
+///
 #[derive(Debug)]
 struct ZarrsArrayPath {
     // /// the path to the tiles array
@@ -204,10 +222,6 @@ impl ZarrsArrayPath {
         ZarrsArrayPath {
             key: (operator_name.clone(), band.clone(), time_interval.clone()),
         }
-    }
-
-    pub fn time_interval(&self) -> TimeInterval {
-        self.key.2.clone()
     }
 
     pub fn band(&self) -> Band {
@@ -352,6 +366,8 @@ struct ZarrsMetaDataChunk {
     pub tile_position: GridIdx2D, // not sure if this is needed
     // pub global_geo_transform: GeoTransform, // can be saved in the array instead
     pub properties: RasterProperties, // properties are not necessarily unique across tiles from one raster/file
+    /// The time initerval of the tile
+    pub time_interval: TimeInterval,
 }
 
 impl<'a> IntoArrayBytes<'a> for ZarrsMetaDataChunk {
@@ -383,8 +399,8 @@ impl FromArrayBytes for ZarrsMetaDataChunk {
 fn open_or_create_new_zarrs_array(
     path: &str,
     store: Arc<FilesystemStore>,
-    shape: impl Into<ArrayShape>,
-    chunk_grid_metadata: impl Into<ArrayBuilderChunkGridMetadata>,
+    shape: impl Into<ArrayShape>, // The shape of the array
+    chunk_grid_metadata: impl Into<ArrayBuilderChunkGridMetadata>, // Usually the shape of a chunk
     data_type: zarrs::array::DataType,
     filler_value: impl Into<ArrayBuilderFillValue>,
     attributes: Option<serde_json::Map<String, serde_json::Value>>,
@@ -421,25 +437,46 @@ fn geotransform_to_attributes_map(tile: &TypedRasterTile2D) -> serde_json::Map<S
     map
 }
 
+/*
+FLEGMON :
+   - run the benchmarks (is the new version faster / as fast / faulty)
+   - go over this code and the open code_tickets
+   - read the next point and prioritize
+   - look at the papers again and see how we can implement the dynamic storage
+     also fix the additonal questions of this code.
+        (right now the tiles are stored both in memory and on disc, while we always want to write
+        we could decide to not read from disc, but from RAM or evict from RAM.
+        There is also the issue of re-reading the tiles from the disc after reboot.
+        We must also check if the the eviction from the disc is fine as is (if it actually deletes the tiles from disc).
+        We must check what happens if the tiles cannot be written (does the code handle this case already?))
+*/
+
 /// Opens or creates a new array at `/{operator_name}/band_{band}/{time}/tiles`.
 /// Stores the metadata of the array if a new one is created.
 fn build_array_and_prepare_insert(
     key @ (operator_name, band, time_interval, tile_index): &CacheKey,
     store: Arc<FilesystemStore>,
     tile: &TypedRasterTile2D,
+    result_descriptor: &RasterResultDescriptor,
 ) -> Result<(ZarrsArrayAccess, ZarrsArrayPath), zarrs::array::ArrayCreateError> {
-    let [tile_height, tile_width] = tile.grid_shape_array();
     let paths = ZarrsArrayPath::new_from_cache_key(key);
-
     let attributes = geotransform_to_attributes_map(tile);
 
-    let shape = vec![tile_height as u64, tile_width as u64];
+    let tile_shape = {
+        let [tile_height, tile_width] = tile.grid_shape_array();
+        vec![tile_height as u64, tile_width as u64]
+    };
+    // TODO (mid) : check if this is correct
+    let array_shape = {
+        let temp = result_descriptor.spatial_grid_descriptor().grid_shape();
+        [temp.x() as u64, temp.y() as u64]
+    };
 
     let data_arr = open_or_create_new_zarrs_array(
         &paths.tiles(),
         store.clone(),
-        shape.clone(),
-        shape.clone(), // TODO (high): this seems incorrect (same as below)
+        array_shape.clone(),
+        tile_shape.clone(),
         zarrs_data_type(tile),
         filler_value(tile),
         Some(attributes),
@@ -448,8 +485,8 @@ fn build_array_and_prepare_insert(
     let validity_arr = open_or_create_new_zarrs_array(
         &paths.validity(),
         store.clone(),
-        shape.clone(),
-        shape.clone(), // TODO (high): this seems incorrect (same as below)
+        array_shape.clone(),
+        tile_shape.clone(),
         data_type::bool(),
         zarrs::array::FillValue::from(false),
         None,
@@ -458,8 +495,7 @@ fn build_array_and_prepare_insert(
     let metadata_arr = open_or_create_new_zarrs_array(
         &paths.metadata(),
         store.clone(),
-        shape.clone(),
-        // vec![10, 10], // create an array that can hold exacly 100 metadata elements
+        array_shape.clone(),
         vec![1, 1],
         zarrs::array::data_type::bytes(),
         zarrs::array::FillValue::from(Vec::<u8>::new()),
@@ -545,12 +581,14 @@ impl StorageFormat for ZarrsStorageFormat {
         tile: TypedRasterTile2D,
         // (operator_name, band, time_interval, tile_index)
         cache_key: Arc<CacheKey>,
+        result_descriptor: /* TODO (crit): must be used! after rebase! */ &RasterResultDescriptor,
     ) -> Result<Self> {
         let store = open_zarrs_filesystemstore()?;
         // dbg!(&tile_index);
 
-        let (arrays, paths) = build_array_and_prepare_insert(&cache_key, store.clone(), &tile)
-            .map_err(|source| Error::ZarrArrayCreateError { source })?;
+        let (arrays, paths) =
+            build_array_and_prepare_insert(&cache_key, store.clone(), &tile, result_descriptor)
+                .map_err(|source| Error::ZarrArrayCreateError { source })?;
 
         let tile_index = cache_key.3;
         let chunk_indices = tile_index
@@ -576,6 +614,9 @@ impl StorageFormat for ZarrsStorageFormat {
                         .tile_position),
                     properties: call_generic_typed_raster_tile_2d_cache!(&tile, |tile| tile
                         .properties
+                        .clone()),
+                    time_interval: call_generic_typed_raster_tile_2d_cache!(&tile, |tile| tile
+                        .time
                         .clone()),
                 },
             )
@@ -606,46 +647,46 @@ impl StorageFormat for ZarrsStorageFormat {
         let arrays = paths.open(store.clone())?;
         // dbg!("loading tile ", paths);
         let loaded_tile = load_tile(arrays, &self.paths, chunk_indices, *data_type)?;
-        // {
-        //     let b = match (tile.clone(), loaded_tile.clone()) {
-        //         (TypedRasterTile2D::I8(t), TypedRasterTile2D::I8(t2)) => {
-        //             t.tiles_equal_ignoring_cache_hint(&t2)
-        //         }
-        //         (TypedRasterTile2D::I16(t), TypedRasterTile2D::I16(t2)) => {
-        //             t.tiles_equal_ignoring_cache_hint(&t2)
-        //         }
-        //         (TypedRasterTile2D::I32(t), TypedRasterTile2D::I32(t2)) => {
-        //             t.tiles_equal_ignoring_cache_hint(&t2)
-        //         }
-        //         (TypedRasterTile2D::I64(t), TypedRasterTile2D::I64(t2)) => {
-        //             t.tiles_equal_ignoring_cache_hint(&t2)
-        //         }
-        //         (TypedRasterTile2D::U8(t), TypedRasterTile2D::U8(t2)) => {
-        //             t.tiles_equal_ignoring_cache_hint(&t2)
-        //         }
-        //         (TypedRasterTile2D::U16(t), TypedRasterTile2D::U16(t2)) => {
-        //             t.tiles_equal_ignoring_cache_hint(&t2)
-        //         }
-        //         (TypedRasterTile2D::U32(t), TypedRasterTile2D::U32(t2)) => {
-        //             t.tiles_equal_ignoring_cache_hint(&t2)
-        //         }
-        //         (TypedRasterTile2D::U64(t), TypedRasterTile2D::U64(t2)) => {
-        //             t.tiles_equal_ignoring_cache_hint(&t2)
-        //         }
-        //         (TypedRasterTile2D::F32(t), TypedRasterTile2D::F32(t2)) => {
-        //             t.tiles_equal_ignoring_cache_hint(&t2)
-        //         }
-        //         (TypedRasterTile2D::F64(t), TypedRasterTile2D::F64(t2)) => {
-        //             t.tiles_equal_ignoring_cache_hint(&t2)
-        //         }
-        //         _ => unreachable!(),
-        //     };
-        //     let ld = loaded_tile.clone();
-        //     assert!(
-        //         b,
-        //         "Actual tile {tile:#?} and loaded_tile {ld:#?} are different."
-        //     );
-        // }
+        {
+            let b = match (tile.clone(), loaded_tile.clone()) {
+                (TypedRasterTile2D::I8(t), TypedRasterTile2D::I8(t2)) => {
+                    t.tiles_equal_ignoring_cache_hint(&t2)
+                }
+                (TypedRasterTile2D::I16(t), TypedRasterTile2D::I16(t2)) => {
+                    t.tiles_equal_ignoring_cache_hint(&t2)
+                }
+                (TypedRasterTile2D::I32(t), TypedRasterTile2D::I32(t2)) => {
+                    t.tiles_equal_ignoring_cache_hint(&t2)
+                }
+                (TypedRasterTile2D::I64(t), TypedRasterTile2D::I64(t2)) => {
+                    t.tiles_equal_ignoring_cache_hint(&t2)
+                }
+                (TypedRasterTile2D::U8(t), TypedRasterTile2D::U8(t2)) => {
+                    t.tiles_equal_ignoring_cache_hint(&t2)
+                }
+                (TypedRasterTile2D::U16(t), TypedRasterTile2D::U16(t2)) => {
+                    t.tiles_equal_ignoring_cache_hint(&t2)
+                }
+                (TypedRasterTile2D::U32(t), TypedRasterTile2D::U32(t2)) => {
+                    t.tiles_equal_ignoring_cache_hint(&t2)
+                }
+                (TypedRasterTile2D::U64(t), TypedRasterTile2D::U64(t2)) => {
+                    t.tiles_equal_ignoring_cache_hint(&t2)
+                }
+                (TypedRasterTile2D::F32(t), TypedRasterTile2D::F32(t2)) => {
+                    t.tiles_equal_ignoring_cache_hint(&t2)
+                }
+                (TypedRasterTile2D::F64(t), TypedRasterTile2D::F64(t2)) => {
+                    t.tiles_equal_ignoring_cache_hint(&t2)
+                }
+                _ => unreachable!(),
+            };
+            let ld = loaded_tile.clone();
+            assert!(
+                b,
+                "Actual tile {tile:#?} and loaded_tile {ld:#?} are different."
+            );
+        }
         Ok(loaded_tile)
     }
 
@@ -668,7 +709,7 @@ fn load_tile(
         .metadata
         .retrieve_chunk(chunk_indices)
         .map_err(|source| Error::ZarrArrayError { source })?;
-    let time = paths.time_interval();
+    let time = metadata_chunk.time_interval;
     let tile_position = metadata_chunk.tile_position;
     let band = paths.band();
     let global_geo_transform = arrays.read_global_geo_transform();
@@ -900,7 +941,11 @@ async fn path_for_cache_key(key: &CacheKey) -> Result<(PathBuf, PathBuf)> {
 
 #[async_trait]
 impl StorageFormat for ArrowIpcStorageFormat {
-    async fn store(tile: TypedRasterTile2D, key: Arc<CacheKey>) -> Result<Self> {
+    async fn store(
+        tile: TypedRasterTile2D,
+        key: Arc<CacheKey>,
+        _result_descriptor: /* TODO (crit): check if this must be used after the rebase! */ &RasterResultDescriptor,
+    ) -> Result<Self> {
         let (cache_dir, file_path) = path_for_cache_key(&key).await?;
         tokio::fs::create_dir_all(cache_dir.clone()).await?;
         let cache_path = cache_dir.join(file_path);
@@ -1027,9 +1072,13 @@ mod tests {
         let band = 0;
         let key = test_key(band);
         let tile = test_tile_u8(band);
-        let stored = ArrowIpcStorageFormat::store(tile.clone(), key)
-            .await
-            .expect("it should be possible to store the tile.");
+        let stored = ArrowIpcStorageFormat::store(
+            tile.clone(),
+            key,
+            todo!("figure out where the raster result descriptor lives"),
+        )
+        .await
+        .expect("it should be possible to store the tile.");
 
         let path = stored.path.clone();
         let metadata = fs::metadata(&path).expect(&format!("File should be at {path:#?}"));
@@ -1073,7 +1122,11 @@ mod tests {
         let expected_tile = tile.clone();
 
         store
-            .insert(key.clone(), tile)
+            .insert(
+                key.clone(),
+                tile,
+                todo!("figure out how to aquire the result descriptor"),
+            )
             .await
             .expect("it should be possible to insert the tile into the OnDiskStorage.");
         let stored: Arc<ArrowIpcStorageFormat> = store
@@ -1105,9 +1158,13 @@ mod tests {
         let band = 0;
         let key = test_key(band);
         let tile = test_tile_u8(band);
-        let stored = ZarrsStorageFormat::store(tile.clone(), key)
-            .await
-            .expect("it should be possible to store the tile.");
+        let stored = ZarrsStorageFormat::store(
+            tile.clone(),
+            key,
+            todo!("figure out how to get the raster result descriptor"),
+        )
+        .await
+        .expect("it should be possible to store the tile.");
 
         {
             // check if the zarrs thing is there
@@ -1152,7 +1209,11 @@ mod tests {
         let expected_tile = tile.clone();
 
         store
-            .insert(key.clone(), tile)
+            .insert(
+                key.clone(),
+                tile,
+                todo!("figure out how to get the raster result descriptor"),
+            )
             .await
             .expect("it should be possible to insert the tile into the OnDiskStorage.");
         let stored: Arc<ZarrsStorageFormat> = store
@@ -1219,7 +1280,7 @@ mod tests {
     fn get_tiles_path() {
         let path = ZarrsArrayPath::new_from_cache_key(&test_key(0));
         let tiles_path = path.tiles();
-        let time = time_interval_to_path_safe_iso(&path.time_interval());
+        let time = time_interval_to_path_safe_iso(todo!("&path.time_interval()"));
         assert_eq!(
             "/05643c4ac1135b60c1e9b65c47fc77d7ccd550b05485dc4f5597ac3d067f065d/band_0/-262143-01-01T00-00-00Z_to_+262142-12-31T23-59-59.999Z/tiles"
                 .to_string(),
@@ -1231,7 +1292,7 @@ mod tests {
     fn get_metadata_path() {
         let path = ZarrsArrayPath::new_from_cache_key(&test_key(0));
         let metadata_path = path.metadata();
-        let time = time_interval_to_path_safe_iso(&path.time_interval());
+        let time = time_interval_to_path_safe_iso(todo!("&path.time_interval()"));
         assert_eq!(
             "/05643c4ac1135b60c1e9b65c47fc77d7ccd550b05485dc4f5597ac3d067f065d/band_0/-262143-01-01T00-00-00Z_to_+262142-12-31T23-59-59.999Z/metadata"
                 .to_string(),

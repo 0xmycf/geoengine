@@ -1,8 +1,8 @@
 use geoengine_datatypes::util::AsAny;
-use std::hash::Hash;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use snafu::ResultExt;
+use std::hash::Hash;
 use tracing::debug;
 
 use crate::util::Result;

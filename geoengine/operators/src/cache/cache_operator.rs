@@ -226,6 +226,7 @@ where
             .expect("`SharedCache` extension should be set during `ProContext` creation");
 
         let cache_result = shared_cache.query_cache(&self.cache_key, &query).await;
+        // let result_descriptor = self.processor.result_descriptor();
 
         if let Ok(Some(cache_result)) = cache_result {
             // cache hit

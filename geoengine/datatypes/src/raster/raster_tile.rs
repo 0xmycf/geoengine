@@ -210,8 +210,8 @@ where
                 // one iterator is exhausted, the other is not, so they are not equal
                 _ => {
                     dbg!("one iterator is exhauseted, while the other is not");
-                    return false
-                },
+                    return false;
+                }
             }
         }
     }
