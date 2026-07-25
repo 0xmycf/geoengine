@@ -19,9 +19,9 @@ use futures::task::UnsafeFutureObj;
 use geoengine_datatypes::{
     primitives::{CacheHint, DateTimeParseFormat},
     raster::{
-        GeoTransform, Grid, Grid2D, GridIdx, GridOrEmpty, GridShapeAccess, GridSize, MaskedGrid2D,
-        RasterDataType, RasterProperties, TilesEqualIgnoringCacheHint, TypedGrid, TypedGrid2D,
-        arrow_ipc_file_to_raster_tile_2d_for_ipc_channel,
+        EmptyGrid, GeoTransform, Grid, Grid2D, GridIdx, GridOrEmpty, GridShapeAccess, GridSize,
+        MaskedGrid2D, RasterDataType, RasterProperties, TilesEqualIgnoringCacheHint, TypedGrid,
+        TypedGrid2D, arrow_ipc_file_to_raster_tile_2d_for_ipc_channel,
         raster_tile_2d_to_arrow_ipc_file_for_ipc_channel,
     },
     util::ByteSize,
@@ -368,6 +368,8 @@ struct ZarrsMetaDataChunk {
     pub properties: RasterProperties, // properties are not necessarily unique across tiles from one raster/file
     /// The time initerval of the tile
     pub time_interval: TimeInterval,
+    /// Whether the tile is a NoDataTile or not
+    pub is_no_data: bool,
 }
 
 impl<'a> IntoArrayBytes<'a> for ZarrsMetaDataChunk {
@@ -618,6 +620,9 @@ impl StorageFormat for ZarrsStorageFormat {
                     time_interval: call_generic_typed_raster_tile_2d_cache!(&tile, |tile| tile
                         .time
                         .clone()),
+                    is_no_data: call_generic_typed_raster_tile_2d_cache!(&tile, |tile| tile
+                        .grid_array
+                        .is_empty()),
                 },
             )
             .map_err(|source| Error::ZarrArrayStoreError {
@@ -684,7 +689,7 @@ impl StorageFormat for ZarrsStorageFormat {
             let ld = loaded_tile.clone();
             assert!(
                 b,
-                "Actual tile {tile:#?} and loaded_tile {ld:#?} are different."
+                "Actual tile {tile:?} and loaded_tile {ld:?} are different."
             );
         }
         Ok(loaded_tile)
@@ -697,6 +702,10 @@ impl StorageFormat for ZarrsStorageFormat {
     async fn is_expired(&self) -> bool {
         false // TODO (crit): figure out how to properly implement this
     }
+}
+
+fn is_no_data(tile: TypedRasterTile2D) -> bool {
+    call_generic_typed_raster_tile_2d_cache!(tile, |tile| tile.grid_array.is_empty())
 }
 
 fn load_tile(
@@ -715,6 +724,35 @@ fn load_tile(
     let global_geo_transform = arrays.read_global_geo_transform();
     // TODO (high): what should I use here? What is the proper default value for these datachunks that are retreived from the on-disk cache?
     let cache_hint = CacheHint::max_duration(); // TODO (crit): 27B344EE-600E-448B-982D-8A7D6DDA2E30
+
+    macro_rules! empty_for_type {
+        ($variant:ident) => {
+            TypedRasterTile2D::$variant(RasterTile2D::new(
+                time,
+                tile_position,
+                band,
+                global_geo_transform,
+                // TODO (mid): do the tiles actually all have the same shape?
+                GridOrEmpty::new_empty(EmptyGrid::new(arrays.tiles_shape())),
+                cache_hint,
+            ))
+        };
+    }
+
+    if (metadata_chunk.is_no_data) {
+        return Ok(match data_type {
+            RasterDataType::U8 => empty_for_type!(U8),
+            RasterDataType::U16 => empty_for_type!(U16),
+            RasterDataType::U32 => empty_for_type!(U32),
+            RasterDataType::U64 => empty_for_type!(U64),
+            RasterDataType::I8 => empty_for_type!(I8),
+            RasterDataType::I16 => empty_for_type!(I16),
+            RasterDataType::I32 => empty_for_type!(I32),
+            RasterDataType::I64 => empty_for_type!(I64),
+            RasterDataType::F32 => empty_for_type!(F32),
+            RasterDataType::F64 => empty_for_type!(F64),
+        });
+    }
 
     let validity_mask: Vec<bool> = arrays
         .validity
