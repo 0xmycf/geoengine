@@ -129,7 +129,6 @@ async fn query(processor: Arc<BoxRasterQueryProcessor<u8>>, query_ctx: &MockQuer
     black_box(tiles);
 }
 
-// TODO (high): build in some test / verification to see if the tiles match / are correct.
 fn benchmark(c: &mut Criterion) {
     let () = rayon::ThreadPoolBuilder::new()
         .build_global()

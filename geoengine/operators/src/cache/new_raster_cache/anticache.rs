@@ -183,9 +183,11 @@ where
 */
 pub struct ArrowIpcStorageFormat {
     path: PathBuf,
-    tile: TypedRasterTile2D,
+    tile: TypedRasterTile2D, // TODO (low): make this optional and implement proper ways of not having it in RAM
     /// The cached bytesize of the file ins storage
     byte_size: usize,
+    /// the datatype of the TypedRasterTile2D
+    data_type: RasterDataType,
 }
 
 // How it is stored:
@@ -193,7 +195,7 @@ pub struct ArrowIpcStorageFormat {
 // the rest is stored as metadata in the zarr file / zarr.json
 pub struct ZarrsStorageFormat {
     paths: ZarrsArrayPath,
-    tile: TypedRasterTile2D,
+    tile: TypedRasterTile2D, // TODO (low): make this optional and implement proper ways of not having it in RAM
     data_type: RasterDataType,
     byte_size: usize,
     chunk_indices: [u64; 2],
@@ -293,52 +295,6 @@ impl ZarrsArrayAccess {
     fn tiles_shape(self: &Self) -> GridShape<[usize; 2]> {
         let shape = self.tiles.shape();
         [shape[0] as usize, shape[1] as usize].into()
-    }
-
-    fn should_grow(&self) -> bool {
-        todo!()
-        // let tiles_shape = self.tiles.shape();
-        // self.tiles.chunk
-        // tiles_shape[0] < 1 && tiles_shape[1] < 1
-    }
-
-    fn grow_shape(shape: &[u64], factor: f64) -> Vec<u64> {
-        shape
-            .iter()
-            .map(|&x| (x as f64 * factor).ceil() as u64)
-            .collect()
-    }
-
-    /// Tries to grow the tiles and metadata array by a factor of 1.5
-    /// TODO (high): see if this is actually correct (I suspect that we need to respect the chunk_grid_size somehow)
-    fn try_grow(&mut self) -> Result<()> {
-        {
-            let tiles_current_shape = self.tiles.shape();
-            let new_shape = Self::grow_shape(tiles_current_shape, 1.5);
-            self.tiles
-                .set_shape(new_shape)
-                .map_err(|source| Error::ZarrArrayCreateError { source })?;
-        }
-        {
-            let metadata_current_shape = self.metadata.shape();
-            let new_shape = Self::grow_shape(metadata_current_shape, 1.5);
-            self.metadata
-                .set_shape(new_shape)
-                .map_err(|source| Error::ZarrArrayCreateError { source })?;
-        }
-
-        self.tiles
-            .store_metadata()
-            .map_err(|source| Error::ZarrArrayCreateError {
-                source: source.into(),
-            });
-        self.metadata
-            .store_metadata()
-            .map_err(|source| Error::ZarrArrayCreateError {
-                source: source.into(),
-            });
-
-        Ok(())
     }
 
     fn read_global_geo_transform(&self) -> GeoTransform {
@@ -554,7 +510,7 @@ fn open_zarrs_filesystemstore() -> Result<Arc<FilesystemStore>> {
     Ok(Arc::new(zarrs))
 }
 
-fn datatype_from_raster(tile: &TypedRasterTile2D) -> RasterDataType {
+fn raster_datatype_from_tile(tile: &TypedRasterTile2D) -> RasterDataType {
     match tile {
         TypedRasterTile2D::I8(_) => RasterDataType::I8,
         TypedRasterTile2D::I16(_) => RasterDataType::I16,
@@ -630,7 +586,7 @@ impl StorageFormat for ZarrsStorageFormat {
                 storage: Metadata,
             })?;
 
-        let data_type = datatype_from_raster(&tile);
+        let data_type = raster_datatype_from_tile(&tile);
         Ok(ZarrsStorageFormat {
             paths,
             tile,
@@ -838,7 +794,7 @@ fn store_tile_data_validity(
             })?;
         return Ok(ret);
     }
-    return Ok(0); // TODO (high): see C482F320-772B-46FE-A6E5-0D7EE22B3AB4
+    return Ok(0); // TODO (low): see C482F320-772B-46FE-A6E5-0D7EE22B3AB4
 }
 
 /// returns the amount of bytes written
@@ -849,18 +805,10 @@ fn store_tile_data(
     chunk_indices: &[u64],
 ) -> std::result::Result<usize, zarrs::array::ArrayError> {
     match TypedGrid2D::try_from(tile) {
-        Err(()) => Ok(0), // TODO (high): evalulate if writing nothinig is actually what we want ∧ if returning 0 is the good return value, or if it would be better to write empty data tiles (C482F320-772B-46FE-A6E5-0D7EE22B3AB4)
-        /* RE: C482F320-772B-46FE-A6E5-0D7EE22B3AB4
-            empty tiles must be marked / checked if zarr(s)
-            even stores empty tiles
-
-            => What is currently happening when an empty tile is read?
-
-
-            It seems like when we read a no-data tile, then the no-data tile is initialized with the filler values.
-            Which means we somehow need to implement a way of figuring out the best way to store this no-data tile s.t. reads also
-            create no-data tiles
-        */
+        Err(()) => Ok(0),
+        // TODO (low): {C482F320-772B-46FE-A6E5-0D7EE22B3AB4}
+        //      make sure that the 0 is correct.
+        //      (we dont write any tile (we dont need to) and at read side we initialize a NoDataTile)
         Ok(typed_grid) => match typed_grid {
             TypedGrid::U8(grid) => store_tile_data_concrete(grid, array, chunk_indices),
             TypedGrid::U16(grid) => store_tile_data_concrete(grid, array, chunk_indices),
@@ -993,10 +941,12 @@ impl StorageFormat for ArrowIpcStorageFormat {
         let mut file = File::create(cache_path.clone())?;
         let _ = file.write_all(&bytes)?;
 
+        let data_type = raster_datatype_from_tile(&tile);
         Ok(Self {
             path: cache_path,
             tile,
             byte_size,
+            data_type,
         })
     }
 
@@ -1005,18 +955,17 @@ impl StorageFormat for ArrowIpcStorageFormat {
         let mut buf = vec![];
 
         let _ = file.read_to_end(&mut buf).await?;
-        // TODO (high): add data_type here too
-        match self.tile {
-            TypedRasterTile2D::I8(_) => arrow_ipc_tile_to_typed_raster::<i8>(buf),
-            TypedRasterTile2D::I16(_) => arrow_ipc_tile_to_typed_raster::<i16>(buf),
-            TypedRasterTile2D::I32(_) => arrow_ipc_tile_to_typed_raster::<i32>(buf),
-            TypedRasterTile2D::I64(_) => arrow_ipc_tile_to_typed_raster::<i64>(buf),
-            TypedRasterTile2D::U8(_) => arrow_ipc_tile_to_typed_raster::<u8>(buf),
-            TypedRasterTile2D::U16(_) => arrow_ipc_tile_to_typed_raster::<u16>(buf),
-            TypedRasterTile2D::U32(_) => arrow_ipc_tile_to_typed_raster::<u32>(buf),
-            TypedRasterTile2D::U64(_) => arrow_ipc_tile_to_typed_raster::<u64>(buf),
-            TypedRasterTile2D::F32(_) => arrow_ipc_tile_to_typed_raster::<f32>(buf),
-            TypedRasterTile2D::F64(_) => arrow_ipc_tile_to_typed_raster::<f64>(buf),
+        match self.data_type {
+            RasterDataType::I8 => arrow_ipc_tile_to_typed_raster::<i8>(buf),
+            RasterDataType::I16 => arrow_ipc_tile_to_typed_raster::<i16>(buf),
+            RasterDataType::I32 => arrow_ipc_tile_to_typed_raster::<i32>(buf),
+            RasterDataType::I64 => arrow_ipc_tile_to_typed_raster::<i64>(buf),
+            RasterDataType::U8 => arrow_ipc_tile_to_typed_raster::<u8>(buf),
+            RasterDataType::U16 => arrow_ipc_tile_to_typed_raster::<u16>(buf),
+            RasterDataType::U32 => arrow_ipc_tile_to_typed_raster::<u32>(buf),
+            RasterDataType::U64 => arrow_ipc_tile_to_typed_raster::<u64>(buf),
+            RasterDataType::F32 => arrow_ipc_tile_to_typed_raster::<f32>(buf),
+            RasterDataType::F64 => arrow_ipc_tile_to_typed_raster::<f64>(buf),
         }
     }
 
