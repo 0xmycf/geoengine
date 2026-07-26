@@ -1,10 +1,10 @@
-pub mod anticache;
+pub mod on_disk;
 
 use crate::cache::cache_tiles::{CompressedRasterTile2D, CompressedRasterTileExt};
 use crate::cache::error::CacheError;
-use crate::cache::new_raster_cache::anticache::{
-    ArrowIpcStorageFormat, OnDiskStore, ZarrsStorageFormat,
-};
+use crate::cache::new_raster_cache::on_disk::OnDiskStore;
+use crate::cache::new_raster_cache::on_disk::arrow_ipc_cache::ArrowIpcStorageFormat;
+use crate::cache::new_raster_cache::on_disk::zarrs_cache::ZarrsStorageFormat;
 use crate::engine::{
     BoxRasterQueryProcessor, CanonicOperatorName, InitializedRasterOperator, QueryContext,
     QueryProcessor, RasterOperator, RasterQueryProcessor, RasterResultDescriptor,
@@ -17,21 +17,19 @@ use futures::Stream;
 use futures::StreamExt;
 use futures::stream;
 use futures::stream::BoxStream;
+use geoengine_datatypes::call_generic_raster_tile_2d;
 use geoengine_datatypes::primitives::{
     BandSelection, CacheHint, QueryRectangle, RasterQueryRectangle, SpatialResolution, TimeInterval,
 };
 use geoengine_datatypes::raster::{
-    Grid, GridBoundingBox2D, GridIdx2D, GridShape, GridShape2D, GridShapeAccess, Pixel,
-    RasterTile2D, TileInformation, TypedGrid2D,
+    Grid, GridBoundingBox2D, GridIdx2D, GridShape, GridShape2D, Pixel, RasterTile2D,
+    TileInformation, TypedGrid2D, TypedRasterTile2D,
 };
 use geoengine_datatypes::util::ByteSize as _;
 use geoengine_datatypes::util::test::TestDefault;
-use itertools::FoldWhile::{Continue, Done};
-use itertools::Itertools;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::File;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::iter;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -49,6 +47,7 @@ pub enum NewRasterCacheEnum {
     InMemoryCompressedRasterTile2DLru(
         NewRasterCache<InMemoryCacheStore<TypedCompressedRasterTile2D, LruEvictionStrategy>>,
     ),
+    // TODO (crit): check the whole enum iff this is even what we want or not
     // OnDiskMockFifo(
     //     NewRasterCache<MockOnDiskCacheStore<MockOnDiskStorageFormat, FifoEvictionStrategy>>,
     // ),
@@ -299,7 +298,7 @@ impl EvictionStrategy for FifoEvictionStrategy {
         if needed == 0 {
             return Ok(EvictionPlan {
                 keys_to_remove: vec![],
-                freed_bytes: 0,
+                freed_bytes: required_space, // TODO (low): shouldnt this be 0, since nothing is freed?
             });
         }
 
@@ -709,34 +708,18 @@ pub trait StorageFormat: Send + Sync + Sized + 'static {
     async fn is_expired(&self) -> bool;
 }
 
-#[derive(Clone, Debug)]
-pub enum TypedRasterTile2D {
-    I8(RasterTile2D<i8>),
-    I16(RasterTile2D<i16>),
-    I32(RasterTile2D<i32>),
-    I64(RasterTile2D<i64>),
-    U8(RasterTile2D<u8>),
-    U16(RasterTile2D<u16>),
-    U32(RasterTile2D<u32>),
-    U64(RasterTile2D<u64>),
-    F32(RasterTile2D<f32>),
-    F64(RasterTile2D<f64>),
-}
-
-impl TypedRasterTile2D {
-    fn cache_hint(&self) -> CacheHint {
-        match self {
-            TypedRasterTile2D::I8(tile) => tile.cache_hint,
-            TypedRasterTile2D::I16(tile) => tile.cache_hint,
-            TypedRasterTile2D::I32(tile) => tile.cache_hint,
-            TypedRasterTile2D::I64(tile) => tile.cache_hint,
-            TypedRasterTile2D::U8(tile) => tile.cache_hint,
-            TypedRasterTile2D::U16(tile) => tile.cache_hint,
-            TypedRasterTile2D::U32(tile) => tile.cache_hint,
-            TypedRasterTile2D::U64(tile) => tile.cache_hint,
-            TypedRasterTile2D::F32(tile) => tile.cache_hint,
-            TypedRasterTile2D::F64(tile) => tile.cache_hint,
-        }
+fn cache_hint(this: &TypedRasterTile2D) -> CacheHint {
+    match this {
+        TypedRasterTile2D::I8(tile) => tile.cache_hint,
+        TypedRasterTile2D::I16(tile) => tile.cache_hint,
+        TypedRasterTile2D::I32(tile) => tile.cache_hint,
+        TypedRasterTile2D::I64(tile) => tile.cache_hint,
+        TypedRasterTile2D::U8(tile) => tile.cache_hint,
+        TypedRasterTile2D::U16(tile) => tile.cache_hint,
+        TypedRasterTile2D::U32(tile) => tile.cache_hint,
+        TypedRasterTile2D::U64(tile) => tile.cache_hint,
+        TypedRasterTile2D::F32(tile) => tile.cache_hint,
+        TypedRasterTile2D::F64(tile) => tile.cache_hint,
     }
 }
 
@@ -752,163 +735,6 @@ pub enum TypedCompressedRasterTile2D {
     U64(CompressedRasterTile2D<u64>),
     F32(CompressedRasterTile2D<f32>),
     F64(CompressedRasterTile2D<f64>),
-}
-
-impl TryFrom<TypedRasterTile2D> for Grid<GridShape2D, bool> {
-    type Error = ();
-
-    fn try_from(this: TypedRasterTile2D) -> std::result::Result<Self, Self::Error> {
-        match this {
-            TypedRasterTile2D::I8(base_tile) => match base_tile.grid_array {
-                geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
-                    Ok(masked_grid.validity_mask)
-                }
-                _ => Err(()),
-            },
-            TypedRasterTile2D::I16(base_tile) => match base_tile.grid_array {
-                geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
-                    Ok(masked_grid.validity_mask)
-                }
-                _ => Err(()),
-            },
-            TypedRasterTile2D::I32(base_tile) => match base_tile.grid_array {
-                geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
-                    Ok(masked_grid.validity_mask)
-                }
-                _ => Err(()),
-            },
-            TypedRasterTile2D::I64(base_tile) => match base_tile.grid_array {
-                geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
-                    Ok(masked_grid.validity_mask)
-                }
-                _ => Err(()),
-            },
-            TypedRasterTile2D::U8(base_tile) => match base_tile.grid_array {
-                geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
-                    Ok(masked_grid.validity_mask)
-                }
-                _ => Err(()),
-            },
-            TypedRasterTile2D::U16(base_tile) => match base_tile.grid_array {
-                geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
-                    Ok(masked_grid.validity_mask)
-                }
-                _ => Err(()),
-            },
-            TypedRasterTile2D::U32(base_tile) => match base_tile.grid_array {
-                geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
-                    Ok(masked_grid.validity_mask)
-                }
-                _ => Err(()),
-            },
-            TypedRasterTile2D::U64(base_tile) => match base_tile.grid_array {
-                geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
-                    Ok(masked_grid.validity_mask)
-                }
-                _ => Err(()),
-            },
-            TypedRasterTile2D::F32(base_tile) => match base_tile.grid_array {
-                geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
-                    Ok(masked_grid.validity_mask)
-                }
-                _ => Err(()),
-            },
-            TypedRasterTile2D::F64(base_tile) => match base_tile.grid_array {
-                geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
-                    Ok(masked_grid.validity_mask)
-                }
-                _ => Err(()),
-            },
-        }
-    }
-}
-
-impl TryFrom<TypedRasterTile2D> for TypedGrid2D {
-    type Error = ();
-
-    fn try_from(this: TypedRasterTile2D) -> std::result::Result<Self, Self::Error> {
-        match this {
-            TypedRasterTile2D::I8(base_tile) => match base_tile.grid_array {
-                geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
-                    Ok(masked_grid.inner_grid.into())
-                }
-                _ => Err(()),
-            },
-            TypedRasterTile2D::I16(base_tile) => match base_tile.grid_array {
-                geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
-                    Ok(masked_grid.inner_grid.into())
-                }
-                _ => Err(()),
-            },
-            TypedRasterTile2D::I32(base_tile) => match base_tile.grid_array {
-                geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
-                    Ok(masked_grid.inner_grid.into())
-                }
-                _ => Err(()),
-            },
-            TypedRasterTile2D::I64(base_tile) => match base_tile.grid_array {
-                geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
-                    Ok(masked_grid.inner_grid.into())
-                }
-                _ => Err(()),
-            },
-            TypedRasterTile2D::U8(base_tile) => match base_tile.grid_array {
-                geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
-                    Ok(masked_grid.inner_grid.into())
-                }
-                _ => Err(()),
-            },
-            TypedRasterTile2D::U16(base_tile) => match base_tile.grid_array {
-                geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
-                    Ok(masked_grid.inner_grid.into())
-                }
-                _ => Err(()),
-            },
-            TypedRasterTile2D::U32(base_tile) => match base_tile.grid_array {
-                geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
-                    Ok(masked_grid.inner_grid.into())
-                }
-                _ => Err(()),
-            },
-            TypedRasterTile2D::U64(base_tile) => match base_tile.grid_array {
-                geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
-                    Ok(masked_grid.inner_grid.into())
-                }
-                _ => Err(()),
-            },
-            TypedRasterTile2D::F32(base_tile) => match base_tile.grid_array {
-                geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
-                    Ok(masked_grid.inner_grid.into())
-                }
-                _ => Err(()),
-            },
-            TypedRasterTile2D::F64(base_tile) => match base_tile.grid_array {
-                geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
-                    Ok(masked_grid.inner_grid.into())
-                }
-                _ => Err(()),
-            },
-        }
-    }
-}
-
-impl GridShapeAccess for TypedRasterTile2D {
-    type ShapeArray = [usize; 2];
-
-    fn grid_shape_array(&self) -> Self::ShapeArray {
-        match self {
-            TypedRasterTile2D::I8(base_tile) => base_tile.grid_shape_array(),
-            TypedRasterTile2D::I16(base_tile) => base_tile.grid_shape_array(),
-            TypedRasterTile2D::I32(base_tile) => base_tile.grid_shape_array(),
-            TypedRasterTile2D::I64(base_tile) => base_tile.grid_shape_array(),
-            TypedRasterTile2D::U8(base_tile) => base_tile.grid_shape_array(),
-            TypedRasterTile2D::U16(base_tile) => base_tile.grid_shape_array(),
-            TypedRasterTile2D::U32(base_tile) => base_tile.grid_shape_array(),
-            TypedRasterTile2D::U64(base_tile) => base_tile.grid_shape_array(),
-            TypedRasterTile2D::F32(base_tile) => base_tile.grid_shape_array(),
-            TypedRasterTile2D::F64(base_tile) => base_tile.grid_shape_array(),
-        }
-    }
 }
 
 #[async_trait]
@@ -1073,7 +899,7 @@ where
             }
         }
 
-        let cache_hint = tile.cache_hint();
+        let cache_hint = cache_hint(&tile);
         let value = SF::store(tile, key.clone(), result_descriptor).await?;
         let value_size = value.byte_size().await?;
 
@@ -1114,6 +940,24 @@ where
         );
         Ok(())
     }
+}
+
+pub fn typed_raster_tile_2d_to_grid(this: &TypedRasterTile2D) -> Option<Grid<GridShape2D, bool>> {
+    call_generic_raster_tile_2d!(this, base_tile => match base_tile.grid_array.clone() {
+        geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
+            Some(masked_grid.validity_mask)
+        }
+        geoengine_datatypes::raster::GridOrEmpty::Empty(_) => None,
+    })
+}
+
+fn typed_raster_tile_2d_to_typed_grid_2d(this: &TypedRasterTile2D) -> Option<TypedGrid2D> {
+    call_generic_raster_tile_2d!(this, base_tile => match base_tile.grid_array.clone() {
+        geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
+            Some(masked_grid.inner_grid.into())
+        }
+        geoengine_datatypes::raster::GridOrEmpty::Empty(_) => None,
+    })
 }
 
 pub struct RasterCacheOperator<Source>
@@ -1413,24 +1257,6 @@ macro_rules! supported_raster_data_type_impl {
                 }
             }
         )*
-    };
-}
-
-#[macro_export]
-macro_rules! call_generic_typed_raster_tile_2d_cache {
-    ($tile:expr, |$thing:ident| $body:expr) => {
-        match $tile {
-            TypedRasterTile2D::I8($thing) => $body,
-            TypedRasterTile2D::I16($thing) => $body,
-            TypedRasterTile2D::I32($thing) => $body,
-            TypedRasterTile2D::I64($thing) => $body,
-            TypedRasterTile2D::U8($thing) => $body,
-            TypedRasterTile2D::U16($thing) => $body,
-            TypedRasterTile2D::U32($thing) => $body,
-            TypedRasterTile2D::U64($thing) => $body,
-            TypedRasterTile2D::F32($thing) => $body,
-            TypedRasterTile2D::F64($thing) => $body,
-        }
     };
 }
 

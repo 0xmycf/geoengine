@@ -96,6 +96,23 @@ where
     }
 }
 
+impl TypedRasterTile2D {
+    pub fn raster_data_type(&self) -> RasterDataType {
+        match self {
+            TypedRasterTile2D::I8(_) => RasterDataType::I8,
+            TypedRasterTile2D::I16(_) => RasterDataType::I16,
+            TypedRasterTile2D::I32(_) => RasterDataType::I32,
+            TypedRasterTile2D::I64(_) => RasterDataType::I64,
+            TypedRasterTile2D::U8(_) => RasterDataType::U8,
+            TypedRasterTile2D::U16(_) => RasterDataType::U16,
+            TypedRasterTile2D::U32(_) => RasterDataType::U32,
+            TypedRasterTile2D::U64(_) => RasterDataType::U64,
+            TypedRasterTile2D::F32(_) => RasterDataType::F32,
+            TypedRasterTile2D::F64(_) => RasterDataType::F64,
+        }
+    }
+}
+
 /// Implement `From<RasterTile> for TypedRasterTile`
 macro_rules! impl_from_raster_tile {
     ($($type:tt),+) => {

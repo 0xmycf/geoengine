@@ -1,0 +1,494 @@
+// TODO (low): handle all panics!
+#![allow(unused)]
+use std::{
+    fmt::Write,
+    fs,
+    io::{self, ErrorKind, Write as IoWrite},
+    ops::Deref,
+    path::PathBuf,
+    result,
+    str::FromStr,
+    sync::OnceLock,
+};
+#[cfg(test)]
+use std::{sync::LazyLock, thread::ThreadId};
+
+use chrono::offset;
+#[cfg(test)]
+use futures::executor::block_on;
+use futures::task::UnsafeFutureObj;
+use geoengine_datatypes::{
+    primitives::{CacheHint, DateTimeParseFormat},
+    raster::{
+        EmptyGrid, GeoTransform, Grid, Grid2D, GridIdx, GridOrEmpty, GridShapeAccess, GridSize,
+        MaskedGrid2D, RasterDataType, RasterProperties, TilesEqualIgnoringCacheHint, TypedGrid,
+        TypedGrid2D, arrow_ipc_file_to_raster_tile_2d_for_ipc_channel,
+        raster_tile_2d_to_arrow_ipc_file_for_ipc_channel,
+    },
+    util::ByteSize,
+};
+use serde_json::{Value, json};
+use std::sync::RwLock as StdRwLock;
+#[cfg(test)]
+use tokio::sync::Mutex;
+use tokio::{
+    fs::{create_dir, metadata, remove_file},
+    io::AsyncReadExt,
+    sync::RwLock,
+};
+use uuid::Uuid;
+#[cfg(test)]
+use zarrs::array::CodecError::ExpectedFixedLengthBytes;
+use zarrs::{
+    array::{
+        Array, ArrayBuilder, ArrayBytes, ArrayBytesOffsets, ArrayCreateError, ArrayShape, DataType,
+        ElementOwned, FromArrayBytes, IntoArrayBytes,
+        builder::{ArrayBuilderChunkGridMetadata, ArrayBuilderFillValue},
+        chunk_shape_to_array_shape,
+        data_type::{self, BoolDataType},
+    },
+    filesystem::FilesystemStore,
+    group::GroupBuilder,
+};
+
+use crate::{
+    cache::{self, new_raster_cache::*},
+    engine::OperatorName,
+    error::{
+        Error,
+        WhichTile::{Metadata, Tiles, Validity},
+    },
+    util::gdal::create_ndvi_meta_data,
+};
+
+pub mod arrow_ipc_cache;
+pub mod zarrs_cache;
+
+const GLOBAL_GEOTRANSFORM_KEY: &'static str = "global_geo_transform";
+
+pub struct OnDiskStore<SF: StorageFormat, ES: EvictionStrategy> {
+    pub cache: RwLock<HashMap<Arc<CacheKey>, Arc<SF>>>,
+    pub eviction_strategy: RwLock<ES>,
+}
+
+pub struct PendingFile<SF: OnDiskStorageFormat> {
+    inner: Option<SF>,
+    commited: bool,
+}
+
+impl<SF: OnDiskStorageFormat> PendingFile<SF> {
+    pub fn new(inner: SF) -> Self {
+        let inner = Some(inner);
+        Self {
+            inner,
+            commited: false,
+        }
+    }
+
+    pub fn commit(mut self) -> SF {
+        self.commited = true;
+        self.inner
+            .take()
+            .expect("taking the inner value of a pending file should be valid")
+    }
+}
+
+impl<SF: OnDiskStorageFormat> Deref for PendingFile<SF> {
+    type Target = SF;
+    fn deref(&self) -> &Self::Target {
+        self.inner
+            .as_ref()
+            .expect("deref the inner value of a pending file to the storage format.")
+    }
+}
+
+impl<SF: OnDiskStorageFormat> Drop for PendingFile<SF> {
+    fn drop(&mut self) {
+        if !self.commited {
+            self.inner.as_mut().map(|f| f.cleanup());
+        }
+    }
+}
+
+#[async_trait]
+pub trait OnDiskStorageFormat: StorageFormat {
+    async fn write(
+        tile: TypedRasterTile2D,
+        key: Arc<CacheKey>,
+        result_descriptor: &RasterResultDescriptor,
+    ) -> Result<PendingFile<Self>> {
+        let store = Self::store(tile, key, result_descriptor).await?;
+        let pending_file = PendingFile::new(store);
+        Ok(pending_file)
+    }
+
+    fn cleanup(&mut self);
+}
+
+// Currently just a copy of ["MockOnDiskCacheStore"] in  ["super;"].
+#[async_trait]
+impl<SF, ES> CacheStore for OnDiskStore<SF, ES>
+where
+    SF: StorageFormat + OnDiskStorageFormat,
+    ES: EvictionStrategy,
+{
+    type SF = SF;
+    type ES = ES;
+
+    async fn get(&self, key: &CacheKey) -> Result<Option<Arc<Self::SF>>> {
+        let x = self.cache.read().await.get(key).map(Arc::clone);
+        match x {
+            Some(key) => Ok(Some(key)),
+            None => Ok(None),
+        }
+    }
+
+    // TODO (crit): this function probably not right anymore, the base has changed a lot. fix it! after rebase
+    async fn insert(
+        &self,
+        key: Arc<CacheKey>,
+        tile: TypedRasterTile2D,
+        raster_result_descriptor: /* TODO (crit): must be used */ &RasterResultDescriptor,
+    ) -> Result<()> {
+        /*
+        We need to make sure that the file is not just written to the disk
+        without actually being inserted in the cache / index later on.
+        Otherwise we will have orphaned files.
+        */
+        let stored_tile = SF::write(tile, key.clone(), raster_result_descriptor).await?;
+        let required_space = stored_tile.byte_size().await?;
+
+        let mut cache = self.cache.write().await;
+        let mut eviction_strategy = self.eviction_strategy.write().await;
+        let eviction_plan = eviction_strategy.plan_eviction(required_space, usize::MAX, |key| {
+            cache.get(key).map_or(true, |sf| Arc::strong_count(sf) > 1)
+        })?;
+
+        if eviction_plan.freed_bytes < required_space {
+            return Err(crate::error::Error::Cache {
+                source: CacheError::Unspecified,
+            });
+        }
+
+        for key in eviction_plan.keys_to_remove {
+            cache.remove(&key);
+            eviction_strategy.record_removal(&key);
+        }
+
+        let cache_obj = stored_tile.commit();
+        cache.insert(key, Arc::new(cache_obj));
+        Ok(())
+    }
+}
+
+#[cfg(not(test))]
+static RASTER_CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+// TODO (mid): this caused a race condition when running multiple tests at once, it must now be properly used
+#[cfg(test)]
+static RASTER_CACHE_DIR: LazyLock<StdRwLock<HashMap<ThreadId, PathBuf>>> =
+    LazyLock::new(|| StdRwLock::new(HashMap::new()));
+
+#[cfg(not(test))]
+pub fn set_raster_cache_dir(path: PathBuf) -> Result<()> {
+    RASTER_CACHE_DIR
+        .set(path)
+        .map_err(|err| Error::MustNotHappen {
+            message: "RASTER_CACHE_DIR should only be set once during startup".to_string(),
+        })?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub fn set_raster_cache_dir(path: PathBuf) -> Result<()> {
+    let mut x = RASTER_CACHE_DIR.write().expect("it to be not poisoned");
+    x.insert(std::thread::current().id(), path);
+    Ok(())
+}
+
+/// Returns the `RASTER_CACHE_DIR` config setting if it is set,
+/// if is not, then return then return the xdg-cache dir
+#[cfg(not(test))]
+fn cache_dir() -> PathBuf {
+    RASTER_CACHE_DIR
+        .get()
+        .map(|x| x.to_path_buf())
+        .unwrap_or_else(|| {
+            let home = std::env::home_dir()
+                .expect("Either 'RASTER_CACHE_DIR' or 'HOME' dir should be set");
+            home.join(".cache").join("geoengine")
+        })
+}
+
+/// Returns the `RASTER_CACHE_DIR` config setting if it is set for the current thread,
+/// if is not, then return then return the xdg-cache dir
+#[cfg(test)]
+fn cache_dir() -> PathBuf {
+    RASTER_CACHE_DIR
+        .read()
+        .expect("read lock should not be poisoned")
+        .get(&std::thread::current().id())
+        .expect("the value to be present")
+        .clone()
+}
+
+fn time_interval_to_path_safe_iso(time: &TimeInterval) -> String {
+    let fmt = &DateTimeParseFormat::custom("%Y-%m-%dT%H-%M-%S%.3fZ".to_string());
+    format!(
+        "{}_to_{}",
+        time.start()
+            .as_date_time()
+            .expect("it to be a valid datetime")
+            .format(fmt),
+        time.end()
+            .as_date_time()
+            .expect("it to be a valid datetime")
+            .format(fmt)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::util::test::assert_eq_raster_operator_res_and_list_of_tiles_u8;
+
+    use super::*;
+    use gdal_sys::{CPLFormCIFilename, VSIGetCanonicalFilename};
+    use geo::k_nearest_concave_hull;
+    use geoengine_datatypes::hashmap;
+    use geoengine_datatypes::primitives::{CacheHint, DateTimeParseFormat, TimeInterval};
+    use geoengine_datatypes::raster::{
+        Grid2D, RasterTile2D, TileInformation, TilesEqualIgnoringCacheHint,
+    };
+    use geoengine_datatypes::util::test::TestDefault;
+    use httptest::matchers::key;
+    use serde::de::Expected;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::str::FromStr;
+    use std::sync::LazyLock;
+    use tempfile::tempdir;
+
+    use tokio::sync::{OnceCell, RwLock};
+
+    pub fn test_key(idx: u32) -> Arc<CacheKey> {
+        Arc::new((
+            // TODO (mid): Not sure what this looks like in reality
+            CanonicOperatorName::new_unchecked(&json!({ "type": "CacheOperator", "params": {} })),
+            idx,
+            TimeInterval::default(),
+            [idx as isize, 0].into(),
+        ))
+    }
+
+    fn test_tile_u8(band: u32) -> TypedRasterTile2D {
+        let values: Vec<u8> = (0_u8..64).collect();
+        let raster_tile = RasterTile2D::new_with_tile_info(
+            TimeInterval::default(),
+            TileInformation {
+                global_geo_transform: TestDefault::test_default(),
+                global_tile_position: [0, 0].into(),
+                tile_size_in_pixels: [8, 8].into(),
+            },
+            band,
+            Grid2D::new([8, 8].into(), values)
+                .expect("it to be a valid Grid2D")
+                .into(),
+            CacheHint::default(),
+        );
+
+        TypedRasterTile2D::U8(raster_tile)
+    }
+
+    fn initialize_test_zarrs_cache_dir() -> tempfile::TempDir {
+        let temp_dir = tempdir().expect("it to work");
+        let () = set_raster_cache_dir(temp_dir.path().to_path_buf()).expect("it to work");
+        temp_dir
+    }
+
+    #[tokio::test]
+    async fn arrow_ipc_storage_format_store_and_load() {
+        initialize_test_zarrs_cache_dir();
+
+        let band = 0;
+        let key = test_key(band);
+        let tile = test_tile_u8(band);
+        let stored = ArrowIpcStorageFormat::store(
+            tile.clone(),
+            key,
+            todo!("figure out where the raster result descriptor lives"),
+        )
+        .await
+        .expect("it should be possible to store the tile.");
+
+        let path = stored.path.clone();
+        let metadata = fs::metadata(&path).expect(&format!("File should be at {path:#?}"));
+        let byte_size = stored
+            .byte_size()
+            .await
+            .expect("it should be possible to get the stored byte size.");
+        assert_eq!(byte_size as u64, metadata.len());
+
+        let loaded = stored
+            .load()
+            .await
+            .expect(&format!("File '{path:#?}' should loadable as a RasterTile"));
+        match loaded {
+            TypedRasterTile2D::U8(loaded_tile) => {
+                if let TypedRasterTile2D::U8(original_tile) = tile {
+                    assert_eq!(
+                        loaded_tile, original_tile,
+                        "Tiles are not the same after on-disk cache"
+                    );
+                } else {
+                    panic!("expected u8 tile");
+                }
+            }
+            _ => panic!("expected u8 tile"),
+        }
+    }
+
+    #[tokio::test]
+    async fn on_disk_storage_insert_and_get_with_arrow_ipc() {
+        initialize_test_zarrs_cache_dir();
+
+        let store = OnDiskStore {
+            cache: RwLock::new(HashMap::new()),
+            eviction_strategy: RwLock::new(FifoEvictionStrategy::new(usize::MAX)),
+        };
+
+        let band = 1;
+        let key = test_key(band);
+        let tile = test_tile_u8(band);
+        let expected_tile = tile.clone();
+
+        store
+            .insert(
+                key.clone(),
+                tile,
+                todo!("figure out how to aquire the result descriptor"),
+            )
+            .await
+            .expect("it should be possible to insert the tile into the OnDiskStorage.");
+        let stored: Arc<ArrowIpcStorageFormat> = store
+            .get(&key)
+            .await
+            .expect("it should be present")
+            .expect("it should be possible to extract the tile-ref from the cache.");
+        let loaded = stored
+            .load()
+            .await
+            .expect("it should be possible to load the tile via the tile-ref.");
+
+        match loaded {
+            TypedRasterTile2D::U8(loaded_tile) => {
+                if let TypedRasterTile2D::U8(original_tile) = expected_tile {
+                    assert_eq!(loaded_tile, original_tile, "Tiles differ after cache.");
+                } else {
+                    panic!("expected u8 tile");
+                }
+            }
+            _ => panic!("expected u8 tile"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn zarrs_storage_format_store_and_load() {
+        let temp_dir = initialize_test_zarrs_cache_dir();
+
+        let band = 0;
+        let key = test_key(band);
+        let tile = test_tile_u8(band);
+        let stored = ZarrsStorageFormat::store(
+            tile.clone(),
+            key,
+            todo!("figure out how to get the raster result descriptor"),
+        )
+        .await
+        .expect("it should be possible to store the tile.");
+
+        {
+            // check if the zarrs thing is there
+            let full_path = temp_dir.path().join(PathBuf::from("zarr_cache"));
+            let _ = fs::metadata(&full_path).expect(&format!("File should be at {full_path:#?}"));
+        }
+
+        let loaded = stored
+            .load()
+            .await
+            .expect(&format!("File should loadable as a TypedRasterTile"));
+
+        match loaded {
+            TypedRasterTile2D::U8(loaded_tile) => {
+                if let TypedRasterTile2D::U8(original_tile) = tile {
+                    assert!(
+                        loaded_tile.tiles_equal_ignoring_cache_hint(&original_tile),
+                        "Tiles are not the same after on-disk zarrs cache\nLoaded: {:#?}\nOrig: {:#?}",
+                        loaded_tile,
+                        original_tile
+                    );
+                } else {
+                    panic!("expected u8 tile");
+                }
+            }
+            _ => panic!("expected u8 tile"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn zarrs_storage_format_insert_and_get() {
+        initialize_test_zarrs_cache_dir();
+
+        let store = OnDiskStore {
+            cache: RwLock::new(HashMap::new()),
+            eviction_strategy: RwLock::new(FifoEvictionStrategy::new(usize::MAX)),
+        };
+
+        let band = 1;
+        let key = test_key(band);
+        let tile = test_tile_u8(band);
+        let expected_tile = tile.clone();
+
+        store
+            .insert(
+                key.clone(),
+                tile,
+                todo!("figure out how to get the raster result descriptor"),
+            )
+            .await
+            .expect("it should be possible to insert the tile into the OnDiskStorage.");
+        let stored: Arc<ZarrsStorageFormat> = store
+            .get(&key)
+            .await
+            .expect("it should be present") // TODO (crit): figure out a better way
+            .expect("it should be possible to extract the tile-ref from the cache.");
+        let loaded = stored
+            .load()
+            .await
+            .expect("it should be possible to load the tile via the tile-ref.");
+
+        match loaded {
+            TypedRasterTile2D::U8(loaded_tile) => {
+                if let TypedRasterTile2D::U8(original_tile) = expected_tile {
+                    assert!(
+                        loaded_tile.tiles_equal_ignoring_cache_hint(&original_tile),
+                        "Tiles are not the same after on-disk zarrs cache\nLoaded: {:#?}\nOrig: {:#?}",
+                        loaded_tile,
+                        original_tile
+                    );
+                } else {
+                    panic!("expected u8 tile");
+                }
+            }
+            _ => panic!("expected u8 tile"),
+        }
+    }
+
+    #[test]
+    fn time_interval_to_iso_test() {
+        let time = TimeInterval::new(0, 2).expect("it should be valid");
+        let expected = "1970-01-01T00-00-00Z_to_1970-01-01T00-00-00.002Z";
+        let actual = time_interval_to_path_safe_iso(&time);
+        assert_eq!(expected, actual);
+    }
+}
