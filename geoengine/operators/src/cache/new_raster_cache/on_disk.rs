@@ -68,7 +68,7 @@ const GLOBAL_GEOTRANSFORM_KEY: &'static str = "global_geo_transform";
 
 pub struct OnDiskStore<SF: StorageFormat, ES: EvictionStrategy> {
     pub cache: RwLock<HashMap<Arc<CacheKey>, Arc<SF>>>,
-    pub eviction_strategy: RwLock<ES>,
+    pub eviction_strategy: Arc<RwLock<ES>>,
 }
 
 pub struct PendingFile<SF: OnDiskStorageFormat> {
@@ -155,28 +155,32 @@ where
         without actually being inserted in the cache / index later on.
         Otherwise we will have orphaned files.
         */
+        let hint = cache_hint(&tile);
         let stored_tile = SF::write(tile, key.clone(), raster_result_descriptor).await?;
         let required_space = stored_tile.byte_size().await?;
 
         let mut cache = self.cache.write().await;
         let mut eviction_strategy = self.eviction_strategy.write().await;
-        let eviction_plan = eviction_strategy.plan_eviction(required_space, usize::MAX, |key| {
-            cache.get(key).map_or(true, |sf| Arc::strong_count(sf) > 1)
+        let mut current_size = 0;
+        for value in cache.values() {
+            current_size += value.byte_size().await?;
+        }
+        let eviction_plan = eviction_strategy.plan_eviction(current_size, required_space, |key| {
+            cache.get(key).is_none_or(|sf| Arc::strong_count(sf) > 1)
         })?;
 
-        if eviction_plan.freed_bytes < required_space {
-            return Err(crate::error::Error::Cache {
-                source: CacheError::Unspecified,
-            });
+        let needed = (current_size + required_space).saturating_sub(eviction_strategy.capacity());
+        if eviction_plan.freed_bytes < needed {
+            return Err(CacheError::NotEnoughSpaceInCache.into());
         }
 
-        for key in eviction_plan.keys_to_remove {
-            cache.remove(&key);
-            eviction_strategy.record_removal(&key);
+        for evict_key in eviction_plan.keys_to_remove {
+            cache.remove(&evict_key);
+            eviction_strategy.record_removal(&evict_key);
         }
 
-        let cache_obj = stored_tile.commit();
-        cache.insert(key, Arc::new(cache_obj));
+        eviction_strategy.record_access(&key, required_space, hint);
+        cache.insert(key, Arc::new(stored_tile.commit()));
         Ok(())
     }
 }
@@ -294,7 +298,7 @@ mod tests {
             Grid2D::new([8, 8].into(), values)
                 .expect("it to be a valid Grid2D")
                 .into(),
-            CacheHint::default(),
+            CacheHint::max_duration(),
         );
 
         TypedRasterTile2D::U8(raster_tile)
@@ -354,7 +358,7 @@ mod tests {
 
         let store = OnDiskStore {
             cache: RwLock::new(HashMap::new()),
-            eviction_strategy: RwLock::new(FifoEvictionStrategy::new(usize::MAX)),
+            eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(usize::MAX))),
         };
 
         let band = 1;
@@ -441,7 +445,7 @@ mod tests {
 
         let store = OnDiskStore {
             cache: RwLock::new(HashMap::new()),
-            eviction_strategy: RwLock::new(FifoEvictionStrategy::new(usize::MAX)),
+            eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(usize::MAX))),
         };
 
         let band = 1;

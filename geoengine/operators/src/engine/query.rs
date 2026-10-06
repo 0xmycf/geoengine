@@ -1,6 +1,7 @@
 use std::{
+    collections::HashMap,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
@@ -68,7 +69,10 @@ pub trait QueryContext: Send + Sync + GdalProcessPoolAccess {
 
     fn cache(&self) -> Option<Arc<SharedCache>>;
 
-    fn new_raster_cache(&self) -> Option<Arc<crate::cache::new_raster_cache::NewRasterCacheEnum>> {
+    fn new_raster_cache(
+        &self,
+        _kind: crate::cache::new_raster_cache::CacheKind,
+    ) -> Option<Arc<crate::cache::new_raster_cache::NewRasterCacheEnum>> {
         None
     }
 
@@ -193,8 +197,12 @@ pub struct MockQueryContext {
     pub cache: Option<Arc<SharedCache>>,
     pub quota_tracking: Option<QuotaTracking>,
     pub quota_checker: Option<QuotaChecker>,
-    pub new_raster_cache: Option<Arc<crate::cache::new_raster_cache::NewRasterCacheEnum>>,
-
+    new_raster_caches: Mutex<
+        HashMap<
+            crate::cache::new_raster_cache::CacheKind,
+            Arc<crate::cache::new_raster_cache::NewRasterCacheEnum>,
+        >,
+    >,
     pub abort_registration: QueryAbortRegistration,
     pub abort_trigger: Option<QueryAbortTrigger>,
 
@@ -217,9 +225,7 @@ impl MockQueryContext {
             cache: None,
             quota_checker: None,
             quota_tracking: None,
-            new_raster_cache: Some(Arc::new(
-                crate::cache::new_raster_cache::NewRasterCacheEnum::new_fifo(1_073_741_824),
-            )),
+            new_raster_caches: Mutex::new(HashMap::new()),
             abort_registration,
             abort_trigger: Some(abort_trigger),
             gdal_process_pool,
@@ -244,9 +250,7 @@ impl MockQueryContext {
             cache,
             quota_checker,
             quota_tracking,
-            new_raster_cache: Some(Arc::new(
-                crate::cache::new_raster_cache::NewRasterCacheEnum::new_fifo(1_073_741_824),
-            )),
+            new_raster_caches: Mutex::new(HashMap::new()),
             abort_registration,
             abort_trigger: Some(abort_trigger),
             gdal_process_pool,
@@ -270,9 +274,7 @@ impl MockQueryContext {
             cache: None,
             quota_checker: None,
             quota_tracking: None,
-            new_raster_cache: Some(Arc::new(
-                crate::cache::new_raster_cache::NewRasterCacheEnum::new_fifo(1_073_741_824),
-            )),
+            new_raster_caches: Mutex::new(HashMap::new()),
             abort_registration,
             abort_trigger: Some(abort_trigger),
         }
@@ -318,8 +320,34 @@ impl QueryContext for MockQueryContext {
         self.cache.clone()
     }
 
-    fn new_raster_cache(&self) -> Option<Arc<crate::cache::new_raster_cache::NewRasterCacheEnum>> {
-        self.new_raster_cache.clone()
+    fn new_raster_cache(
+        &self,
+        kind: crate::cache::new_raster_cache::CacheKind,
+    ) -> Option<Arc<crate::cache::new_raster_cache::NewRasterCacheEnum>> {
+        use crate::cache::new_raster_cache::{EvicionKind, NewRasterCacheEnum, StorageFormatEnum};
+
+        let mut caches = self
+            .new_raster_caches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Some(Arc::clone(caches.entry(kind).or_insert_with(|| {
+            let cache = if let Some(storage) = kind.in_memory {
+                match storage.0 {
+                    StorageFormatEnum::Zarr => {
+                        crate::cache::new_raster_cache::test_default_fifo_zarr()
+                    }
+                    StorageFormatEnum::ArrowIpc => {
+                        crate::cache::new_raster_cache::test_default_fifo_arrow_ipc()
+                    }
+                }
+            } else {
+                match kind.eviction_kind {
+                    EvicionKind::Fifo => NewRasterCacheEnum::new_fifo(kind.capacity_bytes),
+                    EvicionKind::Lru => NewRasterCacheEnum::new_lru(kind.capacity_bytes),
+                }
+            };
+            Arc::new(cache)
+        })))
     }
 }
 
@@ -332,6 +360,10 @@ impl GdalProcessPoolAccess for MockQueryContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::new_raster_cache::{
+        CacheKind, EvicionKind, NewRasterCacheEnum, StorageFormatEnum,
+    };
+    use crate::engine::MockExecutionContext;
     use futures::stream::{self, StreamExt};
 
     #[tokio::test]
@@ -391,5 +423,51 @@ mod tests {
             Some(Err(error::Error::QueryCanceled))
         ));
         assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn mock_context_reuses_only_matching_raster_caches() {
+        let ctx =
+            MockExecutionContext::test_default().mock_query_context(ChunkByteSize::test_default());
+        let fifo_kind = CacheKind::new_in_memory(EvicionKind::Fifo);
+        let fifo = ctx.new_raster_cache(fifo_kind).unwrap();
+        assert!(Arc::ptr_eq(
+            &fifo,
+            &ctx.new_raster_cache(fifo_kind).unwrap()
+        ));
+        assert!(matches!(
+            &*fifo,
+            NewRasterCacheEnum::InMemoryCompressedRasterTile2DFifo(_)
+        ));
+
+        let lru = ctx
+            .new_raster_cache(CacheKind::new_in_memory(EvicionKind::Lru))
+            .unwrap();
+        assert!(!Arc::ptr_eq(&fifo, &lru));
+        assert!(matches!(
+            &*lru,
+            NewRasterCacheEnum::InMemoryCompressedRasterTile2DLru(_)
+        ));
+
+        let zarr_kind = CacheKind::new_on_disk(StorageFormatEnum::Zarr);
+        let zarr = ctx.new_raster_cache(zarr_kind).unwrap();
+        assert!(Arc::ptr_eq(
+            &zarr,
+            &ctx.new_raster_cache(zarr_kind).unwrap()
+        ));
+        assert!(matches!(&*zarr, NewRasterCacheEnum::OnDiskMockFifoZarr(_)));
+
+        let ipc = ctx
+            .new_raster_cache(CacheKind::new_on_disk(StorageFormatEnum::ArrowIpc))
+            .unwrap();
+        assert!(!Arc::ptr_eq(&ipc, &zarr));
+        assert!(matches!(&*ipc, NewRasterCacheEnum::OnDiskMockFifoIpc(_)));
+
+        let mut other_capacity = fifo_kind;
+        other_capacity.capacity_bytes += 1;
+        assert!(!Arc::ptr_eq(
+            &fifo,
+            &ctx.new_raster_cache(other_capacity).unwrap()
+        ));
     }
 }

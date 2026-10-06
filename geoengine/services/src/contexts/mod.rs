@@ -241,7 +241,11 @@ impl QueryContext for QueryContextImpl {
         self.cache.clone()
     }
 
-    fn new_raster_cache(&self) -> Option<Arc<NewRasterCacheEnum>> {
+    fn new_raster_cache(
+        &self,
+        _kind: geoengine_operators::cache::new_raster_cache::CacheKind,
+    ) -> Option<Arc<geoengine_operators::cache::new_raster_cache::NewRasterCacheEnum>> {
+        // TODO (mid): issue(26DD1607-F42F-4750-AF07-1A5FC761CE12)
         self.new_raster_cache.clone()
     }
 }

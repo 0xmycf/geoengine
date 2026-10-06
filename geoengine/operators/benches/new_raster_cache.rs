@@ -9,9 +9,9 @@ use geoengine_datatypes::{
     util::test::TestDefault,
 };
 use geoengine_operators::cache::new_raster_cache::{
-    NewRasterCacheEnum, RasterCacheOperator, test_default_fifo_arrow_ipc, test_default_fifo_zarr,
+    CacheKind, RasterCacheOperator, StorageFormatEnum,
 };
-use geoengine_operators::engine::{BoxRasterQueryProcessor, MockQueryContext};
+use geoengine_operators::engine::{BoxRasterQueryProcessor, MockQueryContext, QueryContext};
 use geoengine_operators::{
     engine::{
         ChunkByteSize, InitializedRasterOperator, MockExecutionContext, QueryProcessor,
@@ -36,10 +36,10 @@ enum CacheOperatorType {
     Zarrs,
 }
 
-fn new_raster_cache_enum(cache: CacheOperatorType) -> NewRasterCacheEnum {
+fn cache_kind(cache: CacheOperatorType) -> CacheKind {
     match cache {
-        CacheOperatorType::ArrowIPC => test_default_fifo_arrow_ipc(),
-        CacheOperatorType::Zarrs => test_default_fifo_zarr(),
+        CacheOperatorType::ArrowIPC => CacheKind::new_on_disk(StorageFormatEnum::ArrowIpc),
+        CacheOperatorType::Zarrs => CacheKind::new_on_disk(StorageFormatEnum::Zarr),
     }
 }
 
@@ -71,18 +71,16 @@ async fn setup(
     .unwrap();
 
     if let Some(cache_op_type) = cache {
-        let cached_op = RasterCacheOperator::wrap_operator(operator);
-
-        // TODO (crit): need to rewrite this so it fits in with the new structure (after rebase)
-        let tile_cache = Arc::new(new_raster_cache_enum(cache_op_type));
+        let kind = cache_kind(cache_op_type);
+        let cached_op = RasterCacheOperator::wrap_operator_with_cache_kind(operator, kind);
 
         let query_ctx = exe_ctx.mock_query_context_with_query_extensions(
             ChunkByteSize::test_default(),
             None,
-            // Some(tile_cache),
             None,
             None,
         );
+        query_ctx.new_raster_cache(kind).expect("cache should be available");
 
         let processor = cached_op.query_processor().unwrap().get_u8().unwrap();
 

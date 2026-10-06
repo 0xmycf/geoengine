@@ -123,7 +123,7 @@ where
             pool,
             volumes: Default::default(),
             tile_cache: Arc::new(SharedCache::test_default()),
-            new_raster_cache: None, // TODO (crit): why is this here and why is it none. How is one supposed to use it?
+            new_raster_cache: None,
             default_cache_ttl: CacheTtlSeconds::new(0),
             provider_registry,
             gdal_process_pool,

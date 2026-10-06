@@ -47,12 +47,51 @@ pub enum NewRasterCacheEnum {
     InMemoryCompressedRasterTile2DLru(
         NewRasterCache<InMemoryCacheStore<TypedCompressedRasterTile2D, LruEvictionStrategy>>,
     ),
-    // TODO (crit): check the whole enum iff this is even what we want or not
-    // OnDiskMockFifo(
-    //     NewRasterCache<MockOnDiskCacheStore<MockOnDiskStorageFormat, FifoEvictionStrategy>>,
-    // ),
-    OnDiskMockFifoIpc(NewRasterCache<OnDiskStore<ArrowIpcStorageFormat, FifoEvictionStrategy>>),
-    OnDiskMockFifoZarr(NewRasterCache<OnDiskStore<ZarrsStorageFormat, FifoEvictionStrategy>>),
+    OnDiskMockFifoIpc(
+        //
+        NewRasterCache<OnDiskStore<ArrowIpcStorageFormat, FifoEvictionStrategy>>,
+    ),
+    OnDiskMockFifoZarr(
+        //
+        NewRasterCache<OnDiskStore<ZarrsStorageFormat, FifoEvictionStrategy>>,
+    ),
+}
+
+// TODO (mid): this is just temporary, until I decide on a good design -- issue(26DD1607-F42F-4750-AF07-1A5FC761CE12)
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CacheKind {
+    pub in_memory: Option<DiskStorage>,
+    pub eviction_kind: EvicionKind,
+    pub capacity_bytes: usize,
+}
+
+impl CacheKind {
+    pub fn new_in_memory(eviction_kind: EvicionKind) -> Self {
+        Self {
+            in_memory: None,
+            eviction_kind,
+            capacity_bytes: 1_073_741_824,
+        }
+    }
+
+    pub fn new_on_disk(storage_format: StorageFormatEnum) -> Self {
+        let in_memory = Some(DiskStorage(storage_format));
+        Self {
+            in_memory,
+            eviction_kind: EvicionKind::Fifo,
+            capacity_bytes: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DiskStorage(pub StorageFormatEnum);
+
+// TODO (mid): this is just temporary, until I decide on a good design -- issue(26DD1607-F42F-4750-AF07-1A5FC761CE12)
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EvicionKind {
+    Lru,
+    Fifo,
 }
 
 impl TestDefault for NewRasterCacheEnum {
@@ -60,9 +99,6 @@ impl TestDefault for NewRasterCacheEnum {
         Self::InMemoryCompressedRasterTile2DFifo(NewRasterCache {
             // TODO (crit): Make sure that the tests expect exactly this! Also is this sensible?
             store: InMemoryCacheStore {
-                // +++++++ rwnvztyr 590846a4 "fix: make zarrs array rezisable" (rebased revision)
-                // Self::OnDiskMockFifoZarr(NewRasterCache { // TODO (crit): Rework this for the tests
-                //     store: OnDiskStore {
                 cache: RwLock::new(HashMap::new()),
                 eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(8_589_934_592))),
                 total_size: Arc::new(AtomicUsize::new(0)),
@@ -71,26 +107,18 @@ impl TestDefault for NewRasterCacheEnum {
     }
 }
 
+// The cache kind selects a storage format; stored tiles themselves are held by the cache.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StorageFormatEnum {
-    // MockOnDisk(),
-    Zarr(Arc<ZarrsStorageFormat>),
-    ArrowIpc(Arc<ArrowIpcStorageFormat>),
-}
-
-impl StorageFormatEnum {
-    async fn load(&self) -> Result<TypedRasterTile2D> {
-        match self {
-            StorageFormatEnum::Zarr(sf) => sf.load().await,
-            StorageFormatEnum::ArrowIpc(sf) => sf.load().await,
-        }
-    }
+    Zarr,
+    ArrowIpc,
 }
 
 pub fn test_default_fifo_zarr() -> NewRasterCacheEnum {
     NewRasterCacheEnum::OnDiskMockFifoZarr(NewRasterCache {
         store: OnDiskStore {
             cache: RwLock::new(HashMap::new()),
-            eviction_strategy: RwLock::new(FifoEvictionStrategy::new(8_589_934_592)),
+            eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(8_589_934_592))),
         },
     })
 }
@@ -99,7 +127,7 @@ pub fn test_default_fifo_arrow_ipc() -> NewRasterCacheEnum {
     NewRasterCacheEnum::OnDiskMockFifoIpc(NewRasterCache {
         store: OnDiskStore {
             cache: RwLock::new(HashMap::new()),
-            eviction_strategy: RwLock::new(FifoEvictionStrategy::new(8_589_934_592)),
+            eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(8_589_934_592))),
         },
     })
 }
@@ -149,6 +177,25 @@ impl NewRasterCacheEnum {
         }
     }
 
+    async fn get_tile(&self, key: &CacheKey) -> Result<Option<TypedRasterTile2D>> {
+        match self {
+            Self::InMemoryCompressedRasterTile2DFifo(_) | Self::InMemoryCompressedRasterTile2DLru(_) => {
+                match self.get(key).await? {
+                    Some(entry) => Ok(Some(entry.load().await?)),
+                    None => Ok(None),
+                }
+            }
+            Self::OnDiskMockFifoIpc(cache) => match cache.store.get(key).await? {
+                Some(entry) => Ok(Some(entry.load().await?)),
+                None => Ok(None),
+            },
+            Self::OnDiskMockFifoZarr(cache) => match cache.store.get(key).await? {
+                Some(entry) => Ok(Some(entry.load().await?)),
+                None => Ok(None),
+            },
+        }
+    }
+
     async fn insert(
         &self,
         key: CacheKey,
@@ -163,21 +210,13 @@ impl NewRasterCacheEnum {
             NewRasterCacheEnum::InMemoryCompressedRasterTile2DLru(cache) => {
                 cache.store.insert(key, tile, raster_properties).await
             }
-            NewRasterCacheEnum::OnDiskMockFifoIpc(_cache) => {
-                todo!("TODO (crit): see above")
+            NewRasterCacheEnum::OnDiskMockFifoIpc(cache) => {
+                cache.store.insert(key, tile, raster_properties).await
             }
-            NewRasterCacheEnum::OnDiskMockFifoZarr(_cache) => {
-                todo!("TODO (crit): see above")
+            NewRasterCacheEnum::OnDiskMockFifoZarr(cache) => {
+                cache.store.insert(key, tile, raster_properties).await
             }
         }
-        // match self {
-        //     NewRasterCacheEnum::OnDiskMockFifoZarr(cache) => {
-        //         cache.store.insert(key, tile, raster_properties).await
-        //     }
-        //     NewRasterCacheEnum::OnDiskMockFifoIpc(cache) => {
-        //         cache.store.insert(key, tile, raster_properties).await
-        //     }
-        // }
     }
 
     pub fn byte_size(&self) -> usize {
@@ -742,7 +781,7 @@ impl StorageFormat for TypedCompressedRasterTile2D {
     async fn store(
         tile: TypedRasterTile2D,
         _key: Arc<CacheKey>,
-        result_descriptor: &RasterResultDescriptor,
+        result_descriptor: &RasterResultDescriptor, // TODO (crit): check if this is intentional
     ) -> Result<Self> {
         tokio::task::spawn_blocking(move || match tile {
             TypedRasterTile2D::I8(tile) => Ok(TypedCompressedRasterTile2D::I8(
@@ -965,6 +1004,7 @@ where
     Source: InitializedRasterOperator,
 {
     source: Source,
+    cache_kind: CacheKind,
 }
 
 impl<Source> RasterCacheOperator<Source>
@@ -972,7 +1012,11 @@ where
     Source: InitializedRasterOperator,
 {
     pub fn wrap_operator(source: Source) -> RasterCacheOperator<Source> {
-        Self { source }
+        Self::wrap_operator_with_cache_kind(source, CacheKind::new_in_memory(EvicionKind::Fifo))
+    }
+
+    pub fn wrap_operator_with_cache_kind(source: Source, cache_kind: CacheKind) -> RasterCacheOperator<Source> {
+        Self { source, cache_kind }
     }
 }
 
@@ -994,34 +1038,34 @@ where
 
         Ok(match source_qp {
             TypedRasterQueryProcessor::U8(s) => TypedRasterQueryProcessor::U8(
-                RasterCacheQueryProcessor::boxed_new(s, self.canonic_name()),
+                RasterCacheQueryProcessor::boxed_new(s, self.canonic_name(), self.cache_kind),
             ),
             TypedRasterQueryProcessor::U16(s) => TypedRasterQueryProcessor::U16(
-                RasterCacheQueryProcessor::boxed_new(s, self.canonic_name()),
+                RasterCacheQueryProcessor::boxed_new(s, self.canonic_name(), self.cache_kind),
             ),
             TypedRasterQueryProcessor::U32(s) => TypedRasterQueryProcessor::U32(
-                RasterCacheQueryProcessor::boxed_new(s, self.canonic_name()),
+                RasterCacheQueryProcessor::boxed_new(s, self.canonic_name(), self.cache_kind),
             ),
             TypedRasterQueryProcessor::U64(s) => TypedRasterQueryProcessor::U64(
-                RasterCacheQueryProcessor::boxed_new(s, self.canonic_name()),
+                RasterCacheQueryProcessor::boxed_new(s, self.canonic_name(), self.cache_kind),
             ),
             TypedRasterQueryProcessor::I8(s) => TypedRasterQueryProcessor::I8(
-                RasterCacheQueryProcessor::boxed_new(s, self.canonic_name()),
+                RasterCacheQueryProcessor::boxed_new(s, self.canonic_name(), self.cache_kind),
             ),
             TypedRasterQueryProcessor::I16(s) => TypedRasterQueryProcessor::I16(
-                RasterCacheQueryProcessor::boxed_new(s, self.canonic_name()),
+                RasterCacheQueryProcessor::boxed_new(s, self.canonic_name(), self.cache_kind),
             ),
             TypedRasterQueryProcessor::I32(s) => TypedRasterQueryProcessor::I32(
-                RasterCacheQueryProcessor::boxed_new(s, self.canonic_name()),
+                RasterCacheQueryProcessor::boxed_new(s, self.canonic_name(), self.cache_kind),
             ),
             TypedRasterQueryProcessor::I64(s) => TypedRasterQueryProcessor::I64(
-                RasterCacheQueryProcessor::boxed_new(s, self.canonic_name()),
+                RasterCacheQueryProcessor::boxed_new(s, self.canonic_name(), self.cache_kind),
             ),
             TypedRasterQueryProcessor::F32(s) => TypedRasterQueryProcessor::F32(
-                RasterCacheQueryProcessor::boxed_new(s, self.canonic_name()),
+                RasterCacheQueryProcessor::boxed_new(s, self.canonic_name(), self.cache_kind),
             ),
             TypedRasterQueryProcessor::F64(s) => TypedRasterQueryProcessor::F64(
-                RasterCacheQueryProcessor::boxed_new(s, self.canonic_name()),
+                RasterCacheQueryProcessor::boxed_new(s, self.canonic_name(), self.cache_kind),
             ),
         })
     }
@@ -1052,6 +1096,7 @@ where
 {
     source: BoxRasterQueryProcessor<T>,
     canonic_operator_name: CanonicOperatorName,
+    cache_kind: CacheKind,
 }
 impl<T> RasterCacheQueryProcessor<T>
 where
@@ -1060,10 +1105,12 @@ where
     fn boxed_new(
         source: BoxRasterQueryProcessor<T>,
         canonic_operator_name: CanonicOperatorName,
+        cache_kind: CacheKind,
     ) -> BoxRasterQueryProcessor<T> {
         Box::new(Self {
             source,
             canonic_operator_name,
+            cache_kind,
         })
     }
 
@@ -1109,19 +1156,14 @@ where
                     );
 
                     let cache_store = ctx
-                        .new_raster_cache()
+                        .new_raster_cache(self.cache_kind)
                         .expect("Cache should have been created for this operator");
 
-                    match cache_store.get(&key).await {
+                    match cache_store.get_tile(&key).await {
                         Err(err) => Some((Err(err), (work, idx + 1))),
                         Ok(Some(stored_tile)) => {
                             tracing::trace!("Cache HIT for tile {:?}", key);
-                            let tile = stored_tile.load().await;
-
-                            let tile: Result<RasterTile2D<T>> = match tile {
-                                Ok(tile) => T::map_enum_to_tile(tile),
-                                Err(err) => Err(err)
-                            };
+                            let tile = T::map_enum_to_tile(stored_tile);
 
                             Some((
                                 tile,
@@ -1509,7 +1551,7 @@ mod tests {
             "the cache and the held reference should both own an Arc to the entry"
         );
 
-        // TODO (critc): after rebase
+        // TODO (crit): after rebase
         assert!(
             cache
                 .insert(
@@ -1528,7 +1570,7 @@ mod tests {
 
         drop(pinned);
 
-        // TODO (critc): after rebase
+        // TODO (crit): after rebase
         cache
             .insert(key_b.clone(), tile_b, todo!("Raster result descriptor"))
             .await
@@ -1869,7 +1911,7 @@ mod tests {
 
         // Verify the tile is actually in the cache after the miss
         let tile_cache = query_ctx
-            .new_raster_cache()
+            .new_raster_cache(CacheKind::new_in_memory(EvicionKind::Fifo))
             .expect("cache should be available in query context");
         let cached_compressed = tile_cache
             .get(&cache_key)
@@ -1921,7 +1963,7 @@ mod tests {
         );
 
         let tile_cache = query_ctx
-            .new_raster_cache()
+            .new_raster_cache(CacheKind::new_in_memory(EvicionKind::Fifo))
             .expect("cache should be available in query context");
         // TODO (crit): after rebase
         tile_cache

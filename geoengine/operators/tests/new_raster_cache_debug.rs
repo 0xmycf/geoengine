@@ -5,7 +5,9 @@ use geoengine_datatypes::{
     raster::{GridBoundingBox2D, RasterTile2D, TilesEqualIgnoringCacheHint},
     util::test::TestDefault,
 };
-use geoengine_operators::cache::new_raster_cache::{RasterCacheOperator, test_default_fifo_zarr};
+use geoengine_operators::cache::new_raster_cache::{
+    CacheKind, RasterCacheOperator, StorageFormat, StorageFormatEnum, test_default_fifo_zarr,
+};
 use geoengine_operators::engine::{
     ChunkByteSize, InitializedRasterOperator, MockExecutionContext, MockQueryContext,
     QueryProcessor, RasterOperator, SingleRasterSource, WorkflowOperatorPath,
@@ -17,7 +19,6 @@ use geoengine_operators::source::{GdalSource, GdalSourceParameters};
 use geoengine_operators::util::Result;
 use geoengine_operators::util::gdal::add_ndvi_dataset;
 use std::str::FromStr;
-use std::sync::Arc;
 
 fn benchmark_query() -> RasterQueryRectangle {
     RasterQueryRectangle::new(
@@ -109,12 +110,14 @@ async fn zarr_cache_returns_same_tiles_as_benchmark_query() {
     .await
     .expect("operator should initialize");
 
-    let cached_operator = RasterCacheOperator::wrap_operator(cached_source_operator);
+    let cached_operator = RasterCacheOperator::wrap_operator_with_cache_kind(
+        cached_source_operator,
+        CacheKind::new_on_disk(StorageFormatEnum::Zarr),
+    );
 
     let cached_query_ctx = cached_ctx.mock_query_context_with_query_extensions(
         ChunkByteSize::test_default(),
         None,
-        // Some(Arc::new(test_default_fifo_zarr())), // TODO (crit): make this work again
         None,
         None,
     );

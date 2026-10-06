@@ -251,7 +251,7 @@ impl ZarrsArrayAccess {
         let band = paths.band();
         let global_geo_transform = self.read_global_geo_transform();
         // TODO (high): what should I use here? What is the proper default value for these datachunks that are retreived from the on-disk cache?
-        let cache_hint = CacheHint::default();
+        let cache_hint = CacheHint::max_duration(); // TODO (crit): {27B344EE-600E-448B-982D-8A7D6DDA2E30}
 
         macro_rules! dispatch {
             ($variant:ident, $ty:ty) => {{
