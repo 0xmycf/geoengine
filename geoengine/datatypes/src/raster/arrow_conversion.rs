@@ -301,10 +301,17 @@ fn raster_tile_2d_to_arrow_record_batch_impl<P: Pixel>(
     spatial_ref: Option<SpatialReferenceOption>,
     include_ipc_metadata: bool,
 ) -> Result<RecordBatch> {
+    // IPC preserves tile_position, so it must preserve the global transform too.
+    // Exports omit that position and instead carry a tile-local transform.
+    let geo_transform = if include_ipc_metadata {
+        tile.global_geo_transform
+    } else {
+        tile.tile_geo_transform()
+    };
     let mut metadata: HashMap<String, String> = [
         (
             GEO_TRANSFORM_KEY.to_string(),
-            serde_json::to_string(&tile.tile_geo_transform()).unwrap_or_default(),
+            serde_json::to_string(&geo_transform).unwrap_or_default(),
         ),
         (
             X_SIZE_KEY.to_string(),
@@ -444,7 +451,7 @@ mod tests {
     use super::*;
     use crate::{
         primitives::{CacheHint, TimeInterval},
-        raster::{EmptyGrid2D, GridIndexAccessMut, MaskedGrid2D, TileInformation},
+        raster::{EmptyGrid2D, GridIndexAccessMut, MaskedGrid2D, TileInformation, TilesEqualIgnoringCacheHint},
         spatial_reference::SpatialReference,
         util::test::TestDefault,
     };
@@ -659,5 +666,8 @@ mod tests {
 
         assert_eq!(original.properties, restored.properties);
         assert_eq!(original.tile_position, restored.tile_position);
+        assert_eq!(original.tile_geo_transform(), restored.tile_geo_transform());
+        assert!(original.tiles_equal_ignoring_cache_hint(&restored));
+
     }
 }
