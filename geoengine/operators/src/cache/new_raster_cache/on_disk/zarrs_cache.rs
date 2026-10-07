@@ -17,16 +17,18 @@ use chrono::offset;
 #[cfg(test)]
 use futures::executor::block_on;
 use futures::task::UnsafeFutureObj;
+use geo::Coordinate;
 use geoengine_datatypes::{
-    primitives::{CacheHint, DateTimeParseFormat},
+    primitives::{CacheHint, Coordinate2D, DateTimeParseFormat},
     raster::{
-        EmptyGrid, GeoTransform, Grid, Grid2D, GridIdx, GridOrEmpty, GridShapeAccess, GridSize,
-        MaskedGrid2D, RasterDataType, RasterProperties, TilesEqualIgnoringCacheHint, TypedGrid,
-        TypedGrid2D, arrow_ipc_file_to_raster_tile_2d_for_ipc_channel,
+        EmptyGrid, GeoTransform, Grid, Grid2D, GridBounds, GridIdx, GridOrEmpty, GridShapeAccess,
+        GridSize, MaskedGrid2D, RasterDataType, RasterProperties, TilesEqualIgnoringCacheHint,
+        TilingStrategy, TypedGrid, TypedGrid2D, arrow_ipc_file_to_raster_tile_2d_for_ipc_channel,
         raster_tile_2d_to_arrow_ipc_file_for_ipc_channel,
     },
     util::ByteSize,
 };
+use num::ToPrimitive;
 use serde_json::{Value, json};
 use std::sync::RwLock as StdRwLock;
 #[cfg(test)]
@@ -206,6 +208,7 @@ impl ZarrsArrayAccess {
         band: u32,
         global_geo_transform: GeoTransform,
         cache_hint: CacheHint,
+        properties: RasterProperties,
     ) -> Result<RasterTile2D<T>> {
         let raw_data: Vec<T> = self
             .tiles
@@ -214,24 +217,25 @@ impl ZarrsArrayAccess {
         let validity_mask: Vec<bool> = self
             .retreive_validity_mask(chunk_indices)
             .map_err(|source| Error::ZarrArrayError { source })?;
+        let tile_shape = self.single_tile_shape(chunk_indices);
         let data = GridOrEmpty::new_grid(
             MaskedGrid2D::new(
                 Grid::new(
                     // TODO (low): do we care about 32 bit systems at all? <- why is that even relevant?
-                    self.tiles_shape(), /* TODO (mid): check if this is correct */
-                    raw_data,
+                    tile_shape, raw_data,
                 )
                 .expect("it to have the correct shape"),
-                Grid::new(self.tiles_shape(), validity_mask).expect("it to have the correct shape"),
+                Grid::new(tile_shape, validity_mask).expect("it to have the correct shape"),
             )
             .expect("it to be a valid input"),
         );
-        Ok((RasterTile2D::new(
+        Ok((RasterTile2D::new_with_properties(
             time,
             tile_position,
             band,
             global_geo_transform,
             data,
+            properties,
             cache_hint,
         )))
     }
@@ -256,15 +260,20 @@ impl ZarrsArrayAccess {
         macro_rules! dispatch {
             ($variant:ident, $ty:ty) => {{
                 if metadata_chunk.is_no_data {
-                    Ok(TypedRasterTile2D::$variant(RasterTile2D::new(
-                        time,
-                        tile_position,
-                        band,
-                        global_geo_transform,
-                        // TODO (mid): do the tiles actually all have the same shape?
-                        GridOrEmpty::new_empty(EmptyGrid::new(self.tiles_shape())),
-                        cache_hint,
-                    )))
+                    Ok(TypedRasterTile2D::$variant(
+                        RasterTile2D::new_with_properties(
+                            time,
+                            tile_position,
+                            band,
+                            global_geo_transform,
+                            // TODO (mid): do the tiles actually all have the same shape?
+                            GridOrEmpty::new_empty(EmptyGrid::new(
+                                self.single_tile_shape(chunk_indices),
+                            )),
+                            metadata_chunk.properties,
+                            cache_hint,
+                        ),
+                    ))
                 } else {
                     let inner_tile = self.make_tile::<$ty>(
                         chunk_indices,
@@ -273,6 +282,7 @@ impl ZarrsArrayAccess {
                         band,
                         global_geo_transform,
                         cache_hint,
+                        metadata_chunk.properties,
                     )?;
                     Ok(TypedRasterTile2D::$variant(inner_tile))
                 }
@@ -358,9 +368,16 @@ impl ZarrsArrayAccess {
         self.metadata.store_chunk(chunk_indices, data)
     }
 
-    fn tiles_shape(self: &Self) -> GridShape<[usize; 2]> {
-        let shape = self.tiles.shape();
-        [shape[0] as usize, shape[1] as usize].into()
+    fn single_tile_shape(self: &Self, chunk_indices: &[u64]) -> GridShape<[usize; 2]> {
+        let single_tile_shape = self
+            .tiles
+            .chunk_shape(chunk_indices)
+            .expect("it to be present"); // TODO (low): if this can even fail, handle it properly.
+        [
+            single_tile_shape[0].get() as usize,
+            single_tile_shape[1].get() as usize,
+        ]
+        .into()
     }
 
     fn read_global_geo_transform(&self) -> GeoTransform {
@@ -395,7 +412,7 @@ impl ZarrsArrayAccess {
 /// These cannot be infered from other info (i.e. the cache key) and not stored globally (unlike the `global_geo_transform`).
 ///
 /// These chunks are serialised as json and then stored in a special zarrs array under `.../metadata`.
-// The indicies are identical to the indicies of the tile data in the tiles array.
+/// The indicies are identical to the indicies of the tile data in the tiles array.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct ZarrsMetaDataChunk {
     /// Same as tile.tile_position
@@ -438,7 +455,7 @@ fn open_or_create_new_zarrs_array(
     path: &str,
     store: Arc<FilesystemStore>,
     shape: impl Into<ArrayShape>, // The shape of the array
-    chunk_grid_metadata: impl Into<ArrayBuilderChunkGridMetadata>, // Usually the shape of a chunk
+    chunk_shape: impl Into<ArrayBuilderChunkGridMetadata>, // Usually the shape of a chunk
     data_type: zarrs::array::DataType,
     filler_value: impl Into<ArrayBuilderFillValue>,
     attributes: Option<serde_json::Map<String, serde_json::Value>>,
@@ -450,8 +467,7 @@ fn open_or_create_new_zarrs_array(
         Ok(array) => Ok(array),
         Err(_) => {
             let array = {
-                let mut builder =
-                    ArrayBuilder::new(shape, chunk_grid_metadata, data_type, filler_value);
+                let mut builder = ArrayBuilder::new(shape, chunk_shape, data_type, filler_value);
                 if let Some(attrs) = attributes {
                     builder.attributes(attrs);
                 }
@@ -470,22 +486,37 @@ fn build_array_and_prepare_insert(
     store: Arc<FilesystemStore>,
     tile: &TypedRasterTile2D,
     result_descriptor: &RasterResultDescriptor,
-) -> Result<(ZarrsArrayAccess, ZarrsArrayPath), zarrs::array::ArrayCreateError> {
+) -> Result<(ZarrsArrayAccess, ZarrsArrayPath)> {
     let paths = ZarrsArrayPath::from_cache_key(key);
     let attributes = ZarrsArrayAccess::geotransform_to_attributes_map(tile);
 
+    // also the chunk shape
     let tile_shape = {
         let [tile_height, tile_width] =
             call_generic_raster_tile_2d!(tile, tile => tile.grid_shape_array());
         [tile_height as u64, tile_width as u64]
     };
-    let array_shape = {
-        let [one, two] = result_descriptor
-            .spatial_grid_descriptor()
-            .grid_shape()
-            .shape_array;
-        [one as u64, two as u64]
-    };
+    let tile_bounds = raster_tile_bounds(
+        result_descriptor,
+        call_generic_raster_tile_2d!(tile, tile => tile.global_geo_transform),
+        call_generic_raster_tile_2d!(tile, tile => tile.grid_shape_array()).into(),
+    );
+    let mut tile_counts = [0; 2];
+    let mut array_shape = [0; 2];
+    for axis in 0..2 {
+        let count = tile_bounds.max_index().as_slice()[axis] as i128
+            - tile_bounds.min_index().as_slice()[axis] as i128
+            + 1;
+        tile_counts[axis] = u64::try_from(count).map_err(|_| Error::InvalidZarrTileIndex {
+            reason: "array tile count exceeds u64",
+        })?;
+        array_shape[axis] =
+            tile_counts[axis]
+                .checked_mul(tile_shape[axis])
+                .ok_or(Error::InvalidZarrTileIndex {
+                    reason: "array pixel extent exceeds u64",
+                })?;
+    }
 
     let data_arr = open_or_create_new_zarrs_array(
         &paths.tiles(),
@@ -495,7 +526,8 @@ fn build_array_and_prepare_insert(
         zarrs_data_type(tile),
         filler_value(tile),
         Some(attributes),
-    )?;
+    )
+    .map_err(|source| Error::ZarrArrayCreateError { source })?;
 
     let validity_arr = open_or_create_new_zarrs_array(
         &paths.validity(),
@@ -505,17 +537,19 @@ fn build_array_and_prepare_insert(
         data_type::bool(),
         zarrs::array::FillValue::from(false),
         None,
-    )?;
+    )
+    .map_err(|source| Error::ZarrArrayCreateError { source })?;
 
     let metadata_arr = open_or_create_new_zarrs_array(
         &paths.metadata(),
         store.clone(),
-        array_shape.clone(),
+        tile_counts,
         vec![1, 1],
         zarrs::array::data_type::bytes(),
         zarrs::array::FillValue::from(Vec::<u8>::new()),
         None,
-    )?;
+    )
+    .map_err(|source| Error::ZarrArrayCreateError { source })?;
 
     Ok((
         ZarrsArrayAccess {
@@ -576,6 +610,39 @@ impl OnDiskStorageFormat for ZarrsStorageFormat {
     }
 }
 
+/// Returns the inclusive global `[y, x]` tile-index bounds intersecting the raster.
+/// Partial edge tiles are included; indices may be negative and are not zarr-chunk indices.
+fn raster_tile_bounds(
+    result_descriptor: &RasterResultDescriptor,
+    global_geo_transform: GeoTransform,
+    tile_shape: GridShape2D,
+) -> GridBoundingBox2D {
+    let raster_bounds = result_descriptor
+        .spatial_grid_descriptor()
+        .spatial_partition();
+    let pixel_bounds = global_geo_transform.spatial_to_grid_bounds(&raster_bounds);
+    TilingStrategy::new(tile_shape, global_geo_transform)
+        .global_pixel_grid_bounds_to_tile_grid_bounds(pixel_bounds)
+}
+
+/// Maps a global tile position to local Zarr chunk indices relative to the first tile.
+///
+/// The formular is: `tile_position - first_tile_position`, this accounts for a different origin.
+fn tile_position_to_chunk_indices(
+    tile_position: GridIdx2D,
+    first_tile_position: GridIdx2D,
+) -> Result<[u64; 2]> {
+    let mut chunk_indices = [0; 2];
+    for axis in 0..2 {
+        let offset = tile_position.as_slice()[axis] as i128
+            - first_tile_position.as_slice()[axis] as i128;
+        chunk_indices[axis] = u64::try_from(offset).map_err(|_| Error::InvalidZarrTileIndex {
+            reason: "tile precedes the array tile origin or its offset exceeds u64",
+        })?;
+    }
+    Ok(chunk_indices)
+}
+
 #[async_trait]
 impl StorageFormat for ZarrsStorageFormat {
     async fn store(
@@ -585,22 +652,19 @@ impl StorageFormat for ZarrsStorageFormat {
         result_descriptor: /* TODO (crit): must be used! after rebase! */ &RasterResultDescriptor,
     ) -> Result<Self> {
         let store = open_zarrs_filesystemstore()?;
-        // dbg!(&tile_index);
 
-        let (arrays, paths) = build_array_and_prepare_insert(
-            &cache_key,
-            store.clone(),
-            &tile,
+        let (arrays, paths) =
+            build_array_and_prepare_insert(&cache_key, store.clone(), &tile, result_descriptor)?;
+
+        let tile_bounds = raster_tile_bounds(
             result_descriptor,
-        )
-        .map_err(|source| Error::ZarrArrayCreateError { source })?;
-
-        let tile_index = cache_key.3;
-        let chunk_indices = tile_index
-            .as_slice()
-            .iter()
-            .map(|x| *x as u64)
-            .collect::<Vec<u64>>();
+            call_generic_raster_tile_2d!(&tile, tile => tile.global_geo_transform),
+            call_generic_raster_tile_2d!(&tile, tile => tile.grid_shape_array()).into(),
+        );
+        let chunk_indices = tile_position_to_chunk_indices(
+            call_generic_raster_tile_2d!(&tile, tile => tile.tile_position),
+            tile_bounds.min_index(),
+        )?;
         let byte_size_tile_data = arrays.store_tile(&tile, &chunk_indices)?;
         let byte_size_tile_validity = arrays.store_validity_mask(&chunk_indices, &tile)?;
         let () = arrays
@@ -631,7 +695,7 @@ impl StorageFormat for ZarrsStorageFormat {
             tile,
             data_type,
             byte_size: byte_size_tile_data + byte_size_tile_validity, // TODO (mid): this might not be the total size that we actually need
-            chunk_indices: [chunk_indices[0], chunk_indices[1]],
+            chunk_indices,
         })
     }
 

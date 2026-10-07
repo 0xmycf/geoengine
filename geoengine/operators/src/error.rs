@@ -519,6 +519,7 @@ pub enum Error {
         // TODO: make `source: MachineLearningError`, once pro features is removed
         source: Box<dyn ErrorSource>,
     },
+
     #[snafu(display("MustNotHappen: {message}, this is a bug"))]
     MustNotHappen {
         message: String,
@@ -566,6 +567,10 @@ pub enum Error {
     ZarrArrayStoreError {
         storage: WhichTile,
         source: zarrs::array::ArrayError,
+    },
+    #[snafu(display("Invalid Zarr tile index: {reason}"))]
+    InvalidZarrTileIndex {
+        reason: &'static str,
     },
 }
 

@@ -91,18 +91,19 @@ impl OnDiskStorageFormat for ArrowIpcStorageFormat {
 
 /// returns the path to the directory (does not create) as the first element
 ///         and the filepath as the second element.
+///
+/// does not create create the file nor the directory.
 async fn path_for_cache_key(key: &CacheKey) -> Result<(PathBuf, PathBuf)> {
     let cache_dir = cache_dir();
-    let ops_dir_name = key.0.to_string();
+    let ops_dir_name = key.0.as_sha256();
     let file_name = format!(
         "band_{}-timeinterval_{}-grididx_{}.raster_cache.ipc",
         key.1,
         time_interval_to_path_safe_iso(&key.2),
         index_to_string(&key.3),
     );
-    tokio::fs::create_dir_all(&cache_dir).await?;
     Ok((
-        cache_dir,
+        cache_dir.join(ops_dir_name),
         PathBuf::from_str(&file_name).expect("it to be a valid pathbuf"),
     ))
 }
