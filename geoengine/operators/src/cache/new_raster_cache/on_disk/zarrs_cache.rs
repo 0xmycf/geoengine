@@ -770,11 +770,211 @@ fn compare_tiles(tile: &TypedRasterTile2D, loaded_tile: &TypedRasterTile2D) {
 }
 
 #[cfg(test)]
+#[path = "tile_position_tests.rs"]
+mod tile_position_tests;
+
+#[cfg(test)]
 mod tests {
 
     use crate::cache::new_raster_cache::on_disk::tests::test_key;
 
     use super::*;
+
+    mod indexing {
+        use super::*;
+        use crate::cache::new_raster_cache::on_disk::set_raster_cache_dir;
+        use crate::engine::{RasterBandDescriptors, SpatialGridDescriptor, TimeDescriptor};
+        use geoengine_datatypes::{raster::BoundedGrid, spatial_reference::SpatialReference};
+
+        #[test]
+        fn tile_positions_to_chunks_at_zero_origin() {
+            let origin = [0, 0].into();
+
+            assert_eq!(tile_position_to_chunk_indices([0, 0].into(), origin).unwrap(), [0, 0]);
+            assert_eq!(tile_position_to_chunk_indices([0, 1].into(), origin).unwrap(), [0, 1]);
+            assert_eq!(tile_position_to_chunk_indices([1, 0].into(), origin).unwrap(), [1, 0]);
+            assert_eq!(tile_position_to_chunk_indices([1, 1].into(), origin).unwrap(), [1, 1]);
+        }
+
+        #[test]
+        fn tile_position_to_chunk_with_offset() {
+            assert_eq!(
+                tile_position_to_chunk_indices([12, 23].into(), [10, 20].into()).unwrap(),
+                [2, 3]
+            );
+        }
+
+        #[test]
+        fn negative_global_tile_positions_map_to_nonnegative_chunks() {
+            assert_eq!(
+                tile_position_to_chunk_indices([-1, -1].into(), [-2, -2].into()).unwrap(),
+                [1, 1]
+            );
+        }
+
+        #[test]
+        fn tile_positions_before_array_origin_return_errors() {
+            let origin = [0, 0].into();
+
+            assert!(tile_position_to_chunk_indices([-1, 0].into(), origin).is_err());
+            assert!(tile_position_to_chunk_indices([0, -1].into(), origin).is_err());
+        }
+
+        fn first_chunk_tile_origin(raster_upper_left: [isize; 2]) -> GridIdx2D {
+            let geo_transform = GeoTransform::new([10., 20.].into(), 0.5, -0.5);
+            let descriptor = RasterResultDescriptor {
+                data_type: RasterDataType::U8,
+                spatial_reference: SpatialReference::epsg_4326().into(),
+                time: TimeDescriptor::new_irregular(Some(TimeInterval::default())),
+                spatial_grid: SpatialGridDescriptor::source_from_parts(
+                    geo_transform,
+                    GridBoundingBox2D::new_unchecked(
+                        raster_upper_left,
+                        [raster_upper_left[0] + 3, raster_upper_left[1] + 5],
+                    ),
+                ),
+                bands: RasterBandDescriptors::new_single_band(),
+            };
+            raster_tile_bounds(&descriptor, geo_transform, [2, 3].into()).min_index()
+        }
+
+        #[test]
+        fn first_chunk_origin_handles_negative_pixel_positions() {
+            assert_eq!(first_chunk_tile_origin([-3, -5]), [-2, -2].into());
+        }
+
+        #[test]
+        fn first_chunk_origin_aligns_down_to_tile_boundary() {
+            assert_eq!(first_chunk_tile_origin([1, 2]), [0, 0].into());
+            assert_eq!(first_chunk_tile_origin([3, 5]), [1, 1].into());
+        }
+
+        async fn assert_store_uses_pixel_positions(
+            world_origin: Coordinate2D,
+            pixel_origin: [isize; 2],
+        ) {
+            let directory = tempfile::tempdir().unwrap();
+            set_raster_cache_dir(directory.path().to_path_buf()).unwrap();
+            let geo_transform = GeoTransform::new(world_origin, 0.5, -0.5);
+            let time = TimeInterval::new(0, 1).unwrap();
+            let descriptor = RasterResultDescriptor {
+                data_type: RasterDataType::U8,
+                spatial_reference: SpatialReference::epsg_4326().into(),
+                time: TimeDescriptor::new_irregular(Some(time)),
+                spatial_grid: SpatialGridDescriptor::source_from_parts(
+                    geo_transform,
+                    GridBoundingBox2D::new_unchecked(
+                        pixel_origin,
+                        [pixel_origin[0] + 3, pixel_origin[1] + 5],
+                    ),
+                ),
+                bands: RasterBandDescriptors::new_single_band(),
+            };
+            let mut stored_tiles = Vec::new();
+
+            for (tile_position, pixel_position, value) in [
+                ([0, 0], [0, 0], 1_u8),
+                ([0, 1], [0, 3], 2),
+                ([1, 0], [2, 0], 3),
+                ([1, 1], [2, 3], 4),
+            ] {
+                let global_tile_position = [
+                    tile_position[0] + pixel_origin[0] / 2,
+                    tile_position[1] + pixel_origin[1] / 3,
+                ];
+                let global_pixel_position = [
+                    pixel_position[0] + pixel_origin[0],
+                    pixel_position[1] + pixel_origin[1],
+                ];
+                let tile = TypedRasterTile2D::U8(RasterTile2D::new(
+                    time,
+                    global_tile_position.into(),
+                    0,
+                    geo_transform,
+                    Grid2D::new([2, 3].into(), vec![value; 6]).unwrap().into(),
+                    CacheHint::max_duration(),
+                ));
+                let key = Arc::new((test_key(0).0.clone(), 0, time, global_pixel_position.into()));
+                let stored = ZarrsStorageFormat::store(tile.clone(), key, &descriptor)
+                    .await
+                    .expect("store tile at its upper-left pixel position");
+
+                assert_eq!(
+                    stored.chunk_indices,
+                    [tile_position[0] as u64, tile_position[1] as u64]
+                );
+                stored_tiles.push((tile, stored, value));
+            }
+
+            for (tile, stored, value) in stored_tiles {
+                let arrays = stored
+                    .paths
+                    .open(open_zarrs_filesystemstore().unwrap())
+                    .unwrap();
+                let pixels: Vec<u8> = arrays.tiles.retrieve_chunk(&stored.chunk_indices).unwrap();
+                assert_eq!(pixels, vec![value; 6]);
+                compare_tiles(&tile, &stored.load().await.unwrap());
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn store_maps_pixel_positions_to_distinct_chunks() {
+            assert_store_uses_pixel_positions([0., 0.].into(), [0, 0]).await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn store_does_not_treat_world_origin_as_pixel_offset() {
+            assert_store_uses_pixel_positions([10., 20.].into(), [0, 0]).await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn store_and_load_preserve_negative_global_tile_positions() {
+            assert_store_uses_pixel_positions([10., 20.].into(), [-4, -6]).await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn array_extent_includes_tiles_intersecting_unaligned_raster_bounds() {
+            let directory = tempfile::tempdir().unwrap();
+            set_raster_cache_dir(directory.path().to_path_buf()).unwrap();
+            let geo_transform = GeoTransform::new([10., 20.].into(), 0.5, -0.5);
+            let time = TimeInterval::new(0, 1).unwrap();
+            let descriptor = RasterResultDescriptor {
+                data_type: RasterDataType::U8,
+                spatial_reference: SpatialReference::epsg_4326().into(),
+                time: TimeDescriptor::new_irregular(Some(time)),
+                spatial_grid: SpatialGridDescriptor::source_from_parts(
+                    geo_transform,
+                    GridBoundingBox2D::new([1, 2], [4, 7]).unwrap(),
+                ),
+                bands: RasterBandDescriptors::new_single_band(),
+            };
+            let tile = RasterTile2D::new(
+                time,
+                [2, 2].into(),
+                0,
+                geo_transform,
+                Grid2D::new([2, 3].into(), vec![1_u8; 6]).unwrap().into(),
+                CacheHint::max_duration(),
+            );
+            let key = Arc::new((
+                test_key(0).0.clone(),
+                0,
+                time,
+                tile.tile_information().global_upper_left_pixel_idx(),
+            ));
+            let stored = ZarrsStorageFormat::store(TypedRasterTile2D::U8(tile), key, &descriptor)
+                .await
+                .unwrap();
+            let arrays = stored
+                .paths
+                .open(open_zarrs_filesystemstore().unwrap())
+                .unwrap();
+            assert_eq!(stored.chunk_indices, [2, 2]);
+            assert_eq!(arrays.tiles.shape(), &[6, 9]);
+            assert_eq!(arrays.validity.shape(), &[6, 9]);
+            assert_eq!(arrays.metadata.shape(), &[3, 3]);
+        }
+    }
 
     #[test]
     fn zarrs_array_path_operator_name_pathable() {
