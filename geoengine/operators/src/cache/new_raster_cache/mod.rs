@@ -179,12 +179,11 @@ impl NewRasterCacheEnum {
 
     async fn get_tile(&self, key: &CacheKey) -> Result<Option<TypedRasterTile2D>> {
         match self {
-            Self::InMemoryCompressedRasterTile2DFifo(_) | Self::InMemoryCompressedRasterTile2DLru(_) => {
-                match self.get(key).await? {
-                    Some(entry) => Ok(Some(entry.load().await?)),
-                    None => Ok(None),
-                }
-            }
+            Self::InMemoryCompressedRasterTile2DFifo(_)
+            | Self::InMemoryCompressedRasterTile2DLru(_) => match self.get(key).await? {
+                Some(entry) => Ok(Some(entry.load().await?)),
+                None => Ok(None),
+            },
             Self::OnDiskMockFifoIpc(cache) => match cache.store.get(key).await? {
                 Some(entry) => Ok(Some(entry.load().await?)),
                 None => Ok(None),
@@ -1015,7 +1014,10 @@ where
         Self::wrap_operator_with_cache_kind(source, CacheKind::new_in_memory(EvicionKind::Fifo))
     }
 
-    pub fn wrap_operator_with_cache_kind(source: Source, cache_kind: CacheKind) -> RasterCacheOperator<Source> {
+    pub fn wrap_operator_with_cache_kind(
+        source: Source,
+        cache_kind: CacheKind,
+    ) -> RasterCacheOperator<Source> {
         Self { source, cache_kind }
     }
 }
@@ -1391,14 +1393,27 @@ mod tests {
         ))
     }
 
+    fn test_result_descriptor() -> RasterResultDescriptor {
+        RasterResultDescriptor {
+            data_type: RasterDataType::U8,
+            spatial_reference: SpatialReference::epsg_4326().into(),
+            time: TimeDescriptor::new_irregular(Some(TimeInterval::default())),
+            spatial_grid: SpatialGridDescriptor::source_from_parts(
+                GeoTransform::test_default(),
+                GridShape2D::new_2d(2, 2).bounding_box(),
+            ),
+            bands: RasterBandDescriptors::new_single_band(),
+        }
+    }
+
     async fn tile_byte_size(tile: &TypedRasterTile2D) -> usize {
         let probe = NewRasterCacheEnum::new_fifo(usize::MAX / 2);
         probe
             .insert(
                 make_cache_key(0, 0),
                 tile.clone(),
-                todo!("Raster Result Descriptor"),
-            ) // TODO (crit): make this work again
+                &test_result_descriptor(),
+            )
             .await
             .unwrap();
         probe.byte_size()
@@ -1410,9 +1425,8 @@ mod tests {
         let cache = make_cache(size);
         let key = make_cache_key(0, 0);
 
-        // TODO (crit): after rebase!
         cache
-            .insert(key.clone(), tile.clone(), todo!("Raster result descriptor"))
+            .insert(key.clone(), tile.clone(), &test_result_descriptor())
             .await
             .unwrap();
 
@@ -1457,20 +1471,19 @@ mod tests {
 
         let cache = NewRasterCacheEnum::new_fifo(size_a + size_b);
 
-        // TODO (crit): after rebase!
         cache
-            .insert(key_a.clone(), tile_a, todo!("Raster result descriptor"))
+            .insert(key_a.clone(), tile_a, &test_result_descriptor())
             .await
             .unwrap();
         cache
-            .insert(key_b.clone(), tile_b, todo!("Raster result descriptor"))
+            .insert(key_b.clone(), tile_b, &test_result_descriptor())
             .await
             .unwrap();
 
         assert!(cache.get(&key_a).await.unwrap().is_some());
 
         cache
-            .insert(key_c.clone(), tile_c, todo!("Raster result descriptor"))
+            .insert(key_c.clone(), tile_c, &test_result_descriptor())
             .await
             .unwrap();
 
@@ -1498,18 +1511,18 @@ mod tests {
 
         // TODO (crit): Make it work again after rebase!c
         cache
-            .insert(key_a.clone(), tile_a, todo!("Raster result descriptor"))
+            .insert(key_a.clone(), tile_a, &test_result_descriptor())
             .await
             .unwrap();
         cache
-            .insert(key_b.clone(), tile_b, todo!("Raster result descriptor"))
+            .insert(key_b.clone(), tile_b, &test_result_descriptor())
             .await
             .unwrap();
 
         assert!(cache.get(&key_a).await.unwrap().is_some());
 
         cache
-            .insert(key_c.clone(), tile_c, todo!("Raster result descriptor"))
+            .insert(key_c.clone(), tile_c, &test_result_descriptor())
             .await
             .unwrap();
 
@@ -1537,7 +1550,7 @@ mod tests {
 
         // TODO (crit): make it work again after the rebase!
         cache
-            .insert(key_a.clone(), tile_a, todo!("Raster result descriptor"))
+            .insert(key_a.clone(), tile_a, &test_result_descriptor())
             .await
             .unwrap();
 
@@ -1551,14 +1564,9 @@ mod tests {
             "the cache and the held reference should both own an Arc to the entry"
         );
 
-        // TODO (crit): after rebase
         assert!(
             cache
-                .insert(
-                    key_b.clone(),
-                    tile_b.clone(),
-                    todo!("Raster result descriptor")
-                )
+                .insert(key_b.clone(), tile_b.clone(), &test_result_descriptor())
                 .await
                 .is_err(),
             "insert must fail while the only evictable entry is pinned"
@@ -1570,9 +1578,8 @@ mod tests {
 
         drop(pinned);
 
-        // TODO (crit): after rebase
         cache
-            .insert(key_b.clone(), tile_b, todo!("Raster result descriptor"))
+            .insert(key_b.clone(), tile_b, &test_result_descriptor())
             .await
             .unwrap();
 
@@ -1607,21 +1614,12 @@ mod tests {
 
         let cache = make_cache(size_a.max(size_b));
 
-        // TODO (crit): after rebase
         cache
-            .insert(
-                key_a.clone(),
-                tile_a.clone(),
-                todo!("Raster result descriptor"),
-            )
+            .insert(key_a.clone(), tile_a.clone(), &test_result_descriptor())
             .await
             .unwrap();
         cache
-            .insert(
-                key_a.clone(),
-                tile_a.clone(),
-                todo!("Raster result descriptor"),
-            )
+            .insert(key_a.clone(), tile_a.clone(), &test_result_descriptor())
             .await
             .unwrap();
 
@@ -1631,9 +1629,8 @@ mod tests {
             "re-inserting the same key must not double-count its bytes"
         );
 
-        // TODO (crit): after rebase
         cache
-            .insert(key_b.clone(), tile_b, todo!("Raster result descriptor"))
+            .insert(key_b.clone(), tile_b, &test_result_descriptor())
             .await
             .unwrap();
 
@@ -1671,9 +1668,8 @@ mod tests {
 
         let cache = NewRasterCacheEnum::new_lru(size_a + size_b);
 
-        // TODO (crit): after rebase
         cache
-            .insert(key_a.clone(), tile_a, todo!("Raster result descriptor"))
+            .insert(key_a.clone(), tile_a, &test_result_descriptor())
             .await
             .unwrap();
         assert_eq!(
@@ -1682,9 +1678,8 @@ mod tests {
             "tile_a should be cached initially"
         );
 
-        // TODO (crit): after rebase
         cache
-            .insert(key_b.clone(), tile_b, todo!("Raster result descriptor"))
+            .insert(key_b.clone(), tile_b, &test_result_descriptor())
             .await
             .unwrap();
         assert_eq!(
@@ -1720,9 +1715,8 @@ mod tests {
 
         let cache = NewRasterCacheEnum::new_lru(size_a.max(size_b));
 
-        // TODO (crit): after rebase
         cache
-            .insert(key_a.clone(), tile_a, todo!("Raster result descriptor"))
+            .insert(key_a.clone(), tile_a, &test_result_descriptor())
             .await
             .unwrap();
 
@@ -1730,9 +1724,8 @@ mod tests {
         assert!(Arc::strong_count(&pinned) > 1);
 
         let cache_size_before = cache.byte_size();
-        // TODO (crit): after rebase
         let result = cache
-            .insert(key_b.clone(), tile_b, todo!("Raster result descriptor"))
+            .insert(key_b.clone(), tile_b, &test_result_descriptor())
             .await;
         assert!(
             result.is_err(),
@@ -1752,9 +1745,8 @@ mod tests {
 
         drop(pinned);
 
-        // TODO (crit): after rebase
         cache
-            .insert(key_b.clone(), tile_b2, todo!("Raster result descriptor"))
+            .insert(key_b.clone(), tile_b2, &test_result_descriptor())
             .await
             .unwrap();
         assert!(cache.get(&key_b).await.unwrap().is_some());
@@ -1777,23 +1769,20 @@ mod tests {
         let capacity = size_a + size_b + size_c;
         let cache = NewRasterCacheEnum::new_lru(capacity);
 
-        // TODO (crit): after rebase
         cache
-            .insert(key_a.clone(), tile_a, todo!("Raster result descriptor"))
+            .insert(key_a.clone(), tile_a, &test_result_descriptor())
             .await
             .unwrap();
         assert_eq!(cache.byte_size(), size_a);
 
-        // TODO (crit): after rebase
         cache
-            .insert(key_b.clone(), tile_b, todo!("Raster result descriptor"))
+            .insert(key_b.clone(), tile_b, &test_result_descriptor())
             .await
             .unwrap();
         assert_eq!(cache.byte_size(), size_a + size_b);
 
-        // TODO (crit): after rebase
         cache
-            .insert(key_c.clone(), tile_c, todo!("Raster result descriptor"))
+            .insert(key_c.clone(), tile_c, &test_result_descriptor())
             .await
             .unwrap();
         assert_eq!(cache.byte_size(), size_a + size_b + size_c);
@@ -1965,13 +1954,8 @@ mod tests {
         let tile_cache = query_ctx
             .new_raster_cache(CacheKind::new_in_memory(EvicionKind::Fifo))
             .expect("cache should be available in query context");
-        // TODO (crit): after rebase
         tile_cache
-            .insert(
-                key,
-                poisoned_tile.clone(),
-                todo!("Raster result descriptor"),
-            )
+            .insert(key, poisoned_tile.clone(), cached_op.result_descriptor())
             .await
             .unwrap();
 

@@ -165,9 +165,10 @@ where
         for value in cache.values() {
             current_size += value.byte_size().await?;
         }
-        let eviction_plan = eviction_strategy.plan_eviction(current_size, required_space, |key| {
-            cache.get(key).is_none_or(|sf| Arc::strong_count(sf) > 1)
-        })?;
+        let eviction_plan =
+            eviction_strategy.plan_eviction(current_size, required_space, |key| {
+                cache.get(key).is_none_or(|sf| Arc::strong_count(sf) > 1)
+            })?;
 
         let needed = (current_size + required_space).saturating_sub(eviction_strategy.capacity());
         if eviction_plan.freed_bytes < needed {
@@ -253,6 +254,7 @@ fn time_interval_to_path_safe_iso(time: &TimeInterval) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::engine::{RasterBandDescriptors, SpatialGridDescriptor, TimeDescriptor};
     use crate::util::test::assert_eq_raster_operator_res_and_list_of_tiles_u8;
 
     use super::*;
@@ -261,8 +263,10 @@ mod tests {
     use geoengine_datatypes::hashmap;
     use geoengine_datatypes::primitives::{CacheHint, DateTimeParseFormat, TimeInterval};
     use geoengine_datatypes::raster::{
-        Grid2D, RasterTile2D, TileInformation, TilesEqualIgnoringCacheHint,
+        BoundedGrid, Grid2D, GridShape2D, RasterTile2D, TileInformation,
+        TilesEqualIgnoringCacheHint,
     };
+    use geoengine_datatypes::spatial_reference::SpatialReference;
     use geoengine_datatypes::util::test::TestDefault;
     use httptest::matchers::key;
     use serde::de::Expected;
@@ -304,6 +308,19 @@ mod tests {
         TypedRasterTile2D::U8(raster_tile)
     }
 
+    fn test_result_descriptor() -> RasterResultDescriptor {
+        RasterResultDescriptor {
+            data_type: RasterDataType::U8,
+            spatial_reference: SpatialReference::epsg_4326().into(),
+            time: TimeDescriptor::new_irregular(Some(TimeInterval::default())),
+            spatial_grid: SpatialGridDescriptor::source_from_parts(
+                GeoTransform::test_default(),
+                GridShape2D::from([8, 8]).bounding_box(),
+            ),
+            bands: RasterBandDescriptors::new_multiple_bands(2),
+        }
+    }
+
     fn initialize_test_zarrs_cache_dir() -> tempfile::TempDir {
         let temp_dir = tempdir().expect("it to work");
         let () = set_raster_cache_dir(temp_dir.path().to_path_buf()).expect("it to work");
@@ -317,13 +334,9 @@ mod tests {
         let band = 0;
         let key = test_key(band);
         let tile = test_tile_u8(band);
-        let stored = ArrowIpcStorageFormat::store(
-            tile.clone(),
-            key,
-            todo!("figure out where the raster result descriptor lives"),
-        )
-        .await
-        .expect("it should be possible to store the tile.");
+        let stored = ArrowIpcStorageFormat::store(tile.clone(), key, &test_result_descriptor())
+            .await
+            .expect("it should be possible to store the tile.");
 
         let path = stored.path.clone();
         let metadata = fs::metadata(&path).expect(&format!("File should be at {path:#?}"));
@@ -367,11 +380,7 @@ mod tests {
         let expected_tile = tile.clone();
 
         store
-            .insert(
-                key.clone(),
-                tile,
-                todo!("figure out how to aquire the result descriptor"),
-            )
+            .insert(key.clone(), tile, &test_result_descriptor())
             .await
             .expect("it should be possible to insert the tile into the OnDiskStorage.");
         let stored: Arc<ArrowIpcStorageFormat> = store
@@ -403,13 +412,9 @@ mod tests {
         let band = 0;
         let key = test_key(band);
         let tile = test_tile_u8(band);
-        let stored = ZarrsStorageFormat::store(
-            tile.clone(),
-            key,
-            todo!("figure out how to get the raster result descriptor"),
-        )
-        .await
-        .expect("it should be possible to store the tile.");
+        let stored = ZarrsStorageFormat::store(tile.clone(), key, &test_result_descriptor())
+            .await
+            .expect("it should be possible to store the tile.");
 
         {
             // check if the zarrs thing is there
@@ -454,11 +459,7 @@ mod tests {
         let expected_tile = tile.clone();
 
         store
-            .insert(
-                key.clone(),
-                tile,
-                todo!("figure out how to get the raster result descriptor"),
-            )
+            .insert(key.clone(), tile, &test_result_descriptor())
             .await
             .expect("it should be possible to insert the tile into the OnDiskStorage.");
         let stored: Arc<ZarrsStorageFormat> = store
