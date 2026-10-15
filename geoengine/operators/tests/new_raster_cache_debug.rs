@@ -6,7 +6,7 @@ use geoengine_datatypes::{
     util::test::TestDefault,
 };
 use geoengine_operators::cache::new_raster_cache::{
-    CacheKind, RasterCacheOperator, StorageFormat, StorageFormatEnum, test_default_fifo_zarr,
+    CacheKind, RasterCacheOperator, StorageFormatEnum,
 };
 use geoengine_operators::engine::{
     ChunkByteSize, InitializedRasterOperator, MockExecutionContext, MockQueryContext,

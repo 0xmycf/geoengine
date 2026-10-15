@@ -26,7 +26,6 @@ use geoengine_datatypes::raster::{
     TileInformation, TypedGrid2D, TypedRasterTile2D,
 };
 use geoengine_datatypes::util::ByteSize as _;
-use geoengine_datatypes::util::test::TestDefault;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::File;
@@ -94,19 +93,6 @@ pub enum EvicionKind {
     Fifo,
 }
 
-impl TestDefault for NewRasterCacheEnum {
-    fn test_default() -> Self {
-        Self::InMemoryCompressedRasterTile2DFifo(NewRasterCache {
-            // TODO (crit): Make sure that the tests expect exactly this! Also is this sensible?
-            store: InMemoryCacheStore {
-                cache: RwLock::new(HashMap::new()),
-                eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(8_589_934_592))),
-                total_size: Arc::new(AtomicUsize::new(0)),
-            },
-        })
-    }
-}
-
 // The cache kind selects a storage format; stored tiles themselves are held by the cache.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StorageFormatEnum {
@@ -114,22 +100,51 @@ pub enum StorageFormatEnum {
     ArrowIpc,
 }
 
-pub fn test_default_fifo_zarr() -> NewRasterCacheEnum {
-    NewRasterCacheEnum::OnDiskMockFifoZarr(NewRasterCache {
-        store: OnDiskStore {
-            cache: RwLock::new(HashMap::new()),
-            eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(8_589_934_592))),
-        },
-    })
-}
+/// Cache constructors for benchmarks and tests.
+///
+/// Compiled unconditionally because benchmarks and integration tests use the
+/// regular library build, including `MockQueryContext`, without `cfg(test)`.
+pub mod test_util {
+    use super::{FifoEvictionStrategy, NewRasterCache, NewRasterCacheEnum, OnDiskStore};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
 
-pub fn test_default_fifo_arrow_ipc() -> NewRasterCacheEnum {
-    NewRasterCacheEnum::OnDiskMockFifoIpc(NewRasterCache {
-        store: OnDiskStore {
-            cache: RwLock::new(HashMap::new()),
-            eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(8_589_934_592))),
-        },
-    })
+    const DEFAULT_CAPACITY_BYTES: usize = 8_589_934_592;
+
+    /// Creates a FIFO in-memory compressed tile cache with an 8 GiB capacity.
+    pub fn test_default_fifo_in_memory() -> NewRasterCacheEnum {
+        NewRasterCacheEnum::new_fifo(DEFAULT_CAPACITY_BYTES)
+    }
+
+    /// Creates an LRU in-memory compressed tile cache with an 8 GiB capacity.
+    pub fn test_default_lru_in_memory() -> NewRasterCacheEnum {
+        NewRasterCacheEnum::new_lru(DEFAULT_CAPACITY_BYTES)
+    }
+
+    /// Creates a FIFO Zarr cache with an 8 GiB capacity.
+    pub fn test_default_fifo_zarr() -> NewRasterCacheEnum {
+        NewRasterCacheEnum::OnDiskMockFifoZarr(NewRasterCache {
+            store: OnDiskStore {
+                cache: RwLock::new(HashMap::new()),
+                eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(
+                    DEFAULT_CAPACITY_BYTES,
+                ))),
+            },
+        })
+    }
+
+    /// Creates a FIFO Arrow IPC cache with an 8 GiB capacity.
+    pub fn test_default_fifo_arrow_ipc() -> NewRasterCacheEnum {
+        NewRasterCacheEnum::OnDiskMockFifoIpc(NewRasterCache {
+            store: OnDiskStore {
+                cache: RwLock::new(HashMap::new()),
+                eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(
+                    DEFAULT_CAPACITY_BYTES,
+                ))),
+            },
+        })
+    }
 }
 
 impl NewRasterCacheEnum {
@@ -1322,6 +1337,7 @@ mod tests {
         RasterDataType, TilingSpecification,
     };
     use geoengine_datatypes::spatial_reference::SpatialReference;
+    use geoengine_datatypes::util::test::TestDefault;
     use std::str::FromStr;
 
     fn make_cache_key(band: u32, idx: isize) -> CacheKey {

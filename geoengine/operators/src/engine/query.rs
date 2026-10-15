@@ -334,10 +334,10 @@ impl QueryContext for MockQueryContext {
             let cache = if let Some(storage) = kind.in_memory {
                 match storage.0 {
                     StorageFormatEnum::Zarr => {
-                        crate::cache::new_raster_cache::test_default_fifo_zarr()
+                        crate::cache::new_raster_cache::test_util::test_default_fifo_zarr()
                     }
                     StorageFormatEnum::ArrowIpc => {
-                        crate::cache::new_raster_cache::test_default_fifo_arrow_ipc()
+                        crate::cache::new_raster_cache::test_util::test_default_fifo_arrow_ipc()
                     }
                 }
             } else {
