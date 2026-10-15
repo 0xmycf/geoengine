@@ -17,7 +17,6 @@ use chrono::offset;
 #[cfg(test)]
 use futures::executor::block_on;
 use futures::task::UnsafeFutureObj;
-use geo::Coordinate;
 use geoengine_datatypes::{
     primitives::{CacheHint, Coordinate2D, DateTimeParseFormat},
     raster::{
@@ -88,6 +87,8 @@ pub struct ZarrsStorageFormat {
     byte_size: usize,
     // the indicies in the Zarrs arrays of this tile, validity mask, metadata etc...
     chunk_indices: [u64; 2],
+    // the cache hint for the tile
+    cache_hint: CacheHint,
 }
 
 /// using the `time_interval` in the `key` field does not work in all cases
@@ -193,7 +194,7 @@ impl ZarrsArrayAccess {
     }
 
     /// Retrieve a validity mask.
-    fn retreive_validity_mask(
+    fn retrieve_validity_mask(
         &self,
         chunk_indices: &[u64],
     ) -> std::result::Result<Vec<bool>, zarrs::array::ArrayError> {
@@ -215,7 +216,7 @@ impl ZarrsArrayAccess {
             .retrieve_chunk(chunk_indices)
             .map_err(|source| Error::ZarrArrayError { source })?;
         let validity_mask: Vec<bool> = self
-            .retreive_validity_mask(chunk_indices)
+            .retrieve_validity_mask(chunk_indices)
             .map_err(|source| Error::ZarrArrayError { source })?;
         let tile_shape = self.single_tile_shape(chunk_indices);
         let data = GridOrEmpty::new_grid(
@@ -246,6 +247,7 @@ impl ZarrsArrayAccess {
         chunk_indices: &[u64],
         paths: &ZarrsArrayPath,
         data_type: RasterDataType,
+        cache_hint: CacheHint,
     ) -> Result<TypedRasterTile2D> {
         let metadata_chunk: ZarrsMetaDataChunk = self
             .retrieve_metadata_chunk(chunk_indices)
@@ -254,8 +256,6 @@ impl ZarrsArrayAccess {
         let tile_position = metadata_chunk.tile_position;
         let band = paths.band();
         let global_geo_transform = self.read_global_geo_transform();
-        // TODO (high): what should I use here? What is the proper default value for these datachunks that are retreived from the on-disk cache?
-        let cache_hint = CacheHint::max_duration(); // TODO (crit): {27B344EE-600E-448B-982D-8A7D6DDA2E30}
 
         macro_rules! dispatch {
             ($variant:ident, $ty:ty) => {{
@@ -634,8 +634,8 @@ fn tile_position_to_chunk_indices(
 ) -> Result<[u64; 2]> {
     let mut chunk_indices = [0; 2];
     for axis in 0..2 {
-        let offset = tile_position.as_slice()[axis] as i128
-            - first_tile_position.as_slice()[axis] as i128;
+        let offset =
+            tile_position.as_slice()[axis] as i128 - first_tile_position.as_slice()[axis] as i128;
         chunk_indices[axis] = u64::try_from(offset).map_err(|_| Error::InvalidZarrTileIndex {
             reason: "tile precedes the array tile origin or its offset exceeds u64",
         })?;
@@ -690,12 +690,14 @@ impl StorageFormat for ZarrsStorageFormat {
             })?;
 
         let data_type = tile.raster_data_type();
+        let cache_hint = call_generic_raster_tile_2d!(&tile, tile => tile.cache_hint);
         Ok(ZarrsStorageFormat {
             paths,
             tile,
             data_type,
             byte_size: byte_size_tile_data + byte_size_tile_validity, // TODO (mid): this might not be the total size that we actually need
             chunk_indices,
+            cache_hint,
         })
     }
 
@@ -706,12 +708,15 @@ impl StorageFormat for ZarrsStorageFormat {
             data_type,
             byte_size,
             chunk_indices,
+            cache_hint,
         } = self;
         let store = open_zarrs_filesystemstore()?;
         let arrays = paths.open(store.clone())?;
-        // dbg!("loading tile ", paths);
-        let loaded_tile = arrays.retrieve_tile(chunk_indices, paths, *data_type)?;
-        compare_tiles(tile, &loaded_tile);
+        let loaded_tile = arrays.retrieve_tile(chunk_indices, paths, *data_type, *cache_hint)?;
+        #[cfg(test)]
+        {
+            compare_tiles(tile, &loaded_tile);
+        }
 
         Ok(loaded_tile)
     }
@@ -721,13 +726,13 @@ impl StorageFormat for ZarrsStorageFormat {
     }
 
     async fn is_expired(&self) -> bool {
-        false // TODO (crit): figure out how to properly implement this
+        self.cache_hint.is_expired()
     }
 }
 
 // used for testing etc
 // remove once everything is finalised
-// cannot mark cfg(test), because I sometimes run use it in the benchmarks (for reporting benchmarks I make sure this is not included)
+#[cfg(test)]
 fn compare_tiles(tile: &TypedRasterTile2D, loaded_tile: &TypedRasterTile2D) {
     let b = match (tile, loaded_tile) {
         (TypedRasterTile2D::I8(t), TypedRasterTile2D::I8(t2)) => {
@@ -776,11 +781,15 @@ mod tile_position_tests;
 #[cfg(test)]
 mod tests {
 
+    use crate::cache::new_raster_cache::on_disk::set_raster_cache_dir;
     use crate::cache::new_raster_cache::on_disk::tests::test_key;
+    use crate::engine::{RasterBandDescriptors, SpatialGridDescriptor, TimeDescriptor};
+    use geoengine_datatypes::{primitives::DateTime, spatial_reference::SpatialReference};
 
     use super::*;
 
     mod indexing {
+
         use super::*;
         use crate::cache::new_raster_cache::on_disk::set_raster_cache_dir;
         use crate::engine::{RasterBandDescriptors, SpatialGridDescriptor, TimeDescriptor};
@@ -790,10 +799,22 @@ mod tests {
         fn tile_positions_to_chunks_at_zero_origin() {
             let origin = [0, 0].into();
 
-            assert_eq!(tile_position_to_chunk_indices([0, 0].into(), origin).unwrap(), [0, 0]);
-            assert_eq!(tile_position_to_chunk_indices([0, 1].into(), origin).unwrap(), [0, 1]);
-            assert_eq!(tile_position_to_chunk_indices([1, 0].into(), origin).unwrap(), [1, 0]);
-            assert_eq!(tile_position_to_chunk_indices([1, 1].into(), origin).unwrap(), [1, 1]);
+            assert_eq!(
+                tile_position_to_chunk_indices([0, 0].into(), origin).unwrap(),
+                [0, 0]
+            );
+            assert_eq!(
+                tile_position_to_chunk_indices([0, 1].into(), origin).unwrap(),
+                [0, 1]
+            );
+            assert_eq!(
+                tile_position_to_chunk_indices([1, 0].into(), origin).unwrap(),
+                [1, 0]
+            );
+            assert_eq!(
+                tile_position_to_chunk_indices([1, 1].into(), origin).unwrap(),
+                [1, 1]
+            );
         }
 
         #[test]
@@ -973,6 +994,80 @@ mod tests {
             assert_eq!(arrays.tiles.shape(), &[6, 9]);
             assert_eq!(arrays.validity.shape(), &[6, 9]);
             assert_eq!(arrays.metadata.shape(), &[3, 3]);
+        }
+    }
+
+    mod cache_hint {
+        use super::*;
+
+        fn set_up() -> (
+            CacheHint,
+            RasterTile2D<u8>,
+            RasterResultDescriptor,
+            Arc<CacheKey>,
+        ) {
+            let cache_hint = CacheHint::with_created_and_expires(
+                "2024-01-01T12:34:56.123Z".parse::<DateTime>().unwrap(),
+                "2024-01-02T12:34:56.789Z"
+                    .parse::<DateTime>()
+                    .unwrap()
+                    .into(),
+            );
+            let time = TimeInterval::new(0, 1).unwrap();
+            let geo_transform = GeoTransform::new([0., 0.].into(), 1., -1.);
+            let descriptor = RasterResultDescriptor {
+                data_type: RasterDataType::U8,
+                spatial_reference: SpatialReference::epsg_4326().into(),
+                time: TimeDescriptor::new_irregular(Some(time)),
+                spatial_grid: SpatialGridDescriptor::source_from_parts(
+                    geo_transform,
+                    GridBoundingBox2D::new([0, 0], [1, 1]).unwrap(),
+                ),
+                bands: RasterBandDescriptors::new_single_band(),
+            };
+            let tile = RasterTile2D::new(
+                time,
+                [0, 0].into(),
+                0,
+                geo_transform,
+                Grid2D::new([2, 2].into(), vec![42_u8; 4]).unwrap().into(),
+                cache_hint,
+            );
+            let key = Arc::new((test_key(0).0.clone(), 0, time, [0, 0].into()));
+            (cache_hint, tile, descriptor, key)
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn cache_hint_is_stored_correctly() {
+            let directory = tempfile::tempdir().unwrap();
+            set_raster_cache_dir(directory.path().to_path_buf()).unwrap();
+            let (cache_hint, tile, descriptor, key) = set_up();
+            let stored =
+                ZarrsStorageFormat::store(TypedRasterTile2D::U8(tile.clone()), key, &descriptor)
+                    .await
+                    .expect("tile should be stored with its cache hint");
+
+            assert_eq!(stored.cache_hint, cache_hint);
+            let TypedRasterTile2D::U8(loaded) =
+                stored.load().await.expect("stored tile should load")
+            else {
+                panic!("expected a U8 tile");
+            };
+            assert_eq!(loaded.cache_hint, cache_hint);
+            assert_eq!(loaded, tile);
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn expired_cache_hint() {
+            let directory = tempfile::tempdir().unwrap();
+            set_raster_cache_dir(directory.path().to_path_buf()).unwrap();
+            let (cache_hint, tile, descriptor, key) = set_up();
+            assert!(cache_hint.is_expired());
+            let stored =
+                ZarrsStorageFormat::store(TypedRasterTile2D::U8(tile.clone()), key, &descriptor)
+                    .await
+                    .expect("tile should be stored with its cache hint");
+            assert!(stored.is_expired().await);
         }
     }
 
