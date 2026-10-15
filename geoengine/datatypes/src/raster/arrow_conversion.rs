@@ -34,6 +34,7 @@ pub const SPATIAL_REF_KEY: &str = "spatialReference";
 pub const BAND_KEY: &str = "band";
 pub const RASTER_PROPERTIES: &str = "rasterProperties";
 pub const TILE_POSITION: &str = "tilePosition";
+pub const CACHE_HINT: &str = "cacheHint";
 
 pub fn raster_tile_2d_to_arrow_ipc_file_for_ipc_channel<P: Pixel>(
     tile: RasterTile2D<P>,
@@ -107,7 +108,15 @@ where
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_else(raster_properties::RasterProperties::default);
 
-        let cache_hint = CacheHint::max_duration(); // TODO (crit): {27B344EE-600E-448B-982D-8A7D6DDA2E30} check what is appropriate here
+        let cache_hint = metadata
+            .get(CACHE_HINT)
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| {
+                tracing::info!(
+                    "Cache hint metadata is missing or could not be deserialized; using maximum cache duration"
+                );
+                CacheHint::no_cache()
+            }); // TODO (crit): {27B344EE-600E-448B-982D-8A7D6DDA2E30} {294c2ea8-84c3-4e72-9632-c10e3d06f001} check what is appropriate here
 
         let raster_tile_2d = RasterTile2D::new_with_properties(
             time,
@@ -343,6 +352,11 @@ fn raster_tile_2d_to_arrow_record_batch_impl<P: Pixel>(
             TILE_POSITION.to_string(),
             serde_json::to_string(&tile.tile_position).unwrap_or_default(),
         );
+        metadata.insert(
+            CACHE_HINT.to_string(),
+            serde_json::to_string(&tile.cache_hint)
+                .expect("cache hint should be serializable as JSON"),
+        );
     }
 
     let array = grid_2d_to_arrow_array(tile.grid_array);
@@ -451,7 +465,10 @@ mod tests {
     use super::*;
     use crate::{
         primitives::{CacheHint, TimeInterval},
-        raster::{EmptyGrid2D, GridIndexAccessMut, MaskedGrid2D, TileInformation, TilesEqualIgnoringCacheHint},
+        raster::{
+            EmptyGrid2D, GridIndexAccessMut, MaskedGrid2D, TileInformation,
+            TilesEqualIgnoringCacheHint,
+        },
         spatial_reference::SpatialReference,
         util::test::TestDefault,
     };
@@ -614,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn test_arrow_ipc_file_to_raster_tile_2d_empty() {
+    fn test_arrow_ipc_file_to_raster_tile_2d_for_ipc_channel_empty() {
         let original = RasterTile2D::new_with_tile_info(
             TimeInterval::default(),
             TileInformation {
@@ -624,20 +641,28 @@ mod tests {
             },
             0,
             EmptyGrid2D::<f32>::new([3, 2].into()).into(),
-            CacheHint::max_duration(), // TODO (crit): {27B344EE-600E-448B-982D-8A7D6DDA2E30}
+            CacheHint::with_created_and_expires(
+                "2024-01-01T12:34:56.123Z".parse().unwrap(),
+                "2024-01-02T18:45:30.789Z"
+                    .parse::<crate::primitives::DateTime>()
+                    .unwrap()
+                    .into(),
+            ),
         );
 
-        let bytes = raster_tile_2d_to_arrow_ipc_file(
-            original.clone(),
-            SpatialReference::epsg_4326().into(),
-        )
-        .unwrap();
-        let restored: RasterTile2D<f32> = arrow_ipc_file_to_raster_tile_2d(bytes).unwrap();
+        let bytes = raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(original.clone()).unwrap();
+        let restored: RasterTile2D<f32> =
+            arrow_ipc_file_to_raster_tile_2d_for_ipc_channel(bytes).unwrap();
 
         assert!(restored.grid_array.is_empty());
         assert_eq!(original.grid_array, restored.grid_array);
         assert_eq!(original.properties, restored.properties);
         assert_eq!(original.tile_position, restored.tile_position);
+        assert_eq!(
+            original.cache_hint.total_ttl_seconds(),
+            restored.cache_hint.total_ttl_seconds()
+        );
+        assert!(original.tiles_equal_ignoring_cache_hint(&restored));
     }
 
     #[test]
@@ -653,7 +678,13 @@ mod tests {
             Grid2D::new([3, 2].into(), vec![10_u8, 20, 30, 40, 50, 60])
                 .unwrap()
                 .into(),
-            CacheHint::max_duration(), // TODO (crit): {27B344EE-600E-448B-982D-8A7D6DDA2E30}
+            CacheHint::with_created_and_expires(
+                "2024-01-01T12:34:56.123Z".parse().unwrap(),
+                "2024-01-02T18:45:30.789Z"
+                    .parse::<crate::primitives::DateTime>()
+                    .unwrap()
+                    .into(),
+            ),
         );
 
         let bytes = raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(original.clone()).unwrap();
@@ -667,7 +698,10 @@ mod tests {
         assert_eq!(original.properties, restored.properties);
         assert_eq!(original.tile_position, restored.tile_position);
         assert_eq!(original.tile_geo_transform(), restored.tile_geo_transform());
+        assert_eq!(
+            original.cache_hint.total_ttl_seconds(),
+            restored.cache_hint.total_ttl_seconds()
+        );
         assert!(original.tiles_equal_ignoring_cache_hint(&restored));
-
     }
 }

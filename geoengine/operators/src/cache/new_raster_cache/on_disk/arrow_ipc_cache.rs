@@ -81,6 +81,8 @@ pub struct ArrowIpcStorageFormat {
     byte_size: usize,
     /// the datatype of the TypedRasterTile2D
     data_type: RasterDataType,
+    /// The cache_hint from the tile, only used for [`StorageFormat::is_expired`]
+    cache_hint: CacheHint,
 }
 
 impl OnDiskStorageFormat for ArrowIpcStorageFormat {
@@ -125,11 +127,13 @@ impl StorageFormat for ArrowIpcStorageFormat {
         let _ = file.write_all(&bytes)?;
 
         let data_type = tile.raster_data_type();
+        let cache_hint = call_generic_raster_tile_2d!(&tile, tile => tile.cache_hint);
         Ok(Self {
             path: cache_path,
             tile,
             byte_size,
             data_type,
+            cache_hint,
         })
     }
 
@@ -157,7 +161,7 @@ impl StorageFormat for ArrowIpcStorageFormat {
     }
 
     async fn is_expired(&self) -> bool {
-        false // TODO (crit): Implement this properly
+        self.cache_hint.is_expired()
     }
 }
 
@@ -172,7 +176,7 @@ fn arrow_ipc_tile_to_typed_raster<P>(tile: Vec<u8>) -> Result<TypedRasterTile2D>
 where
     P: Pixel + SupportedRasterDataType,
 {
-    let raster_tile = arrow_ipc_file_to_raster_tile_2d_for_ipc_channel::<P>(tile)?;
+    let mut raster_tile = arrow_ipc_file_to_raster_tile_2d_for_ipc_channel::<P>(tile)?;
     Ok(SupportedRasterDataType::map_tile_to_enum(raster_tile))
 }
 
