@@ -67,8 +67,9 @@ pub mod zarrs_cache;
 const GLOBAL_GEOTRANSFORM_KEY: &'static str = "global_geo_transform";
 
 pub struct OnDiskStore<SF: StorageFormat, ES: EvictionStrategy> {
-    pub cache: RwLock<HashMap<Arc<CacheKey>, Arc<SF>>>,
+    pub cache_index: RwLock<HashMap<Arc<CacheKey>, Arc<SizeTrackedEntry<SF>>>>,
     pub eviction_strategy: Arc<RwLock<ES>>,
+    pub total_current_size: Arc<AtomicUsize>,
 }
 
 pub struct PendingFile<SF: OnDiskStorageFormat> {
@@ -110,6 +111,7 @@ impl<SF: OnDiskStorageFormat> Drop for PendingFile<SF> {
     }
 }
 
+// TODO (high): {462286af-362d-42f0-a803-ebe807aa820b}
 #[async_trait]
 pub trait OnDiskStorageFormat: StorageFormat {
     async fn write(
@@ -125,18 +127,17 @@ pub trait OnDiskStorageFormat: StorageFormat {
     fn cleanup(&mut self);
 }
 
-// Currently just a copy of ["MockOnDiskCacheStore"] in  ["super;"].
 #[async_trait]
 impl<SF, ES> CacheStore for OnDiskStore<SF, ES>
 where
     SF: StorageFormat + OnDiskStorageFormat,
     ES: EvictionStrategy,
 {
-    type SF = SF;
+    type SF = SizeTrackedEntry<SF>;
     type ES = ES;
 
     async fn get(&self, key: &CacheKey) -> Result<Option<Arc<Self::SF>>> {
-        let x = self.cache.read().await.get(key).map(Arc::clone);
+        let x = self.cache_index.read().await.get(key).map(Arc::clone);
         match x {
             Some(key) => Ok(Some(key)),
             None => Ok(None),
@@ -148,23 +149,34 @@ where
         &self,
         key: Arc<CacheKey>,
         tile: TypedRasterTile2D,
-        raster_result_descriptor: /* TODO (crit): must be used */ &RasterResultDescriptor,
+        result_descriptor: &RasterResultDescriptor,
     ) -> Result<()> {
-        /*
-        We need to make sure that the file is not just written to the disk
+        /* We need to make sure that the file is not just written to the disk
         without actually being inserted in the cache / index later on.
-        Otherwise we will have orphaned files.
-        */
-        let hint = cache_hint(&tile);
-        let stored_tile = SF::write(tile, key.clone(), raster_result_descriptor).await?;
-        let required_space = stored_tile.byte_size().await?;
-
-        let mut cache = self.cache.write().await;
-        let mut eviction_strategy = self.eviction_strategy.write().await;
-        let mut current_size = 0;
-        for value in cache.values() {
-            current_size += value.byte_size().await?;
+        Otherwise we will have orphaned files. */
+        {
+            let cache = self.cache_index.read().await;
+            if cache.contains_key(&key) {
+                ES::record_hit(self.eviction_strategy.clone(), &key).await;
+                return Ok(());
+            }
         }
+
+        let cache_hint = cache_hint(&tile);
+        let pending_file = SF::write(tile, key.clone(), result_descriptor).await?;
+        let value_size = pending_file.byte_size().await?;
+
+        let key_size = cache_key_byte_size(&key);
+        let required_space = value_size + key_size;
+
+        let mut cache = self.cache_index.write().await;
+        if cache.contains_key(&key) {
+            return Ok(());
+        }
+
+        let mut eviction_strategy = self.eviction_strategy.write().await;
+        let current_size = self.total_current_size.load(Ordering::SeqCst);
+
         let eviction_plan =
             eviction_strategy.plan_eviction(current_size, required_space, |key| {
                 cache.get(key).is_none_or(|sf| Arc::strong_count(sf) > 1)
@@ -180,8 +192,15 @@ where
             eviction_strategy.record_removal(&evict_key);
         }
 
-        eviction_strategy.record_access(&key, required_space, hint);
-        cache.insert(key, Arc::new(stored_tile.commit()));
+        eviction_strategy.record_access(&key, required_space, cache_hint);
+        cache.insert(
+            key,
+            Arc::new(SizeTrackedEntry::new(
+                pending_file.commit(),
+                required_space,
+                self.total_current_size.clone(),
+            )),
+        );
         Ok(())
     }
 }
@@ -370,8 +389,9 @@ mod tests {
         initialize_test_zarrs_cache_dir();
 
         let store = OnDiskStore {
-            cache: RwLock::new(HashMap::new()),
+            cache_index: RwLock::new(HashMap::new()),
             eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(usize::MAX))),
+            total_current_size: Arc::new(AtomicUsize::new(0)),
         };
 
         let band = 1;
@@ -383,7 +403,7 @@ mod tests {
             .insert(key.clone(), tile, &test_result_descriptor())
             .await
             .expect("it should be possible to insert the tile into the OnDiskStorage.");
-        let stored: Arc<ArrowIpcStorageFormat> = store
+        let stored: Arc<SizeTrackedEntry<ArrowIpcStorageFormat>> = store
             .get(&key)
             .await
             .expect("it should be present")
@@ -449,8 +469,9 @@ mod tests {
         initialize_test_zarrs_cache_dir();
 
         let store = OnDiskStore {
-            cache: RwLock::new(HashMap::new()),
+            cache_index: RwLock::new(HashMap::new()),
             eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(usize::MAX))),
+            total_current_size: Arc::new(AtomicUsize::new(0)),
         };
 
         let band = 1;
@@ -462,7 +483,7 @@ mod tests {
             .insert(key.clone(), tile, &test_result_descriptor())
             .await
             .expect("it should be possible to insert the tile into the OnDiskStorage.");
-        let stored: Arc<ZarrsStorageFormat> = store
+        let stored: Arc<SizeTrackedEntry<ZarrsStorageFormat>> = store
             .get(&key)
             .await
             .expect("it should be present") // TODO (crit): figure out a better way

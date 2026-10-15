@@ -87,7 +87,10 @@ pub struct ArrowIpcStorageFormat {
 
 impl OnDiskStorageFormat for ArrowIpcStorageFormat {
     fn cleanup(&mut self) {
-        tokio::fs::remove_file(&self.path);
+        // TODO (high): {462286af-362d-42f0-a803-ebe807aa820b}
+        if let Err(err) = std::fs::remove_file(&self.path) {
+            tracing::warn!("Failed to remove file {}: {}", self.path.display(), err);
+        };
     }
 }
 

@@ -108,6 +108,7 @@ pub mod test_util {
     use super::{FifoEvictionStrategy, NewRasterCache, NewRasterCacheEnum, OnDiskStore};
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
     use tokio::sync::RwLock;
 
     const DEFAULT_CAPACITY_BYTES: usize = 8_589_934_592;
@@ -126,10 +127,11 @@ pub mod test_util {
     pub fn test_default_fifo_zarr() -> NewRasterCacheEnum {
         NewRasterCacheEnum::OnDiskMockFifoZarr(NewRasterCache {
             store: OnDiskStore {
-                cache: RwLock::new(HashMap::new()),
+                cache_index: RwLock::new(HashMap::new()),
                 eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(
                     DEFAULT_CAPACITY_BYTES,
                 ))),
+                total_current_size: Arc::new(AtomicUsize::new(0)),
             },
         })
     }
@@ -138,10 +140,11 @@ pub mod test_util {
     pub fn test_default_fifo_arrow_ipc() -> NewRasterCacheEnum {
         NewRasterCacheEnum::OnDiskMockFifoIpc(NewRasterCache {
             store: OnDiskStore {
-                cache: RwLock::new(HashMap::new()),
+                cache_index: RwLock::new(HashMap::new()),
                 eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(
                     DEFAULT_CAPACITY_BYTES,
                 ))),
+                total_current_size: Arc::new(AtomicUsize::new(0)),
             },
         })
     }
@@ -942,7 +945,7 @@ where
         &self,
         key: Arc<CacheKey>,
         tile: TypedRasterTile2D,
-        result_descriptor: /* TODO (crit): make sure this is used again after rebase! */ &RasterResultDescriptor,
+        result_descriptor: &RasterResultDescriptor,
     ) -> Result<()> {
         {
             let cache = self.cache.read().await;

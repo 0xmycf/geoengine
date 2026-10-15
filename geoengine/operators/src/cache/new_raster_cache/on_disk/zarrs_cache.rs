@@ -602,11 +602,33 @@ fn open_zarrs_filesystemstore() -> Result<Arc<FilesystemStore>> {
     Ok(Arc::new(zarrs))
 }
 
+// TODO (high): {462286af-362d-42f0-a803-ebe807aa820b}
+// while this is one implementation, the write / read guard is still missing
+// which could lead to race errors.
 impl OnDiskStorageFormat for ZarrsStorageFormat {
     fn cleanup(&mut self) {
-        todo!(
-            "figure out the correct semantics for this (cannot just delete the files, as they might have data from other tiles in them no?)"
-        )
+        let arrays = match open_zarrs_filesystemstore().and_then(|store| self.paths.open(store)) {
+            Ok(arrays) => arrays,
+            Err(error) => {
+                tracing::warn!(%error, "Failed to open Zarr arrays for cleanup");
+                return;
+            }
+        };
+
+        for (name, array) in [
+            ("tiles", &arrays.tiles),
+            ("validity", &arrays.validity),
+            ("metadata", &arrays.metadata),
+        ] {
+            if let Err(error) = array.erase_chunk(&self.chunk_indices) {
+                tracing::warn!(
+                    %error,
+                    array = name,
+                    chunk_indices = ?self.chunk_indices,
+                    "Failed to erase Zarr cache chunk"
+                );
+            }
+        }
     }
 }
 
