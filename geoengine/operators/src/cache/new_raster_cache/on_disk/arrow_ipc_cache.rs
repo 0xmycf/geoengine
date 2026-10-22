@@ -1,5 +1,4 @@
 // TODO (low): handle all panics!
-#![allow(unused)]
 use std::{
     fmt::Write,
     fs,
@@ -67,6 +66,26 @@ use crate::{
     util::gdal::create_ndvi_meta_data,
 };
 
+#[derive(Debug, Clone)]
+pub struct IpcCommonData {
+    /// the datatype of the TypedRasterTile2D
+    data_type: RasterDataType,
+    /// The cache_hint from the tile, only used for [`StorageFormat::is_expired`]
+    cache_hint: CacheHint,
+    /// the cache key
+    cache_key: Arc<CacheKey>,
+}
+
+impl IpcCommonData {
+    pub fn new(data_type: RasterDataType, cache_hint: CacheHint, cache_key: Arc<CacheKey>) -> Self {
+        Self {
+            data_type,
+            cache_hint,
+            cache_key,
+        }
+    }
+}
+
 /*
     // TODO (low): revisit the visibility modifiers
 
@@ -75,22 +94,62 @@ use crate::{
     which means the cache (might) be persistent.
 */
 pub struct ArrowIpcStorageFormat {
-    pub path: PathBuf,
-    tile: TypedRasterTile2D, // TODO (low): make this optional and implement proper ways of not having it in RAM
-    /// The cached bytesize of the file ins storage
-    byte_size: usize,
-    /// the datatype of the TypedRasterTile2D
-    data_type: RasterDataType,
-    /// The cache_hint from the tile, only used for [`StorageFormat::is_expired`]
-    cache_hint: CacheHint,
+    // pub path: PathBuf,
+    tile: Vec<u8>,
+    common: IpcCommonData,
 }
 
+impl ArrowIpcStorageFormat {
+    pub fn new(tile: Vec<u8>, common: IpcCommonData) -> Self {
+        Self { tile, common }
+    }
+}
+
+// TODO (crit): {5c897d01-8846-473d-9976-3ef00d862c00}
+pub struct ArrowIpcDiskEntry {
+    pub path: PathBuf,
+    common: IpcCommonData,
+}
+
+impl ArrowIpcDiskEntry {
+    pub fn new(path: PathBuf, common: IpcCommonData) -> Self {
+        Self { path, common }
+    }
+}
+
+#[async_trait]
+impl DiskEntry for ArrowIpcDiskEntry {
+    type Prepared = ArrowIpcStorageFormat; //: OnDiskStorageFormat;
+
+    async fn read(&self) -> Result<Self::Prepared> {
+        let mut file = tokio::fs::File::open(self.path.clone()).await?;
+        let mut buf = vec![];
+
+        let _ = file.read_to_end(&mut buf).await?;
+        Ok(ArrowIpcStorageFormat::new(buf, self.common.clone()))
+    }
+}
+
+#[async_trait]
 impl OnDiskStorageFormat for ArrowIpcStorageFormat {
-    fn cleanup(&mut self) {
-        // TODO (high): {462286af-362d-42f0-a803-ebe807aa820b}
-        if let Err(err) = std::fs::remove_file(&self.path) {
-            tracing::warn!("Failed to remove file {}: {}", self.path.display(), err);
-        };
+    type Written = ArrowIpcDiskEntry; //: DiskEntry<Prepared = Self>;
+
+    /// Removes the file if writing fails
+    async fn write(self) -> Result<Self::Written> {
+        let (cache_dir, file_path) = path_for_cache_key(&self.common.cache_key).await?;
+        tokio::fs::create_dir_all(cache_dir.clone()).await?;
+        let cache_path = cache_dir.join(file_path);
+
+        let mut file = File::create(cache_path.clone())?;
+        match file.write_all(&self.tile) {
+            Err(err) => {
+                let _ = tokio::fs::remove_file(cache_path.clone()).await;
+                return Err(err.into());
+            }
+            _ => {}
+        }
+
+        Ok(ArrowIpcDiskEntry::new(cache_path, self.common))
     }
 }
 
@@ -120,51 +179,38 @@ impl StorageFormat for ArrowIpcStorageFormat {
         key: Arc<CacheKey>,
         _result_descriptor: /* TODO (crit): check if this must be used after the rebase! */ &RasterResultDescriptor,
     ) -> Result<Self> {
-        let (cache_dir, file_path) = path_for_cache_key(&key).await?;
-        tokio::fs::create_dir_all(cache_dir.clone()).await?;
-        let cache_path = cache_dir.join(file_path);
-
         let bytes = typed_raster_tile_to_arrow_ipc(tile.clone())?; // is cloning here necessary?
         let byte_size = bytes.len();
-        let mut file = File::create(cache_path.clone())?;
-        let _ = file.write_all(&bytes)?;
-
-        let data_type = tile.raster_data_type();
         let cache_hint = call_generic_raster_tile_2d!(&tile, tile => tile.cache_hint);
-        Ok(Self {
-            path: cache_path,
-            tile,
-            byte_size,
-            data_type,
-            cache_hint,
-        })
+        Ok(Self::new(
+            bytes,
+            IpcCommonData::new(tile.raster_data_type(), cache_hint, key),
+        ))
     }
 
     async fn load(&self) -> Result<TypedRasterTile2D> {
-        let mut file = tokio::fs::File::open(self.path.clone()).await?;
-        let mut buf = vec![];
-
-        let _ = file.read_to_end(&mut buf).await?;
-        match self.data_type {
-            RasterDataType::I8 => arrow_ipc_tile_to_typed_raster::<i8>(buf),
-            RasterDataType::I16 => arrow_ipc_tile_to_typed_raster::<i16>(buf),
-            RasterDataType::I32 => arrow_ipc_tile_to_typed_raster::<i32>(buf),
-            RasterDataType::I64 => arrow_ipc_tile_to_typed_raster::<i64>(buf),
-            RasterDataType::U8 => arrow_ipc_tile_to_typed_raster::<u8>(buf),
-            RasterDataType::U16 => arrow_ipc_tile_to_typed_raster::<u16>(buf),
-            RasterDataType::U32 => arrow_ipc_tile_to_typed_raster::<u32>(buf),
-            RasterDataType::U64 => arrow_ipc_tile_to_typed_raster::<u64>(buf),
-            RasterDataType::F32 => arrow_ipc_tile_to_typed_raster::<f32>(buf),
-            RasterDataType::F64 => arrow_ipc_tile_to_typed_raster::<f64>(buf),
+        match self.common.data_type {
+            RasterDataType::I8 => arrow_ipc_tile_to_typed_raster::<i8>(&self.tile),
+            RasterDataType::I16 => arrow_ipc_tile_to_typed_raster::<i16>(&self.tile),
+            RasterDataType::I32 => arrow_ipc_tile_to_typed_raster::<i32>(&self.tile),
+            RasterDataType::I64 => arrow_ipc_tile_to_typed_raster::<i64>(&self.tile),
+            RasterDataType::U8 => arrow_ipc_tile_to_typed_raster::<u8>(&self.tile),
+            RasterDataType::U16 => arrow_ipc_tile_to_typed_raster::<u16>(&self.tile),
+            RasterDataType::U32 => arrow_ipc_tile_to_typed_raster::<u32>(&self.tile),
+            RasterDataType::U64 => arrow_ipc_tile_to_typed_raster::<u64>(&self.tile),
+            RasterDataType::F32 => arrow_ipc_tile_to_typed_raster::<f32>(&self.tile),
+            RasterDataType::F64 => arrow_ipc_tile_to_typed_raster::<f64>(&self.tile),
         }
     }
 
+    /// Returns only the size of the bytes that will be written to the disk.
+    /// The additional sizes for the stuff that is kept in memory must be calculated seperately.
     async fn byte_size(&self) -> Result<usize> {
-        Ok(self.byte_size)
+        Ok(self.tile.len())
     }
 
     async fn is_expired(&self) -> bool {
-        self.cache_hint.is_expired()
+        self.common.cache_hint.is_expired()
     }
 }
 
@@ -175,7 +221,7 @@ fn typed_raster_tile_to_arrow_ipc(tile: TypedRasterTile2D) -> Result<Vec<u8>> {
     .map_err(|err| crate::error::Error::DataType { source: err })
 }
 
-fn arrow_ipc_tile_to_typed_raster<P>(tile: Vec<u8>) -> Result<TypedRasterTile2D>
+fn arrow_ipc_tile_to_typed_raster<P>(tile: &[u8]) -> Result<TypedRasterTile2D>
 where
     P: Pixel + SupportedRasterDataType,
 {

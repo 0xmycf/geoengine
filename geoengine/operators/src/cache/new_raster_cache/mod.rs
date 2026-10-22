@@ -2,9 +2,9 @@ pub mod on_disk;
 
 use crate::cache::cache_tiles::{CompressedRasterTile2D, CompressedRasterTileExt};
 use crate::cache::error::CacheError;
-use crate::cache::new_raster_cache::on_disk::OnDiskStore;
 use crate::cache::new_raster_cache::on_disk::arrow_ipc_cache::ArrowIpcStorageFormat;
 use crate::cache::new_raster_cache::on_disk::zarrs_cache::ZarrsStorageFormat;
+use crate::cache::new_raster_cache::on_disk::{DiskEntry, OnDiskStore};
 use crate::engine::{
     BoxRasterQueryProcessor, CanonicOperatorName, InitializedRasterOperator, QueryContext,
     QueryProcessor, RasterOperator, RasterQueryProcessor, RasterResultDescriptor,
@@ -203,11 +203,14 @@ impl NewRasterCacheEnum {
                 None => Ok(None),
             },
             Self::OnDiskMockFifoIpc(cache) => match cache.store.get(key).await? {
-                Some(entry) => Ok(Some(entry.load().await?)),
+                Some(entry) => Ok(Some(entry.read().await?.load().await?)),
                 None => Ok(None),
             },
             Self::OnDiskMockFifoZarr(cache) => match cache.store.get(key).await? {
-                Some(entry) => Ok(Some(entry.load().await?)),
+                Some(entry) => {
+                    let x = entry.read().await?.load().await?;
+                    Ok(Some(x))
+                }
                 None => Ok(None),
             },
         }

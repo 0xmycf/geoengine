@@ -57,7 +57,7 @@ use crate::{
         self,
         new_raster_cache::{
             on_disk::{
-                GLOBAL_GEOTRANSFORM_KEY, OnDiskStorageFormat, cache_dir,
+                DiskEntry, GLOBAL_GEOTRANSFORM_KEY, OnDiskStorageFormat, cache_dir,
                 time_interval_to_path_safe_iso,
             },
             *,
@@ -71,6 +71,27 @@ use crate::{
     },
     util::gdal::create_ndvi_meta_data,
 };
+
+pub struct ZarrDiskEntry {
+    // Abstraction over the filepaths to the different arrays used for serialising from/into Zarrs
+    paths: ZarrsArrayPath,
+    // The datatype of the tile, incase the tile is not present
+    // (future work (TODO (low): {9B0394FE-14E0-4B82-9BC6-E2EE119D86DF} fix this comment once resolved))
+    data_type: RasterDataType,
+    // the indicies in the Zarrs arrays of this tile, validity mask, metadata etc...
+    chunk_indices: [u64; 2],
+    // the cache hint for the tile
+    cache_hint: CacheHint,
+}
+
+#[async_trait]
+impl DiskEntry for ZarrDiskEntry {
+    type Prepared = ZarrsStorageFormat;
+
+    async fn read(&self) -> Result<Self::Prepared> {
+        todo!()
+    }
+}
 
 // How it is stored:
 // TODO (low): write this down in detail
@@ -90,6 +111,111 @@ pub struct ZarrsStorageFormat {
     chunk_indices: [u64; 2],
     // the cache hint for the tile
     cache_hint: CacheHint,
+}
+
+#[async_trait]
+impl StorageFormat for ZarrsStorageFormat {
+    async fn store(
+        tile: TypedRasterTile2D,
+        // (operator_name, band, time_interval, tile_index)
+        cache_key: Arc<CacheKey>,
+        result_descriptor: /* TODO (crit): must be used! after rebase! */ &RasterResultDescriptor,
+    ) -> Result<Self> {
+        let store = open_zarrs_filesystemstore()?;
+
+        let (arrays, paths) =
+            build_array_and_prepare_insert(&cache_key, store.clone(), &tile, result_descriptor)?;
+
+        let tile_bounds = raster_tile_bounds(
+            result_descriptor,
+            call_generic_raster_tile_2d!(&tile, tile => tile.global_geo_transform),
+            call_generic_raster_tile_2d!(&tile, tile => tile.grid_shape_array()).into(),
+        );
+
+        let chunk_indices = tile_position_to_chunk_indices(
+            call_generic_raster_tile_2d!(&tile, tile => tile.tile_position),
+            tile_bounds.min_index(),
+        )?;
+
+        let (byte_size_tile_data, byte_size_tile_validity) = {
+            let mut writer = ZarrChunkWriter::new(&arrays);
+            match writer.store_tile_chunks(&tile, &chunk_indices) {
+                Ok(sizes) => sizes,
+                Err(err) => {
+                    for completed in writer.get_attempted() {
+                        let (name, array) = match completed {
+                            CompletedZarrWrite::Tile => ("tiles", &arrays.tiles),
+                            CompletedZarrWrite::Validity => ("validity", &arrays.validity),
+                            CompletedZarrWrite::Metadata => ("metadata", &arrays.metadata),
+                        };
+                        if let Err(error) = array.erase_chunk(&chunk_indices) {
+                            tracing::warn!(
+                                %error,
+                                array = name,
+                                chunk_indices = ?chunk_indices,
+                                "Failed to erase Zarr cache chunk after write failure"
+                            );
+                        }
+                    }
+                    return Err(err);
+                }
+            }
+        };
+
+        let data_type = tile.raster_data_type();
+        let cache_hint = call_generic_raster_tile_2d!(&tile, tile => tile.cache_hint);
+        Ok(ZarrsStorageFormat {
+            paths,
+            tile,
+            data_type,
+            byte_size: byte_size_tile_data + byte_size_tile_validity, // TODO (mid): this might not be the total size that we actually need
+            chunk_indices,
+            cache_hint,
+        })
+    }
+
+    async fn load(&self) -> Result<TypedRasterTile2D> {
+        let ZarrsStorageFormat {
+            paths,
+            tile,
+            data_type,
+            byte_size,
+            chunk_indices,
+            cache_hint,
+        } = self;
+        let store = open_zarrs_filesystemstore()?;
+        let arrays = paths.open(store.clone())?;
+        let loaded_tile = arrays.retrieve_tile(chunk_indices, paths, *data_type, *cache_hint)?;
+        #[cfg(test)]
+        {
+            compare_tiles(tile, &loaded_tile);
+        }
+
+        Ok(loaded_tile)
+    }
+
+    async fn byte_size(&self) -> Result<usize> {
+        Ok(self.byte_size)
+    }
+
+    async fn is_expired(&self) -> bool {
+        self.cache_hint.is_expired()
+    }
+}
+
+// TODO (high): {462286af-362d-42f0-a803-ebe807aa820b}
+// while this is one implementation, the write / read guard is still missing
+// which could lead to race errors.
+#[async_trait]
+impl OnDiskStorageFormat for ZarrsStorageFormat {
+    /// Handle to the files on disk that can be read back into memory
+    // type Written: DiskEntry<Prepared = Self>;
+    type Written = ZarrDiskEntry;
+
+    /// Write the data to disk and return a handle to the files on disk
+    async fn write(self) -> Result<Self::Written> {
+        todo!()
+    }
 }
 
 /// using the `time_interval` in the `key` field does not work in all cases
@@ -604,36 +730,6 @@ fn open_zarrs_filesystemstore() -> Result<Arc<FilesystemStore>> {
     Ok(Arc::new(zarrs))
 }
 
-// TODO (high): {462286af-362d-42f0-a803-ebe807aa820b}
-// while this is one implementation, the write / read guard is still missing
-// which could lead to race errors.
-impl OnDiskStorageFormat for ZarrsStorageFormat {
-    fn cleanup(&mut self) {
-        let arrays = match open_zarrs_filesystemstore().and_then(|store| self.paths.open(store)) {
-            Ok(arrays) => arrays,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to open Zarr arrays for cleanup");
-                return;
-            }
-        };
-
-        for (name, array) in [
-            ("tiles", &arrays.tiles),
-            ("validity", &arrays.validity),
-            ("metadata", &arrays.metadata),
-        ] {
-            if let Err(error) = array.erase_chunk(&self.chunk_indices) {
-                tracing::warn!(
-                    %error,
-                    array = name,
-                    chunk_indices = ?self.chunk_indices,
-                    "Failed to erase Zarr cache chunk"
-                );
-            }
-        }
-    }
-}
-
 /// Returns the inclusive global `[y, x]` tile-index bounds intersecting the raster.
 /// Partial edge tiles are included; indices may be negative and are not zarr-chunk indices.
 fn raster_tile_bounds(
@@ -737,96 +833,6 @@ impl<'a> ZarrChunkWriter<'a> {
             )?;
 
         Ok((byte_size_tile_data, byte_size_tile_validity)) // TODO (crit): {ef998d34-209e-4eb1-a8dc-30b6cf084e55}
-    }
-}
-
-#[async_trait]
-impl StorageFormat for ZarrsStorageFormat {
-    async fn store(
-        tile: TypedRasterTile2D,
-        // (operator_name, band, time_interval, tile_index)
-        cache_key: Arc<CacheKey>,
-        result_descriptor: /* TODO (crit): must be used! after rebase! */ &RasterResultDescriptor,
-    ) -> Result<Self> {
-        let store = open_zarrs_filesystemstore()?;
-
-        let (arrays, paths) =
-            build_array_and_prepare_insert(&cache_key, store.clone(), &tile, result_descriptor)?;
-
-        let tile_bounds = raster_tile_bounds(
-            result_descriptor,
-            call_generic_raster_tile_2d!(&tile, tile => tile.global_geo_transform),
-            call_generic_raster_tile_2d!(&tile, tile => tile.grid_shape_array()).into(),
-        );
-
-        let chunk_indices = tile_position_to_chunk_indices(
-            call_generic_raster_tile_2d!(&tile, tile => tile.tile_position),
-            tile_bounds.min_index(),
-        )?;
-
-        let (byte_size_tile_data, byte_size_tile_validity) = {
-            let mut writer = ZarrChunkWriter::new(&arrays);
-            match writer.store_tile_chunks(&tile, &chunk_indices) {
-                Ok(sizes) => sizes,
-                Err(err) => {
-                    for completed in writer.get_attempted() {
-                        let (name, array) = match completed {
-                            CompletedZarrWrite::Tile => ("tiles", &arrays.tiles),
-                            CompletedZarrWrite::Validity => ("validity", &arrays.validity),
-                            CompletedZarrWrite::Metadata => ("metadata", &arrays.metadata),
-                        };
-                        if let Err(error) = array.erase_chunk(&chunk_indices) {
-                            tracing::warn!(
-                                %error,
-                                array = name,
-                                chunk_indices = ?chunk_indices,
-                                "Failed to erase Zarr cache chunk after write failure"
-                            );
-                        }
-                    }
-                    return Err(err);
-                }
-            }
-        };
-
-        let data_type = tile.raster_data_type();
-        let cache_hint = call_generic_raster_tile_2d!(&tile, tile => tile.cache_hint);
-        Ok(ZarrsStorageFormat {
-            paths,
-            tile,
-            data_type,
-            byte_size: byte_size_tile_data + byte_size_tile_validity, // TODO (mid): this might not be the total size that we actually need
-            chunk_indices,
-            cache_hint,
-        })
-    }
-
-    async fn load(&self) -> Result<TypedRasterTile2D> {
-        let ZarrsStorageFormat {
-            paths,
-            tile,
-            data_type,
-            byte_size,
-            chunk_indices,
-            cache_hint,
-        } = self;
-        let store = open_zarrs_filesystemstore()?;
-        let arrays = paths.open(store.clone())?;
-        let loaded_tile = arrays.retrieve_tile(chunk_indices, paths, *data_type, *cache_hint)?;
-        #[cfg(test)]
-        {
-            compare_tiles(tile, &loaded_tile);
-        }
-
-        Ok(loaded_tile)
-    }
-
-    async fn byte_size(&self) -> Result<usize> {
-        Ok(self.byte_size)
-    }
-
-    async fn is_expired(&self) -> bool {
-        self.cache_hint.is_expired()
     }
 }
 

@@ -57,17 +57,17 @@ pub fn arrow_ipc_file_to_raster_tile_2d<P>(tile: Vec<u8>) -> Result<RasterTile2D
 where
     P: Pixel,
 {
-    arrow_ipc_file_to_raster_tile_2d_impl(tile)
+    arrow_ipc_file_to_raster_tile_2d_impl(&tile)
 }
 
-pub fn arrow_ipc_file_to_raster_tile_2d_for_ipc_channel<P>(tile: Vec<u8>) -> Result<RasterTile2D<P>>
+pub fn arrow_ipc_file_to_raster_tile_2d_for_ipc_channel<P>(tile: &[u8]) -> Result<RasterTile2D<P>>
 where
     P: Pixel,
 {
     arrow_ipc_file_to_raster_tile_2d_impl(tile)
 }
 
-fn arrow_ipc_file_to_raster_tile_2d_impl<P>(tile: Vec<u8>) -> Result<RasterTile2D<P>>
+fn arrow_ipc_file_to_raster_tile_2d_impl<P>(tile: &[u8]) -> Result<RasterTile2D<P>>
 where
     P: Pixel,
 {
@@ -652,7 +652,7 @@ mod tests {
 
         let bytes = raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(original.clone()).unwrap();
         let restored: RasterTile2D<f32> =
-            arrow_ipc_file_to_raster_tile_2d_for_ipc_channel(bytes).unwrap();
+            arrow_ipc_file_to_raster_tile_2d_for_ipc_channel(&bytes).unwrap();
 
         assert!(restored.grid_array.is_empty());
         assert_eq!(original.grid_array, restored.grid_array);
@@ -689,7 +689,7 @@ mod tests {
 
         let bytes = raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(original.clone()).unwrap();
         let restored: RasterTile2D<u8> =
-            arrow_ipc_file_to_raster_tile_2d_for_ipc_channel(bytes).unwrap();
+            arrow_ipc_file_to_raster_tile_2d_for_ipc_channel(&bytes).unwrap();
 
         assert_eq!(original.time, restored.time);
         assert_eq!(original.band, restored.band);
