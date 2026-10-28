@@ -9,7 +9,7 @@ use std::{
     thread::ThreadId,
 };
 
-use geoengine_datatypes::primitives::DateTimeParseFormat;
+use geoengine_datatypes::{primitives::DateTimeParseFormat, raster::RasterDataType};
 
 use crate::cache::new_raster_cache::*;
 #[cfg(not(test))]
@@ -32,7 +32,7 @@ pub struct OnDiskStore<SF: OnDiskStorageFormat, ES: EvictionStrategy> {
 #[async_trait]
 pub trait OnDiskStorageFormat: StorageFormat {
     /// Handle to the files on disk that can be read back into memory
-    type Written: DiskEntry<Prepared = Self>;
+    type Written: DiskEntry; //<Prepared = Self>;
 
     /// Write the data to disk and return a handle to the files on disk
     async fn write(self) -> Result<Self::Written>;
@@ -43,9 +43,9 @@ pub trait OnDiskStorageFormat: StorageFormat {
 pub trait DiskEntry: Send + Sync + Sized + 'static {
     // The type that may be written to disk
     // this type is also eligible for in-memory caching
-    type Prepared: OnDiskStorageFormat;
+    // type Prepared: OnDiskStorageFormat;
 
-    async fn read(&self) -> Result<Self::Prepared>;
+    async fn read(&self) -> Result<TypedRasterTile2D>;
 }
 
 #[async_trait]
@@ -114,11 +114,12 @@ where
             eviction_strategy.record_removal(&evict_key);
         }
 
+        let written = prepared_tile.write().await?;
         eviction_strategy.record_access(&key, required_space, cache_hint);
         cache.insert(
             key,
             Arc::new(SizeTrackedEntry::new(
-                prepared_tile.write().await?,
+                written,
                 required_space,
                 self.total_current_size.clone(),
             )),
@@ -191,6 +192,26 @@ fn time_interval_to_path_safe_iso(time: &TimeInterval) -> String {
             .expect("it to be a valid datetime")
             .format(fmt)
     )
+}
+
+#[derive(Debug, Clone)]
+pub struct CommonOnDiskStorageData {
+    /// the datatype of the TypedRasterTile2D
+    pub data_type: RasterDataType,
+    /// The cache_hint from the tile, only used for [`StorageFormat::is_expired`]
+    pub cache_hint: CacheHint,
+    /// the cache key
+    pub cache_key: Arc<CacheKey>,
+}
+
+impl CommonOnDiskStorageData {
+    pub fn new(data_type: RasterDataType, cache_hint: CacheHint, cache_key: Arc<CacheKey>) -> Self {
+        Self {
+            data_type,
+            cache_hint,
+            cache_key,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -331,10 +352,9 @@ mod tests {
             let loaded = written
                 .read()
                 .await
-                .expect("it should be possible to read the tile from disk.")
-                .load()
-                .await
-                .expect(&format!("File '{path:#?}' should loadable as a RasterTile"));
+                .expect("it should be possible to read the tile from disk.");
+            // .expect(&format!("File '{path:#?}' should loadable as a RasterTile"));
+
             match loaded {
                 TypedRasterTile2D::U8(loaded_tile) => {
                     if let TypedRasterTile2D::U8(original_tile) = tile {
@@ -353,7 +373,9 @@ mod tests {
 
     mod zarrs {
         use super::*;
-        use crate::cache::new_raster_cache::on_disk::zarrs_cache::ZarrDiskEntry;
+        use crate::cache::new_raster_cache::on_disk::zarrs_cache::{
+            Old__ZarrDiskEntry, ZarrDiskEntry,
+        };
 
         #[tokio::test]
         async fn on_disk_storage_insert_and_get_with_zarrs() {
@@ -374,7 +396,7 @@ mod tests {
                 .insert(key.clone(), tile, &test_result_descriptor())
                 .await
                 .expect("it should be possible to insert the tile into the OnDiskStorage.");
-            let stored: Arc<SizeTrackedEntry<ZarrDiskEntry>> = store
+            let stored: Arc<SizeTrackedEntry<Old__ZarrDiskEntry>> = store
                 .get(&key)
                 .await
                 .expect("it should be present")
@@ -382,10 +404,10 @@ mod tests {
             let loaded = stored
                 .read()
                 .await
-                .unwrap()
-                .load()
-                .await
                 .expect("it should be possible to load the tile via the tile-ref.");
+            // .unwrap()
+            // .load()
+            // .await
 
             match loaded {
                 TypedRasterTile2D::U8(loaded_tile) => {
@@ -461,7 +483,7 @@ mod tests {
                 .insert(key.clone(), tile, &test_result_descriptor())
                 .await
                 .expect("it should be possible to insert the tile into the OnDiskStorage.");
-            let stored: Arc<SizeTrackedEntry<ZarrDiskEntry>> = store
+            let stored: Arc<SizeTrackedEntry<Old__ZarrDiskEntry>> = store
                 .get(&key)
                 .await
                 .expect("it should be present") // TODO (crit): figure out a better way
@@ -469,10 +491,10 @@ mod tests {
             let loaded = stored
                 .read()
                 .await
-                .unwrap()
-                .load()
-                .await
                 .expect("it should be possible to load the tile via the tile-ref.");
+            // .unwrap()
+            // .load()
+            // .await
 
             match loaded {
                 TypedRasterTile2D::U8(loaded_tile) => {

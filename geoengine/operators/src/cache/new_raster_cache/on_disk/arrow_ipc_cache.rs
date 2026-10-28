@@ -54,7 +54,10 @@ use crate::{
     cache::{
         self,
         new_raster_cache::{
-            on_disk::{OnDiskStorageFormat, cache_dir, time_interval_to_path_safe_iso},
+            on_disk::{
+                CommonOnDiskStorageData, OnDiskStorageFormat, cache_dir,
+                time_interval_to_path_safe_iso,
+            },
             *,
         },
     },
@@ -66,26 +69,6 @@ use crate::{
     util::gdal::create_ndvi_meta_data,
 };
 
-#[derive(Debug, Clone)]
-pub struct IpcCommonData {
-    /// the datatype of the TypedRasterTile2D
-    data_type: RasterDataType,
-    /// The cache_hint from the tile, only used for [`StorageFormat::is_expired`]
-    cache_hint: CacheHint,
-    /// the cache key
-    cache_key: Arc<CacheKey>,
-}
-
-impl IpcCommonData {
-    pub fn new(data_type: RasterDataType, cache_hint: CacheHint, cache_key: Arc<CacheKey>) -> Self {
-        Self {
-            data_type,
-            cache_hint,
-            cache_key,
-        }
-    }
-}
-
 /*
     // TODO (low): revisit the visibility modifiers
 
@@ -96,11 +79,11 @@ impl IpcCommonData {
 pub struct ArrowIpcStorageFormat {
     // pub path: PathBuf,
     tile: Vec<u8>,
-    common: IpcCommonData,
+    common: CommonOnDiskStorageData,
 }
 
 impl ArrowIpcStorageFormat {
-    pub fn new(tile: Vec<u8>, common: IpcCommonData) -> Self {
+    pub fn new(tile: Vec<u8>, common: CommonOnDiskStorageData) -> Self {
         Self { tile, common }
     }
 }
@@ -108,25 +91,28 @@ impl ArrowIpcStorageFormat {
 // TODO (crit): {5c897d01-8846-473d-9976-3ef00d862c00}
 pub struct ArrowIpcDiskEntry {
     pub path: PathBuf,
-    common: IpcCommonData,
+    common: CommonOnDiskStorageData,
 }
 
 impl ArrowIpcDiskEntry {
-    pub fn new(path: PathBuf, common: IpcCommonData) -> Self {
+    pub fn new(path: PathBuf, common: CommonOnDiskStorageData) -> Self {
         Self { path, common }
     }
 }
 
 #[async_trait]
 impl DiskEntry for ArrowIpcDiskEntry {
-    type Prepared = ArrowIpcStorageFormat; //: OnDiskStorageFormat;
+    // type Prepared = ArrowIpcStorageFormat; //: OnDiskStorageFormat;
 
-    async fn read(&self) -> Result<Self::Prepared> {
+    async fn read(&self) -> Result<TypedRasterTile2D> {
         let mut file = tokio::fs::File::open(self.path.clone()).await?;
         let mut buf = vec![];
 
         let _ = file.read_to_end(&mut buf).await?;
-        Ok(ArrowIpcStorageFormat::new(buf, self.common.clone()))
+        // TODO construct the tile right away
+        Ok(ArrowIpcStorageFormat::new(buf, self.common.clone())
+            .load()
+            .await?)
     }
 }
 
@@ -184,7 +170,7 @@ impl StorageFormat for ArrowIpcStorageFormat {
         let cache_hint = call_generic_raster_tile_2d!(&tile, tile => tile.cache_hint);
         Ok(Self::new(
             bytes,
-            IpcCommonData::new(tile.raster_data_type(), cache_hint, key),
+            CommonOnDiskStorageData::new(tile.raster_data_type(), cache_hint, key),
         ))
     }
 

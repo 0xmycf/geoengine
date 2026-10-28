@@ -203,12 +203,12 @@ impl NewRasterCacheEnum {
                 None => Ok(None),
             },
             Self::OnDiskMockFifoIpc(cache) => match cache.store.get(key).await? {
-                Some(entry) => Ok(Some(entry.read().await?.load().await?)),
+                Some(entry) => Ok(Some(entry.read().await?)),
                 None => Ok(None),
             },
             Self::OnDiskMockFifoZarr(cache) => match cache.store.get(key).await? {
                 Some(entry) => {
-                    let x = entry.read().await?.load().await?;
+                    let x = entry.read().await?;
                     Ok(Some(x))
                 }
                 None => Ok(None),
@@ -1001,8 +1001,10 @@ where
     }
 }
 
-pub fn typed_raster_tile_2d_to_grid(this: &TypedRasterTile2D) -> Option<Grid<GridShape2D, bool>> {
-    call_generic_raster_tile_2d!(this, base_tile => match base_tile.grid_array.clone() {
+pub fn typed_raster_tile_2d_to_grid_validity_mask(
+    this: &TypedRasterTile2D,
+) -> Option<Grid<GridShape2D, bool>> {
+    call_generic_raster_tile_2d!(this, base_tile => match base_tile.grid_array.clone() { // TODO (mid): remove clone?
         geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
             Some(masked_grid.validity_mask)
         }
@@ -1010,8 +1012,10 @@ pub fn typed_raster_tile_2d_to_grid(this: &TypedRasterTile2D) -> Option<Grid<Gri
     })
 }
 
-fn typed_raster_tile_2d_to_typed_grid_2d(this: &TypedRasterTile2D) -> Option<TypedGrid2D> {
-    call_generic_raster_tile_2d!(this, base_tile => match base_tile.grid_array.clone() {
+fn typed_raster_tile_2d_to_typed_grid_2d_grid_array(
+    this: &TypedRasterTile2D,
+) -> Option<TypedGrid2D> {
+    call_generic_raster_tile_2d!(this, base_tile => match base_tile.grid_array.clone() { // TODO (mid): remove clone?
         geoengine_datatypes::raster::GridOrEmpty::Grid(masked_grid) => {
             Some(masked_grid.inner_grid.into())
         }
