@@ -34,6 +34,7 @@ pub trait OnDiskStorageFormat: StorageFormat {
     /// Handle to the files on disk that can be read back into memory
     type Written: DiskEntry; //<Prepared = Self>;
 
+    // TODO (crit): {00ab4c2f-3bee-4f03-864f-a1d1e02e6d4a}
     /// Write the data to disk and return a handle to the files on disk
     async fn write(self) -> Result<Self::Written>;
 }
@@ -58,12 +59,11 @@ where
     type ES = ES;
 
     async fn get(&self, key: &CacheKey) -> Result<Option<Arc<Self::SF>>> {
-        todo!()
-        // let x = self.cache_index.read().await.get(key).map(Arc::clone);
-        // match x {
-        //     Some(key) => Ok(Some(key)),
-        //     None => Ok(None),
-        // }
+        let x = self.cache_index.read().await.get(key).map(Arc::clone);
+        match x {
+            Some(key) => Ok(Some(key)),
+            None => Ok(None),
+        }
     }
 
     // TODO (crit): this function probably not right anymore, the base has changed a lot. fix it! after rebase
@@ -173,9 +173,9 @@ fn cache_dir() -> PathBuf {
 fn cache_dir() -> PathBuf {
     RASTER_CACHE_DIR
         .read()
-        .expect("read lock should not be poisoned")
+        .expect("[cfg(test) cache_dir] read lock should not be poisoned")
         .get(&std::thread::current().id())
-        .expect("the value to be present")
+        .expect("[cfg(test) cache_dir] the thread.id() to be present")
         .clone()
 }
 
@@ -373,15 +373,13 @@ mod tests {
 
     mod zarrs {
         use super::*;
-        use crate::cache::new_raster_cache::on_disk::zarrs_cache::{
-            Old__ZarrDiskEntry, ZarrDiskEntry,
-        };
+        use crate::cache::new_raster_cache::on_disk::zarrs_cache::ZarrDiskEntry;
 
         #[tokio::test]
         async fn on_disk_storage_insert_and_get_with_zarrs() {
             initialize_test_zarrs_cache_dir();
 
-            let store: OnDiskStore<ZarrsStorageFormat, FifoEvictionStrategy> = OnDiskStore {
+            let store: OnDiskStore<PreparedZarrStorageFormat, FifoEvictionStrategy> = OnDiskStore {
                 cache_index: RwLock::new(HashMap::new()),
                 eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(usize::MAX))),
                 total_current_size: Arc::new(AtomicUsize::new(0)),
@@ -396,7 +394,7 @@ mod tests {
                 .insert(key.clone(), tile, &test_result_descriptor())
                 .await
                 .expect("it should be possible to insert the tile into the OnDiskStorage.");
-            let stored: Arc<SizeTrackedEntry<Old__ZarrDiskEntry>> = store
+            let stored = store
                 .get(&key)
                 .await
                 .expect("it should be present")
@@ -405,9 +403,6 @@ mod tests {
                 .read()
                 .await
                 .expect("it should be possible to load the tile via the tile-ref.");
-            // .unwrap()
-            // .load()
-            // .await
 
             match loaded {
                 TypedRasterTile2D::U8(loaded_tile) => {
@@ -431,9 +426,10 @@ mod tests {
             let band = 0;
             let key = test_key(band);
             let tile = test_tile_u8(band);
-            let stored = ZarrsStorageFormat::store(tile.clone(), key, &test_result_descriptor())
-                .await
-                .expect("it should be possible to store the tile.");
+            let stored =
+                PreparedZarrStorageFormat::store(tile.clone(), key, &test_result_descriptor())
+                    .await
+                    .expect("it should be possible to store the tile.");
 
             {
                 // check if the zarrs thing is there
@@ -468,7 +464,7 @@ mod tests {
         async fn zarrs_storage_format_insert_and_get() {
             initialize_test_zarrs_cache_dir();
 
-            let store: OnDiskStore<ZarrsStorageFormat, FifoEvictionStrategy> = OnDiskStore {
+            let store: OnDiskStore<PreparedZarrStorageFormat, FifoEvictionStrategy> = OnDiskStore {
                 cache_index: RwLock::new(HashMap::new()),
                 eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(usize::MAX))),
                 total_current_size: Arc::new(AtomicUsize::new(0)),
@@ -483,7 +479,7 @@ mod tests {
                 .insert(key.clone(), tile, &test_result_descriptor())
                 .await
                 .expect("it should be possible to insert the tile into the OnDiskStorage.");
-            let stored: Arc<SizeTrackedEntry<Old__ZarrDiskEntry>> = store
+            let stored = store
                 .get(&key)
                 .await
                 .expect("it should be present") // TODO (crit): figure out a better way
@@ -492,9 +488,6 @@ mod tests {
                 .read()
                 .await
                 .expect("it should be possible to load the tile via the tile-ref.");
-            // .unwrap()
-            // .load()
-            // .await
 
             match loaded {
                 TypedRasterTile2D::U8(loaded_tile) => {

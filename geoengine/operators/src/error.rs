@@ -559,14 +559,28 @@ pub enum Error {
     ZarrArrayCreateError {
         source: zarrs::array::ArrayCreateError,
     },
+    #[snafu(display("Error while creating a group with zarrs: {source}"))]
+    ZarrGroupCreateError {
+        source: zarrs::group::GroupCreateError,
+    },
     #[snafu(display("Error while working on an array with zarrs: {source}"))]
     ZarrArrayError {
         source: zarrs::array::ArrayError,
     },
-    #[snafu(display("Error while inserting on an array with zarrs: {source} for {storage}."))]
+    #[snafu(display("Error while inserting on an array with zarrs: {source} for {which_tile}."))]
     ZarrArrayStoreError {
-        storage: WhichTile,
+        which_tile: WhichTile,
         source: zarrs::array::ArrayError,
+    },
+    #[snafu(display(
+        "Unexpected array identifier {key}. Expected one of: tiles, validity, metadata."
+    ))]
+    ZarrsGeoengineCacheArrayMappingError {
+        key: String,
+    },
+    #[snafu(display("Zarr cache metadata at {key} does not match the expected definition."))]
+    ZarrCacheMetadataMismatch {
+        key: String,
     },
     #[snafu(display("Invalid Zarr tile index: {reason}"))]
     InvalidZarrTileIndex {

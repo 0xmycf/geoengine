@@ -29,6 +29,8 @@ use geoengine_datatypes::{
     },
     util::ByteSize,
 };
+use ipc_channel::ipc::bytes_channel;
+use itertools::Itertools;
 use num::ToPrimitive;
 use opentelemetry::global;
 use serde_json::{Value, json};
@@ -53,6 +55,10 @@ use zarrs::{
     },
     filesystem::FilesystemStore,
     group::GroupBuilder,
+    storage::{
+        ListableStorageTraits, ReadableStorageTraits, ReadableWritableStorageTraits, StoreKey,
+        WritableStorageTraits, store::MemoryStore,
+    },
 };
 
 use crate::{
@@ -92,7 +98,7 @@ impl DiskEntry for ZarrDiskEntry {
     // type Prepared = New__ZarrsStorageFormat;
 
     async fn read(&self) -> Result<TypedRasterTile2D> {
-        let store = open_zarrs_filesystemstore()?;
+        let store = open_zarrs_filesystemstore(&self.paths)?;
         let arrays = self.paths.open(store)?;
         arrays.retrieve_tile(
             &self.chunk_indices,
@@ -104,23 +110,279 @@ impl DiskEntry for ZarrDiskEntry {
 }
 
 #[derive(Debug)]
-#[allow(non_snake_case, non_camel_case_types)] // TODO (crit): rename this once done
-pub struct New__ZarrsStorageFormat {
-    // Abstraction over the filepaths to the different arrays used for serialising from/into Zarrs
+struct ZarrStoreEntry {
+    store_key: StoreKey,
+    /// The bytes are optional, for example for empty tiles
+    bytes: Option<bytes::Bytes>,
+}
+
+impl ZarrStoreEntry {
+    fn new((store_key, bytes): (StoreKey, Option<bytes::Bytes>)) -> Self {
+        Self { store_key, bytes }
+    }
+
+    fn set_in_store<TStore>(&self, store: &TStore) -> Result<()>
+    where
+        TStore: WritableStorageTraits,
+    {
+        if let Some(bytes) = self.bytes.clone() {
+            store
+                .set(&self.store_key, bytes)
+                .map_err(|err| Error::ZarrArrayError { source: err.into() })?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+#[allow(non_snake_case, non_camel_case_types)]
+pub struct PreparedZarrStorageFormat {
+    // the zarr array definitions
+    layout: [(StoreKey, bytes::Bytes); 4],
+    tile_data: ZarrStoreEntry,
+    validity_data: ZarrStoreEntry,
+    metadata: ZarrStoreEntry,
+
+    byte_size: u64,
     paths: ZarrsArrayPath,
 
-    zarr_tile_data: ZarrTileData,
-    // /// None iff empty tile
-    // tile_grid: Option<TypedGrid2D>,
-    // /// None iff empty tile
-    // validity_mask: Option<Vec<bool>>,
-    // zarr_metadata_chunk: ZarrsMetaDataChunk,
-
-    // the indicies in the Zarrs arrays of this tile, validity mask, metadata etc...
     chunk_indices: [u64; 2],
-    array_data: ZarrArrayData,
 
     common: CommonOnDiskStorageData,
+}
+
+impl PreparedZarrStorageFormat {
+    const METADATA: &str = "metadata";
+    const VALIDITY: &str = "validity";
+    const TILES: &str = "tiles";
+}
+
+fn key_to_array<'a, 'b>(key: &'a StoreKey) -> Option<&'b str> {
+    match key.as_str().split('/').next() {
+        Some("metadata") => Some(PreparedZarrStorageFormat::METADATA),
+        Some("validity") => Some(PreparedZarrStorageFormat::VALIDITY),
+        Some("tiles") => Some(PreparedZarrStorageFormat::TILES),
+        _ => None,
+    }
+}
+
+#[async_trait]
+impl StorageFormat for PreparedZarrStorageFormat {
+    // TODO (high): remove the unwraps and expects.
+    async fn store(
+        tile: TypedRasterTile2D,
+        cache_key: Arc<CacheKey>,
+        result_descriptor: &RasterResultDescriptor,
+    ) -> Result<Self> {
+        let store = Arc::new(MemoryStore::new());
+        let group = GroupBuilder::new()
+            .build(Arc::clone(&store), "/")
+            .map_err(|source| Error::ZarrGroupCreateError { source })?;
+        group
+            .store_metadata()
+            .map_err(|err| Error::ZarrArrayCreateError { source: err.into() })?;
+
+        let chunk_indices = {
+            let global_geo_transform =
+                call_generic_raster_tile_2d!(&tile, tile => tile.global_geo_transform);
+            let tile_bounds = raster_tile_bounds(
+                result_descriptor,
+                global_geo_transform,
+                call_generic_raster_tile_2d!(&tile, tile => tile.grid_shape_array()).into(),
+            );
+
+            tile_position_to_chunk_indices(
+                call_generic_raster_tile_2d!(&tile, tile => tile.tile_position),
+                tile_bounds.min_index(),
+            )
+        }?;
+        let common = {
+            let cache_hint = call_generic_raster_tile_2d!(&tile, tile => tile.cache_hint.clone());
+
+            CommonOnDiskStorageData::new(
+                tile.raster_data_type(),
+                cache_hint,
+                Arc::clone(&cache_key),
+            )
+        };
+
+        let paths = ZarrsArrayPath::from_cache_key(&cache_key);
+        let arrays = build_array_and_prepare_insert(
+            //
+            &cache_key,
+            &paths,
+            Arc::clone(&store),
+            &tile,
+            result_descriptor,
+        )?;
+
+        let _ = {
+            let mut writer = ZarrChunkWriter::new(&arrays);
+            match writer.store_tile_chunks(&tile, chunk_indices) {
+                Ok(sizes) => sizes,
+                Err(err) => {
+                    for completed in writer.attempted() {
+                        let (name, array) = match completed {
+                            CompletedZarrWrite::Tile => ("tiles", &arrays.tiles),
+                            CompletedZarrWrite::Validity => ("validity", &arrays.validity),
+                            CompletedZarrWrite::Metadata => ("metadata", &arrays.metadata),
+                        };
+                        // TODO (crit): this is not even neccessary here.
+                        if let Err(error) = array.erase_chunk(&chunk_indices) {
+                            tracing::warn!(
+                                %error,
+                                array = name,
+                                chunk_indices = ?chunk_indices,
+                                "Failed to erase Zarr cache chunk after write failure"
+                            );
+                        }
+                    }
+                    return Err(err);
+                }
+            }
+        };
+
+        let mut layout_builder = Vec::with_capacity(4);
+        let mut data: HashMap<&str, (StoreKey, Option<bytes::Bytes>)> = HashMap::with_capacity(3);
+        let mut byte_size = 0_u64;
+        for key in store
+            .list()
+            .map_err(|err| Error::ZarrArrayError { source: err.into() })?
+        {
+            let is_json = key.as_str().ends_with(".json");
+
+            let bytes = store.get(&key).expect("The key to be present");
+
+            byte_size += bytes.as_ref().map(|x| x.len()).unwrap_or(0) as u64;
+            if is_json {
+                layout_builder.push((key, bytes.expect("the bytes to be present")));
+            } else {
+                data.insert(
+                    key_to_array(&key).ok_or(Error::ZarrsGeoengineCacheArrayMappingError {
+                        key: key.to_string(),
+                    })?,
+                    (key, bytes),
+                );
+            }
+        }
+        Ok(PreparedZarrStorageFormat {
+            layout: layout_builder
+                .try_into()
+                .expect("the layout to have 4 entries"),
+            tile_data: ZarrStoreEntry::new(
+                data.remove(PreparedZarrStorageFormat::TILES)
+                    .expect("tiles component to be present"),
+            ),
+            validity_data: ZarrStoreEntry::new(
+                data.remove(PreparedZarrStorageFormat::VALIDITY)
+                    .expect("validity component to be present"),
+            ),
+            metadata: ZarrStoreEntry::new(
+                data.remove(PreparedZarrStorageFormat::METADATA)
+                    .expect("metadata component to be present"),
+            ),
+
+            paths,
+            chunk_indices,
+            byte_size,
+            common,
+        })
+    }
+
+    async fn load(&self) -> Result<TypedRasterTile2D> {
+        let store = Arc::new(MemoryStore::new());
+        write_to_store(&self, &store, true /* write jsons too */)?;
+        let arrays = self.paths.open(Arc::clone(&store))?;
+        arrays.retrieve_tile(
+            &self.chunk_indices,
+            &self.paths,
+            self.common.data_type,
+            self.common.cache_hint,
+        )
+    }
+
+    async fn byte_size(&self) -> Result<usize> {
+        Ok(self.byte_size as usize)
+    }
+
+    async fn is_expired(&self) -> bool {
+        self.common.cache_hint.is_expired()
+    }
+}
+
+fn write_to_store<TStore>(
+    data: &PreparedZarrStorageFormat,
+    store: &TStore,
+    write_json: bool,
+) -> Result<()>
+where
+    TStore: WritableStorageTraits,
+{
+    if write_json {
+        for (key, bytes) in &data.layout {
+            store
+                .set(&key, bytes.clone())
+                .map_err(|err| Error::ZarrArrayError { source: err.into() })?;
+        }
+    }
+    data.tile_data.set_in_store(store)?;
+    data.validity_data.set_in_store(store)?;
+    data.metadata.set_in_store(store)?;
+    Ok(())
+}
+
+fn ensure_layout<TStore>(store: &TStore, layout: &[(StoreKey, bytes::Bytes); 4]) -> Result<()>
+where
+    TStore: ReadableWritableStorageTraits,
+{
+    for (key, expected_bytes) in layout {
+        match store
+            .get(key)
+            .map_err(|err| Error::ZarrArrayError { source: err.into() })?
+        {
+            None => {
+                // Definition is absent: write it.
+                store
+                    .set(key, expected_bytes.clone())
+                    .map_err(|err| Error::ZarrArrayError { source: err.into() })?;
+            }
+            Some(actual) => {
+                check_metadata_matches(key, &actual, expected_bytes)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_metadata_matches(key: &StoreKey, actual: &[u8], expected: &[u8]) -> Result<()> {
+    let actual: Value = serde_json::from_slice(actual)?;
+    let expected: Value = serde_json::from_slice(expected)?;
+
+    if actual != expected {
+        return Err(Error::ZarrCacheMetadataMismatch {
+            key: key.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+#[async_trait]
+impl OnDiskStorageFormat for PreparedZarrStorageFormat {
+    type Written = ZarrDiskEntry;
+
+    async fn write(self) -> Result<Self::Written> {
+        let store = open_zarrs_filesystemstore(&self.paths)?;
+        ensure_layout(&store, &self.layout)?;
+
+        write_to_store(&self, &store, false /* dont write zarr-layout jsons */)?;
+        Ok(ZarrDiskEntry {
+            paths: self.paths,
+            data_type: self.common.data_type,
+            chunk_indices: self.chunk_indices,
+            cache_hint: self.common.cache_hint,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -144,11 +406,14 @@ struct ZarrArrayData {
 }
 
 impl ZarrArrayData {
-    fn build_arrays(
+    fn build_arrays<TStore>(
         self,
         paths: &ZarrsArrayPath,
-        store: Arc<FilesystemStore>,
-    ) -> Result<ZarrsArrayAccess> {
+        store: Arc<TStore>,
+    ) -> Result<ZarrsArrayAccess<TStore>>
+    where
+        TStore: ReadableWritableStorageTraits + 'static,
+    {
         let self_arr = open_or_create_new_zarrs_array(
             &paths.tiles(),
             store.clone(),
@@ -190,419 +455,13 @@ impl ZarrArrayData {
     }
 }
 
-impl New__ZarrsStorageFormat {
-    fn new(
-        paths: ZarrsArrayPath,
-        tile_grid: Option<TypedGrid2D>,
-        validity_mask: Option<Vec<bool>>,
-        zarr_metadata_chunk: ZarrsMetaDataChunk,
-        chunk_indices: [u64; 2],
-        array_data: ZarrArrayData,
-        common: CommonOnDiskStorageData,
-    ) -> Self {
-        Self {
-            paths,
-            zarr_tile_data: ZarrTileData {
-                tile_grid,
-                validity_mask,
-                zarr_metadata_chunk,
-            },
-            chunk_indices,
-            array_data,
-            common,
-        }
-    }
-
-    fn geotransform_to_attributes_map(transform: &GeoTransform) -> serde_json::Map<String, Value> {
-        let mut map = serde_json::Map::new();
-        map.insert(
-            GLOBAL_GEOTRANSFORM_KEY.to_string(),
-            serde_json::to_value(transform).expect("it to be serialisable"),
-        );
-        map
-    }
-
-    fn array_data(
-        paths: &ZarrsArrayPath,
-        global_geo_transform: &GeoTransform,
-        result_descriptor: &RasterResultDescriptor,
-        tile: &TypedRasterTile2D,
-    ) -> Result<ZarrArrayData> {
-        let attributes =
-            New__ZarrsStorageFormat::geotransform_to_attributes_map(global_geo_transform);
-
-        // also the chunk shape
-        let tile_shape = {
-            let [tile_height, tile_width] =
-                call_generic_raster_tile_2d!(tile, tile => tile.grid_shape_array());
-            [tile_height as u64, tile_width as u64]
-        };
-        let tile_bounds = raster_tile_bounds(
-            result_descriptor,
-            call_generic_raster_tile_2d!(tile, tile => tile.global_geo_transform),
-            call_generic_raster_tile_2d!(tile, tile => tile.grid_shape_array()).into(),
-        );
-        let mut tile_counts = [0; 2];
-        let mut array_shape = [0; 2];
-        for axis in 0..2 {
-            let count = tile_bounds.max_index().as_slice()[axis] as i128
-                - tile_bounds.min_index().as_slice()[axis] as i128
-                + 1;
-            tile_counts[axis] = u64::try_from(count).map_err(|_| Error::InvalidZarrTileIndex {
-                reason: "array tile count exceeds u64",
-            })?;
-            array_shape[axis] = tile_counts[axis].checked_mul(tile_shape[axis]).ok_or(
-                Error::InvalidZarrTileIndex {
-                    reason: "array pixel extent exceeds u64",
-                },
-            )?;
-        }
-        let zarr_data_type = zarrs_data_type(tile);
-        let fill_value = filler_value(tile);
-        Ok(ZarrArrayData {
-            attributes,
-            tile_shape,
-            tile_bounds,
-            tile_counts,
-            array_shape,
-            zarr_data_type,
-            fill_value,
-        })
-    }
-}
-
-#[async_trait]
-impl StorageFormat for New__ZarrsStorageFormat {
-    async fn store(
-        tile: TypedRasterTile2D,
-        cache_key: Arc<CacheKey>,
-        result_descriptor: &RasterResultDescriptor,
-    ) -> Result<Self> {
-        let paths = ZarrsArrayPath::from_cache_key(&cache_key);
-        let tile_grid = typed_raster_tile_2d_to_typed_grid_2d_grid_array(&tile);
-        let validity_mask = typed_raster_tile_2d_to_grid_validity_mask(&tile).map(|x| x.data);
-        let zarr_metadata_chunk = ZarrsMetaDataChunk {
-            tile_position: call_generic_raster_tile_2d!(&tile,
-                tile => tile.tile_position),
-            properties: call_generic_raster_tile_2d!(&tile,
-                tile => tile.properties.clone()),
-            time_interval: call_generic_raster_tile_2d!(&tile,
-                tile => tile.time.clone()),
-            is_no_data: call_generic_raster_tile_2d!(&tile,
-                tile => tile.grid_array.is_empty()),
-        };
-        let global_geo_transform =
-            call_generic_raster_tile_2d!(&tile, tile => tile.global_geo_transform);
-        let chunk_indices = {
-            let tile_bounds = raster_tile_bounds(
-                result_descriptor,
-                global_geo_transform,
-                call_generic_raster_tile_2d!(&tile, tile => tile.grid_shape_array()).into(),
-            );
-
-            tile_position_to_chunk_indices(
-                call_generic_raster_tile_2d!(&tile, tile => tile.tile_position),
-                tile_bounds.min_index(),
-            )
-        }?;
-        let common = {
-            let cache_hint = call_generic_raster_tile_2d!(&tile, tile => tile.cache_hint.clone());
-
-            CommonOnDiskStorageData::new(
-                tile.raster_data_type(),
-                cache_hint,
-                Arc::clone(&cache_key),
-            )
-        };
-        let array_data = New__ZarrsStorageFormat::array_data(
-            &paths,
-            &global_geo_transform,
-            result_descriptor,
-            &tile,
-        )?;
-        Ok(Self::new(
-            paths,
-            tile_grid,
-            validity_mask,
-            zarr_metadata_chunk,
-            chunk_indices,
-            array_data,
-            common,
-        ))
-    }
-
-    async fn load(&self) -> Result<TypedRasterTile2D> {
-        let metadata = &self.zarr_tile_data.zarr_metadata_chunk;
-        let global_geo_transform: GeoTransform =
-            serde_json::from_value(self.array_data.attributes[GLOBAL_GEOTRANSFORM_KEY].clone())
-                .expect("it to be deserialisable");
-        let tile_shape: GridShape2D = [
-            self.array_data.tile_shape[0] as usize,
-            self.array_data.tile_shape[1] as usize,
-        ]
-        .into();
-
-        macro_rules! dispatch {
-            ($variant:ident) => {{
-                let grid_array = if metadata.is_no_data {
-                    GridOrEmpty::new_empty(EmptyGrid::new(tile_shape))
-                } else {
-                    let Some(TypedGrid::$variant(grid)) = &self.zarr_tile_data.tile_grid else {
-                        unreachable!("non-empty tile must have a grid of its declared data type");
-                    };
-                    let validity_mask = self
-                        .zarr_tile_data
-                        .validity_mask
-                        .as_ref()
-                        .expect("non-empty tile must have a validity mask"); // TODO (high): {5a2389d6-babc-4896-a5e8-42aa13af871f}
-                    GridOrEmpty::new_grid(
-                        MaskedGrid2D::new(
-                            grid.clone(),
-                            Grid::new(tile_shape, validity_mask.clone())
-                                .expect("validity mask to have the correct shape"),
-                        )
-                        .expect("data and validity mask to have matching shapes"),
-                    )
-                };
-                Ok(TypedRasterTile2D::$variant(
-                    RasterTile2D::new_with_properties(
-                        metadata.time_interval,
-                        metadata.tile_position,
-                        self.paths.band(),
-                        global_geo_transform,
-                        grid_array,
-                        metadata.properties.clone(),
-                        self.common.cache_hint,
-                    ),
-                ))
-            }};
-        }
-
-        match self.common.data_type {
-            RasterDataType::U8 => dispatch!(U8),
-            RasterDataType::U16 => dispatch!(U16),
-            RasterDataType::U32 => dispatch!(U32),
-            RasterDataType::U64 => dispatch!(U64),
-            RasterDataType::I8 => dispatch!(I8),
-            RasterDataType::I16 => dispatch!(I16),
-            RasterDataType::I32 => dispatch!(I32),
-            RasterDataType::I64 => dispatch!(I64),
-            RasterDataType::F32 => dispatch!(F32),
-            RasterDataType::F64 => dispatch!(F64),
-        }
-    }
-
-    /// tile.data + validity + metadata (+ zarr overhead)
-    /// this is not the size of the full struct
-    async fn byte_size(&self) -> Result<usize> {
-        let tile_data_size = self
-            .zarr_tile_data
-            .tile_grid
-            .as_ref()
-            .map(|grid| call_generic_grid_2d!(grid, grid => grid.byte_size()))
-            .unwrap_or(0);
-        let validity_size = self
-            .zarr_tile_data
-            .validity_mask
-            .as_ref()
-            .map(|mask| mask.len())
-            .unwrap_or(0);
-        let metadata_size = self
-            .zarr_tile_data
-            .zarr_metadata_chunk
-            .clone()
-            .into_array_bytes(
-                /* the datatype is ignored */
-                &zarrs::array::data_type::bytes(),
-            )
-            .map(|x| x.size())
-            .map_err(|err| Error::ZarrArrayError { source: err.into() })?;
-
-        Ok(tile_data_size + validity_size + metadata_size)
-    }
-
-    async fn is_expired(&self) -> bool {
-        self.common.cache_hint.is_expired()
-    }
-}
-
-#[async_trait]
-impl OnDiskStorageFormat for New__ZarrsStorageFormat {
-    type Written = ZarrDiskEntry;
-
-    async fn write(self) -> Result<Self::Written> {
-        let arrays = self
-            .array_data
-            .build_arrays(&self.paths, open_zarrs_filesystemstore()?)?;
-        let (byte_size_tile_data, byte_size_tile_validity) = {
-            let mut writer = ZarrChunkWriter::new(&arrays);
-            match writer.store_tile_chunks_v2(self.zarr_tile_data, self.chunk_indices) {
-                Ok(sizes) => sizes,
-                Err(err) => {
-                    for completed in writer.get_attempted() {
-                        let (name, array) = match completed {
-                            CompletedZarrWrite::Tile => ("tiles", &arrays.tiles),
-                            CompletedZarrWrite::Validity => ("validity", &arrays.validity),
-                            CompletedZarrWrite::Metadata => ("metadata", &arrays.metadata),
-                        };
-                        if let Err(error) = array.erase_chunk(&self.chunk_indices) {
-                            tracing::warn!(
-                                %error,
-                                array = name,
-                                chunk_indices = ?self.chunk_indices,
-                                "Failed to erase Zarr cache chunk after write failure"
-                            );
-                        }
-                    }
-                    return Err(err);
-                }
-            }
-        };
-
-        Ok(ZarrDiskEntry {
-            paths: self.paths,
-            data_type: self.common.data_type,
-            chunk_indices: self.chunk_indices,
-            cache_hint: self.common.cache_hint,
-        })
-    }
-}
-
-// How it is stored:
-// TODO (low): write this down in detail
-pub struct ZarrsStorageFormat {
-    // Abstraction over the filepaths to the different arrays used for serialising from/into Zarrs
-    paths: ZarrsArrayPath,
-    // The actual tile, might be evicted from RAM, stored on Disk if there is enough space
-    tile: TypedRasterTile2D, // TODO (low): make this optional and implement proper ways of not having it in RAM {9B0394FE-14E0-4B82-9BC6-E2EE119D86DF}
-    // The datatype of the tile, incase the tile is not present
-    // (future work (TODO (low): {9B0394FE-14E0-4B82-9BC6-E2EE119D86DF} fix this comment once resolved))
-    data_type: RasterDataType,
-    // The size (in bytes) this takes up on the disk
-    // TODO (mid): is it important to also specify byte size in RAM, do we also need to calcualte the size of this whole struct?
-    //             as this struct is also stored in RAM and takes up the cache space?
-    byte_size: usize,
-    // the indicies in the Zarrs arrays of this tile, validity mask, metadata etc...
-    chunk_indices: [u64; 2],
-    // the cache hint for the tile
-    cache_hint: CacheHint,
-}
-
-#[async_trait]
-impl StorageFormat for ZarrsStorageFormat {
-    async fn store(
-        tile: TypedRasterTile2D,
-        // (operator_name, band, time_interval, tile_index)
-        cache_key: Arc<CacheKey>,
-        result_descriptor: &RasterResultDescriptor,
-    ) -> Result<Self> {
-        let store = open_zarrs_filesystemstore()?;
-
-        let (arrays, paths) =
-            build_array_and_prepare_insert(&cache_key, store.clone(), &tile, result_descriptor)?;
-
-        let tile_bounds = raster_tile_bounds(
-            result_descriptor,
-            call_generic_raster_tile_2d!(&tile, tile => tile.global_geo_transform),
-            call_generic_raster_tile_2d!(&tile, tile => tile.grid_shape_array()).into(),
-        );
-
-        let chunk_indices = tile_position_to_chunk_indices(
-            call_generic_raster_tile_2d!(&tile, tile => tile.tile_position),
-            tile_bounds.min_index(),
-        )?;
-
-        let (byte_size_tile_data, byte_size_tile_validity) = {
-            let mut writer = ZarrChunkWriter::new(&arrays);
-            match writer.store_tile_chunks(&tile, chunk_indices) {
-                Ok(sizes) => sizes,
-                Err(err) => {
-                    for completed in writer.get_attempted() {
-                        let (name, array) = match completed {
-                            CompletedZarrWrite::Tile => ("tiles", &arrays.tiles),
-                            CompletedZarrWrite::Validity => ("validity", &arrays.validity),
-                            CompletedZarrWrite::Metadata => ("metadata", &arrays.metadata),
-                        };
-                        if let Err(error) = array.erase_chunk(&chunk_indices) {
-                            tracing::warn!(
-                                %error,
-                                array = name,
-                                chunk_indices = ?chunk_indices,
-                                "Failed to erase Zarr cache chunk after write failure"
-                            );
-                        }
-                    }
-                    return Err(err);
-                }
-            }
-        };
-
-        let data_type = tile.raster_data_type();
-        let cache_hint = call_generic_raster_tile_2d!(&tile, tile => tile.cache_hint);
-        Ok(ZarrsStorageFormat {
-            paths,
-            tile,
-            data_type,
-            byte_size: byte_size_tile_data + byte_size_tile_validity, // TODO (mid): this might not be the total size that we actually need
-            chunk_indices,
-            cache_hint,
-        })
-    }
-
-    async fn load(&self) -> Result<TypedRasterTile2D> {
-        let ZarrsStorageFormat {
-            paths,
-            tile,
-            data_type,
-            byte_size,
-            chunk_indices,
-            cache_hint,
-        } = self;
-        let store = open_zarrs_filesystemstore()?;
-        let arrays: ZarrsArrayAccess = todo!(); // paths.open(store.clone())?;
-        let loaded_tile = arrays.retrieve_tile(chunk_indices, paths, *data_type, *cache_hint)?;
-        #[cfg(test)]
-        {
-            compare_tiles(tile, &loaded_tile);
-        }
-
-        Ok(loaded_tile)
-    }
-
-    async fn byte_size(&self) -> Result<usize> {
-        Ok(self.byte_size)
-    }
-
-    async fn is_expired(&self) -> bool {
-        self.cache_hint.is_expired()
-    }
-}
-
-#[allow(non_camel_case_types)]
-pub struct Old__ZarrDiskEntry; // TODO (crit): remove once finished
-
-#[async_trait]
-impl DiskEntry for Old__ZarrDiskEntry {
-    // type Prepared = ZarrsStorageFormat;
-
-    async fn read(&self) -> Result<TypedRasterTile2D> {
-        todo!()
-    }
-}
-
-// TODO (high): {462286af-362d-42f0-a803-ebe807aa820b}
-// while this is one implementation, the write / read guard is still missing
-// which could lead to race errors.
-#[async_trait]
-impl OnDiskStorageFormat for ZarrsStorageFormat {
-    /// Handle to the files on disk that can be read back into memory
-    // type Written: DiskEntry<Prepared = Self>;
-    type Written = Old__ZarrDiskEntry;
-
-    /// Write the data to disk and return a handle to the files on disk
-    async fn write(self) -> Result<Self::Written> {
-        todo!()
-    }
+fn geotransform_to_attributes_map(transform: &GeoTransform) -> serde_json::Map<String, Value> {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        GLOBAL_GEOTRANSFORM_KEY.to_string(),
+        serde_json::to_value(transform).expect("it to be serialisable"),
+    );
+    map
 }
 
 /// using the `time_interval` in the `key` field does not work in all cases
@@ -647,27 +506,27 @@ impl ZarrsArrayPath {
     }
 
     #[inline]
-    fn path(&self, suffix: &str) -> String {
-        let (operator_name, band, interval) = (&self.operator_name, self.band, self.time_interval);
-        let time = time_interval_to_path_safe_iso(&interval);
-        let op = self.operator_name_path_safe();
-        format!("/{op}/band_{band}/{time}/{suffix}")
+    fn path(suffix: &str) -> String {
+        format!("/{suffix}")
     }
 
     pub fn tiles(&self) -> String {
-        self.path("tiles")
+        Self::path("tiles")
     }
 
     pub fn metadata(&self) -> String {
-        self.path("metadata")
+        Self::path("metadata")
     }
 
     pub fn validity(&self) -> String {
-        self.path("validity")
+        Self::path("validity")
     }
 
     /// Fails if the arrays where not created yet, or whenever [`zarrs:array::Array::open`] fails.
-    fn open(&self, store: Arc<FilesystemStore>) -> Result<ZarrsArrayAccess> {
+    fn open<TStore>(&self, store: Arc<TStore>) -> Result<ZarrsArrayAccess<TStore>>
+    where
+        TStore: ReadableStorageTraits + 'static,
+    {
         let tiles_array = Array::open(store.clone(), &self.tiles())
             .map_err(|source| Error::ZarrArrayCreateError { source })?;
         let metadata_array = Array::open(store.clone(), &self.metadata())
@@ -683,23 +542,26 @@ impl ZarrsArrayPath {
     }
 }
 
-type TileStore = zarrs::array::Array<FilesystemStore>;
-type MetaDataStore = zarrs::array::Array<FilesystemStore>;
-type ValidityMaskStore = zarrs::array::Array<FilesystemStore>;
+type TileArray<TStore> = zarrs::array::Array<TStore>;
+type MetaDataStore<TStore> = zarrs::array::Array<TStore>;
+type ValidityMaskStore<TStore> = zarrs::array::Array<TStore>;
 
 /// Bundles the different [`FilesystemStore`]s into one struct, so that
 /// the access is always well-defined.
-struct ZarrsArrayAccess {
+struct ZarrsArrayAccess<TStore> {
     /// The store in which the actual tile data is stored
-    tiles: TileStore,
+    tiles: TileArray<TStore>,
     /// the store in which the validity mask is stored
-    validity: ValidityMaskStore,
+    validity: ValidityMaskStore<TStore>,
     /// the store in which the metadata relevant for a single tile is stored
-    metadata: MetaDataStore,
+    metadata: MetaDataStore<TStore>,
 }
 
 // TODO (low): more cleanup with using this!
-impl ZarrsArrayAccess {
+impl<TStore> ZarrsArrayAccess<TStore>
+where
+    TStore: ReadableWritableStorageTraits + 'static,
+{
     /// Retrieve a single metadata chunk.
     fn retrieve_metadata_chunk(
         &self,
@@ -827,7 +689,7 @@ impl ZarrsArrayAccess {
         self.tiles
             .store_chunk(chunk_indices, data)
             .map_err(|source| Error::ZarrArrayStoreError {
-                storage: WhichTile::Tiles,
+                which_tile: WhichTile::Tiles,
                 source,
             })?;
         Ok(ret)
@@ -893,7 +755,7 @@ impl ZarrsArrayAccess {
                 .validity
                 .store_chunk(&chunk_indices, mask)
                 .map_err(|source| Error::ZarrArrayStoreError {
-                    storage: WhichTile::Validity,
+                    which_tile: WhichTile::Validity,
                     source,
                 })?;
             return Ok(ret);
@@ -913,7 +775,7 @@ impl ZarrsArrayAccess {
                 .validity
                 .store_chunk(&chunk_indices, mask.data)
                 .map_err(|source| Error::ZarrArrayStoreError {
-                    storage: WhichTile::Validity,
+                    which_tile: WhichTile::Validity,
                     source,
                 })?;
             return Ok(ret);
@@ -929,7 +791,7 @@ impl ZarrsArrayAccess {
         self.metadata
             .store_chunk(&chunk_indices, metadata_chunk)
             .map_err(|source| Error::ZarrArrayStoreError {
-                storage: WhichTile::Metadata,
+                which_tile: WhichTile::Metadata,
                 source,
             })
     }
@@ -942,7 +804,7 @@ impl ZarrsArrayAccess {
         self.metadata
             .store_chunk(&chunk_indices, data)
             .map_err(|source| Error::ZarrArrayStoreError {
-                storage: WhichTile::Metadata,
+                which_tile: WhichTile::Metadata,
                 source,
             })
     }
@@ -960,7 +822,7 @@ impl ZarrsArrayAccess {
     }
 
     fn read_global_geo_transform(&self) -> GeoTransform {
-        let arr: &Array<FilesystemStore> = &self.tiles;
+        let arr: &Array<TStore> = &self.tiles;
         match arr.metadata() {
             zarrs::array::ArrayMetadata::V2(_) => {
                 unreachable!("Reading metadata from V2 which is not supported.")
@@ -1019,18 +881,18 @@ impl FromArrayBytes for ZarrsMetaDataChunk {
     }
 }
 
-fn open_or_create_new_zarrs_array(
+fn open_or_create_new_zarrs_array<TStore>(
     path: &str,
-    store: Arc<FilesystemStore>,
+    store: Arc<TStore>,
     shape: impl Into<ArrayShape>, // The shape of the array
     chunk_shape: impl Into<ArrayBuilderChunkGridMetadata>, // Usually the shape of a chunk
     data_type: zarrs::array::DataType,
     filler_value: impl Into<ArrayBuilderFillValue>,
     attributes: Option<serde_json::Map<String, serde_json::Value>>,
-) -> std::result::Result<
-    zarrs::array::Array<zarrs::filesystem::FilesystemStore>,
-    zarrs::array::ArrayCreateError,
-> {
+) -> std::result::Result<Array<TStore>, ArrayCreateError>
+where
+    TStore: ReadableWritableStorageTraits + 'static,
+{
     match Array::open(store.clone(), path) {
         Ok(array) => Ok(array),
         Err(_) => {
@@ -1049,14 +911,18 @@ fn open_or_create_new_zarrs_array(
 
 /// Opens or creates a new array at `/{operator_name}/band_{band}/{time}/tiles`.
 /// Stores the metadata of the array if a new one is created.
-fn build_array_and_prepare_insert(
+fn build_array_and_prepare_insert<TStore>(
     key @ (operator_name, band, time_interval, tile_index): &CacheKey,
-    store: Arc<FilesystemStore>,
+    paths: &ZarrsArrayPath,
+    store: Arc<TStore>,
     tile: &TypedRasterTile2D,
     result_descriptor: &RasterResultDescriptor,
-) -> Result<(ZarrsArrayAccess, ZarrsArrayPath)> {
+) -> Result<ZarrsArrayAccess<TStore>>
+where
+    TStore: ReadableWritableStorageTraits + 'static,
+{
     let paths = ZarrsArrayPath::from_cache_key(key);
-    let attributes = New__ZarrsStorageFormat::geotransform_to_attributes_map(
+    let attributes = geotransform_to_attributes_map(
         &call_generic_raster_tile_2d!(tile, tile => tile.global_geo_transform),
     );
 
@@ -1121,14 +987,11 @@ fn build_array_and_prepare_insert(
     )
     .map_err(|source| Error::ZarrArrayCreateError { source })?;
 
-    Ok((
-        ZarrsArrayAccess {
-            tiles: data_arr,
-            validity: validity_arr,
-            metadata: metadata_arr,
-        },
-        paths,
-    ))
+    Ok(ZarrsArrayAccess {
+        tiles: data_arr,
+        validity: validity_arr,
+        metadata: metadata_arr,
+    })
 }
 
 // TODO (mid): Are those NAN / filler values actually the right ones? Should they be made configurable?
@@ -1164,9 +1027,21 @@ fn zarrs_data_type(tile: &TypedRasterTile2D) -> zarrs::array::DataType {
     }
 }
 
-fn open_zarrs_filesystemstore() -> Result<Arc<FilesystemStore>> {
+fn format_cache_key(root: PathBuf, paths: &ZarrsArrayPath) -> PathBuf {
+    let (operator_name, band, interval) = (&paths.operator_name, paths.band, paths.time_interval);
+    let time = time_interval_to_path_safe_iso(&interval);
+    let op = paths.operator_name_path_safe();
+    root.join(op).join(format!("band_{band}")).join(time)
+}
+
+const ZARR_CACHE: &str = "zarr_cache";
+
+// TODO (mid): check the callsites how they handle this
+/// Opens a new ZarrArrayStore at "{op}/band_{band}/{time}"
+fn open_zarrs_filesystemstore(paths: &ZarrsArrayPath) -> Result<Arc<FilesystemStore>> {
     let cache_dir = cache_dir();
-    let zarrs = zarrs::filesystem::FilesystemStore::new(cache_dir.join("zarr_cache"))
+    let path = format_cache_key(cache_dir.join(ZARR_CACHE), &paths);
+    let zarrs = zarrs::filesystem::FilesystemStore::new(path)
         // TODO (mid): check the callsites how they handle this
         .map_err(|err| Error::ZarrFilesystemError { source: err })?;
     Ok(Arc::new(zarrs))
@@ -1214,13 +1089,16 @@ enum CompletedZarrWrite {
     Metadata = 1 << 2,
 }
 
-struct ZarrChunkWriter<'a> {
-    arrays: &'a ZarrsArrayAccess,
+struct ZarrChunkWriter<'a, TStore> {
+    arrays: &'a ZarrsArrayAccess<TStore>,
     attempted_writes: u8, // = Combination of [`CompletedZarrWrites`]
 }
 
-impl<'a> ZarrChunkWriter<'a> {
-    fn new(arrays: &'a ZarrsArrayAccess) -> Self {
+impl<'a, TStore> ZarrChunkWriter<'a, TStore>
+where
+    TStore: ReadableWritableStorageTraits + 'static,
+{
+    fn new(arrays: &'a ZarrsArrayAccess<TStore>) -> Self {
         ZarrChunkWriter {
             arrays,
             attempted_writes: 0,
@@ -1231,7 +1109,7 @@ impl<'a> ZarrChunkWriter<'a> {
         self.attempted_writes |= write as u8;
     }
 
-    fn get_attempted(&self) -> Vec<CompletedZarrWrite> {
+    fn attempted(&self) -> Vec<CompletedZarrWrite> {
         let mut attempted = Vec::new();
         if self.attempted_writes & (CompletedZarrWrite::Tile as u8) != 0 {
             attempted.push(CompletedZarrWrite::Tile);
@@ -1359,11 +1237,49 @@ mod tests {
 
     use crate::cache::new_raster_cache::on_disk::set_raster_cache_dir;
     use crate::cache::new_raster_cache::on_disk::tests::test_key;
+    use crate::cache::new_raster_cache::on_disk::zarrs_cache::format_cache_key;
     use crate::engine::{RasterBandDescriptors, SpatialGridDescriptor, TimeDescriptor};
     use geoengine_datatypes::util::test::TestDefault;
     use geoengine_datatypes::{primitives::DateTime, spatial_reference::SpatialReference};
+    use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn it_checks_metadata_as_json() {
+        let key = StoreKey::new("tiles/zarr.json").unwrap();
+        let expected = br#"{"shape":[512,512],"data_type":"uint8"}"#;
+        let reordered = br#"{ "data_type": "uint8", "shape": [512, 512] }"#;
+
+        check_metadata_matches(&key, reordered, expected).unwrap();
+
+        assert!(matches!(
+            check_metadata_matches(
+                &key,
+                br#"{"shape":[256,512],"data_type":"uint8"}"#,
+                expected,
+            ),
+            Err(Error::ZarrCacheMetadataMismatch { key: actual_key })
+                if actual_key == key.as_str()
+        ));
+
+        for (actual, expected) in [
+            (b"invalid".as_slice(), expected.as_slice()),
+            (expected.as_slice(), b"invalid".as_slice()),
+            (b"invalid".as_slice(), b"invalid".as_slice()),
+        ] {
+            assert!(matches!(
+                check_metadata_matches(&key, actual, expected),
+                Err(Error::SerdeJson { .. })
+            ));
+        }
+    }
+
+    fn set_tempdir() -> TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        set_raster_cache_dir(directory.path().to_path_buf()).unwrap();
+        directory
+    }
 
     mod indexing {
 
@@ -1451,8 +1367,7 @@ mod tests {
             world_origin: Coordinate2D,
             pixel_origin: [isize; 2],
         ) {
-            let directory = tempfile::tempdir().unwrap();
-            set_raster_cache_dir(directory.path().to_path_buf()).unwrap();
+            let directory = set_tempdir();
             let geo_transform = GeoTransform::new(world_origin, 0.5, -0.5);
             let time = TimeInterval::new(0, 1).unwrap();
             let descriptor = RasterResultDescriptor {
@@ -1492,8 +1407,9 @@ mod tests {
                     Grid2D::new([2, 3].into(), vec![value; 6]).unwrap().into(),
                     CacheHint::max_duration(),
                 ));
-                let key = Arc::new((test_key(0).0.clone(), 0, time, global_pixel_position.into()));
-                let stored = ZarrsStorageFormat::store(tile.clone(), key, &descriptor)
+                let key: Arc<(CanonicOperatorName, Band, TimeInterval, TileIndex)> =
+                    Arc::new((test_key(0).0.clone(), 0, time, global_pixel_position.into()));
+                let stored = PreparedZarrStorageFormat::store(tile.clone(), key, &descriptor)
                     .await
                     .expect("store tile at its upper-left pixel position");
 
@@ -1505,12 +1421,10 @@ mod tests {
             }
 
             for (tile, stored, value) in stored_tiles {
-                let arrays: ZarrsArrayAccess = todo!();
-
-                // stored
-                // .paths
-                // .open(open_zarrs_filesystemstore().unwrap())
-                // .unwrap();
+                let arrays: ZarrsArrayAccess<FilesystemStore> = stored
+                    .paths
+                    .open(open_zarrs_filesystemstore(&stored.paths).unwrap())
+                    .unwrap();
                 let pixels: Vec<u8> = arrays.tiles.retrieve_chunk(&stored.chunk_indices).unwrap();
                 assert_eq!(pixels, vec![value; 6]);
                 compare_tiles(&tile, &stored.load().await.unwrap());
@@ -1534,8 +1448,7 @@ mod tests {
 
         #[tokio::test(flavor = "current_thread")]
         async fn array_extent_includes_tiles_intersecting_unaligned_raster_bounds() {
-            let directory = tempfile::tempdir().unwrap();
-            set_raster_cache_dir(directory.path().to_path_buf()).unwrap();
+            let directory = set_tempdir();
             let geo_transform = GeoTransform::new([10., 20.].into(), 0.5, -0.5);
             let time = TimeInterval::new(0, 1).unwrap();
             let descriptor = RasterResultDescriptor {
@@ -1562,14 +1475,14 @@ mod tests {
                 time,
                 tile.tile_information().global_upper_left_pixel_idx(),
             ));
-            let stored = ZarrsStorageFormat::store(TypedRasterTile2D::U8(tile), key, &descriptor)
-                .await
+            let stored =
+                PreparedZarrStorageFormat::store(TypedRasterTile2D::U8(tile), key, &descriptor)
+                    .await
+                    .unwrap();
+            let arrays: ZarrsArrayAccess<FilesystemStore> = stored
+                .paths
+                .open(open_zarrs_filesystemstore(&stored.paths).unwrap())
                 .unwrap();
-            let arrays: ZarrsArrayAccess = todo!();
-            // stored
-            // .paths
-            // .open(open_zarrs_filesystemstore().unwrap())
-            // .unwrap();
             assert_eq!(stored.chunk_indices, [2, 2]);
             assert_eq!(arrays.tiles.shape(), &[6, 9]);
             assert_eq!(arrays.validity.shape(), &[6, 9]);
@@ -1620,15 +1533,17 @@ mod tests {
 
         #[tokio::test(flavor = "current_thread")]
         async fn cache_hint_is_stored_correctly() {
-            let directory = tempfile::tempdir().unwrap();
-            set_raster_cache_dir(directory.path().to_path_buf()).unwrap();
+            let directory = set_tempdir();
             let (cache_hint, tile, descriptor, key) = set_up();
-            let stored =
-                ZarrsStorageFormat::store(TypedRasterTile2D::U8(tile.clone()), key, &descriptor)
-                    .await
-                    .expect("tile should be stored with its cache hint");
+            let stored = PreparedZarrStorageFormat::store(
+                TypedRasterTile2D::U8(tile.clone()),
+                key,
+                &descriptor,
+            )
+            .await
+            .expect("tile should be stored with its cache hint");
 
-            assert_eq!(stored.cache_hint, cache_hint);
+            assert_eq!(stored.common.cache_hint, cache_hint);
             let TypedRasterTile2D::U8(loaded) =
                 stored.load().await.expect("stored tile should load")
             else {
@@ -1640,23 +1555,89 @@ mod tests {
 
         #[tokio::test(flavor = "current_thread")]
         async fn expired_cache_hint() {
-            let directory = tempfile::tempdir().unwrap();
-            set_raster_cache_dir(directory.path().to_path_buf()).unwrap();
+            set_tempdir();
             let (cache_hint, tile, descriptor, key) = set_up();
             assert!(cache_hint.is_expired());
-            let stored =
-                ZarrsStorageFormat::store(TypedRasterTile2D::U8(tile.clone()), key, &descriptor)
-                    .await
-                    .expect("tile should be stored with its cache hint");
+            let stored = PreparedZarrStorageFormat::store(
+                TypedRasterTile2D::U8(tile.clone()),
+                key,
+                &descriptor,
+            )
+            .await
+            .expect("tile should be stored with its cache hint");
             assert!(stored.is_expired().await);
         }
     }
 
+    pub(crate) fn setup() -> (
+        GeoTransform,
+        TypedRasterTile2D,
+        Arc<CacheKey>,
+        RasterResultDescriptor,
+    ) {
+        let geo_transform = GeoTransform::new([0., 0.].into(), 1., -1.);
+        let tile = {
+            TypedRasterTile2D::U8(RasterTile2D::new_with_properties(
+                TimeInterval::default(),
+                [0, 0].into(),
+                0,
+                geo_transform,
+                GridOrEmpty::new_grid(
+                    MaskedGrid2D::new(
+                        Grid::new([2, 2].into(), vec![1_u8, 2, 3, 4]).unwrap(),
+                        Grid::new([2, 2].into(), vec![true; 4]).unwrap(),
+                    )
+                    .unwrap(),
+                ),
+                RasterProperties::default(),
+                CacheHint::max_duration(),
+            ))
+        };
+        let key = test_key(0);
+        let result_descriptor = RasterResultDescriptor {
+            data_type: RasterDataType::U8,
+            spatial_reference: SpatialReference::epsg_4326().into(),
+            time: TimeDescriptor::new_irregular(Some(TimeInterval::default())),
+            spatial_grid: SpatialGridDescriptor::source_from_parts(
+                geo_transform,
+                GridBoundingBox2D::new([0, 0], [1, 1]).unwrap(),
+            ),
+            bands: RasterBandDescriptors::new_single_band(),
+        };
+        (geo_transform, tile, key, result_descriptor)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn round_trip_test_zarr_storage_format_v2() {
+        set_tempdir();
+        let (geo_transform, tile, key, result_descriptor) = setup();
+        let storage_format =
+            PreparedZarrStorageFormat::store(tile.clone(), key, &result_descriptor)
+                .await
+                .expect("store should work");
+        let disk_entry = storage_format.write().await.expect("write should work");
+        let mut tiles = Vec::with_capacity(10);
+        for _ in (0..10) {
+            let loaded = disk_entry.read().await.expect("read should work");
+            tiles.push(loaded);
+        }
+        tiles.iter().for_each(|loaded| compare_tiles(&tile, loaded));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_store_load_with_new_zarr_storage_format_v2() {
+        let (geo_transform, tile, key, result_descriptor) = setup();
+        let storage_format =
+            PreparedZarrStorageFormat::store(tile.clone(), key, &result_descriptor)
+                .await
+                .expect("store should work");
+        let loaded = storage_format.load().await.expect("load should work");
+        compare_tiles(&tile, &loaded);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn zarrs_failed_write_removes_partial_writes() {
-        let directory = tempfile::tempdir().unwrap();
-        set_raster_cache_dir(directory.path().to_path_buf()).unwrap();
-
+        let directory = set_tempdir();
         let key = test_key(0);
         let geo_transform = GeoTransform::new([0., 0.].into(), 1., -1.);
         let descriptor = RasterResultDescriptor {
@@ -1670,9 +1651,13 @@ mod tests {
             bands: RasterBandDescriptors::new_single_band(),
         };
 
-        let (_array_access, array_path) = build_array_and_prepare_insert(
+        let array_path = &ZarrsArrayPath::from_cache_key(&key);
+        let store = open_zarrs_filesystemstore(&array_path).unwrap();
+
+        let _array_access = build_array_and_prepare_insert(
             &key,
-            open_zarrs_filesystemstore().unwrap(),
+            &array_path,
+            store,
             &TypedRasterTile2D::U8(RasterTile2D::new(
                 TimeInterval::new(0, 1).unwrap(),
                 [0, 0].into(),
@@ -1707,7 +1692,7 @@ mod tests {
             CACHE_DIR/zarr_cache/metadata/c
         to prevent the writer from creating this chunk directory, thus failing the write.
         */
-        let root = directory.path().join("zarr_cache");
+        let root = directory.path().join(ZARR_CACHE);
         let tiles_path = root.join(array_path.tiles().trim_start_matches("/"));
         let validity_path = root.join(array_path.validity().trim_start_matches("/"));
         let metadata_path = root.join(array_path.metadata().trim_start_matches("/"));
@@ -1724,12 +1709,12 @@ mod tests {
             CacheHint::max_duration(),
         )
         .into();
-        let result = ZarrsStorageFormat::store(tile.clone(), key.clone(), &descriptor).await;
+        let result = PreparedZarrStorageFormat::store(tile.clone(), key.clone(), &descriptor).await;
 
         assert!(matches!(
             result,
             Err(crate::error::Error::ZarrArrayStoreError {
-                storage: WhichTile::Metadata,
+                which_tile: WhichTile::Metadata,
                 ..
             })
         ));
@@ -1745,7 +1730,7 @@ mod tests {
 
         // removing the blocker, should allow the write
         std::fs::remove_file(metadata_path.join("c")).unwrap();
-        let stored = ZarrsStorageFormat::store(tile.clone(), key, &descriptor)
+        let stored = PreparedZarrStorageFormat::store(tile.clone(), key, &descriptor)
             .await
             .expect("tile should be stored after removing blocker file");
         compare_tiles(
@@ -1768,23 +1753,39 @@ mod tests {
     fn get_tiles_path() {
         let path = ZarrsArrayPath::from_cache_key(&test_key(0));
         let tiles_path = path.tiles();
-        let time = time_interval_to_path_safe_iso(todo!("&path.time_interval()"));
-        assert_eq!(
-            "/05643c4ac1135b60c1e9b65c47fc77d7ccd550b05485dc4f5597ac3d067f065d/band_0/-262143-01-01T00-00-00Z_to_+262142-12-31T23-59-59.999Z/tiles"
-                .to_string(),
-            tiles_path
-        );
+        assert_eq!("/tiles".to_string(), tiles_path);
     }
 
     #[test]
     fn get_metadata_path() {
         let path = ZarrsArrayPath::from_cache_key(&test_key(0));
         let metadata_path = path.metadata();
-        let time = time_interval_to_path_safe_iso(todo!("&path.time_interval()"));
+        assert_eq!("/metadata".to_string(), metadata_path);
+    }
+
+    #[test]
+    fn get_validity_path() {
+        let path = ZarrsArrayPath::from_cache_key(&test_key(0));
+        let validity_path = path.validity();
+        assert_eq!("/validity".to_string(), validity_path);
+    }
+
+    #[test]
+    fn test_format_cache_key() {
+        let directory = set_tempdir();
+
+        let key = test_key(0);
+        let path = ZarrsArrayPath::from_cache_key(&key);
+        let pathbuf: String = format_cache_key(cache_dir().join(ZARR_CACHE), &path)
+            .to_str()
+            .unwrap()
+            .to_string();
+        let tmp = directory.path().display();
         assert_eq!(
-            "/05643c4ac1135b60c1e9b65c47fc77d7ccd550b05485dc4f5597ac3d067f065d/band_0/-262143-01-01T00-00-00Z_to_+262142-12-31T23-59-59.999Z/metadata"
-                .to_string(),
-            metadata_path
+            format!(
+                "{tmp}/{ZARR_CACHE}/05643c4ac1135b60c1e9b65c47fc77d7ccd550b05485dc4f5597ac3d067f065d/band_0/-262143-01-01T00-00-00Z_to_+262142-12-31T23-59-59.999Z"
+            ),
+            pathbuf
         );
     }
 

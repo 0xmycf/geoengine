@@ -48,5 +48,4 @@ pub enum CacheError {
     TimeQueryFailed {
         message: String,
     },
-    Unspecified, // TODO (crit): remove this after the rebase
 }

@@ -3,7 +3,7 @@ pub mod on_disk;
 use crate::cache::cache_tiles::{CompressedRasterTile2D, CompressedRasterTileExt};
 use crate::cache::error::CacheError;
 use crate::cache::new_raster_cache::on_disk::arrow_ipc_cache::ArrowIpcStorageFormat;
-use crate::cache::new_raster_cache::on_disk::zarrs_cache::ZarrsStorageFormat;
+use crate::cache::new_raster_cache::on_disk::zarrs_cache::PreparedZarrStorageFormat;
 use crate::cache::new_raster_cache::on_disk::{DiskEntry, OnDiskStore};
 use crate::engine::{
     BoxRasterQueryProcessor, CanonicOperatorName, InitializedRasterOperator, QueryContext,
@@ -52,7 +52,7 @@ pub enum NewRasterCacheEnum {
     ),
     OnDiskMockFifoZarr(
         //
-        NewRasterCache<OnDiskStore<ZarrsStorageFormat, FifoEvictionStrategy>>,
+        NewRasterCache<OnDiskStore<PreparedZarrStorageFormat, FifoEvictionStrategy>>,
     ),
 }
 
@@ -308,7 +308,8 @@ pub struct EvictionStrategyItem {
 }
 
 impl FifoEvictionStrategy {
-    fn new(capacity: usize) -> Self {
+    /// Creates a FIFO eviction strategy with the given capacity in bytes.
+    pub fn new(capacity: usize) -> Self {
         FifoEvictionStrategy {
             queue: Vec::new(),
             capacity,

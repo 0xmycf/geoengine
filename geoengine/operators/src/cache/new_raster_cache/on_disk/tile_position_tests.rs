@@ -44,9 +44,14 @@ async fn stored_positions(first_tile_position: [isize; 2]) -> Vec<([isize; 2], [
             time,
             tile.tile_information().global_upper_left_pixel_idx(),
         ));
-        let stored = ZarrsStorageFormat::store(TypedRasterTile2D::U8(tile), key, &descriptor)
-            .await
-            .expect("store tile");
+        struct Foo {
+            chunk_indices: [u64; 2]
+        }
+        let stored: Foo = todo!()
+            // ZarrsStorageFormat::store(TypedRasterTile2D::U8(tile), key, &descriptor)
+            // .await
+            // .expect("store tile")
+            ;
         positions.push((tile_position, stored.chunk_indices));
     }
     positions
@@ -55,7 +60,10 @@ async fn stored_positions(first_tile_position: [isize; 2]) -> Vec<([isize; 2], [
 #[test]
 fn tile_mapping_matches_previous_pixel_mapping() {
     for tile_size in [[2, 3], [512, 512]] {
-        let strategy = TilingStrategy::new(tile_size.into(), GeoTransform::new([0., 0.].into(), 1., -1.));
+        let strategy = TilingStrategy::new(
+            tile_size.into(),
+            GeoTransform::new([0., 0.].into(), 1., -1.),
+        );
         for first_tile in [[0, 0], [2, 3], [-2, -3]] {
             let pixel_origin = strategy.tile_idx_to_global_pixel_idx(first_tile.into());
             for offset in [[0, 0], [0, 1], [1, 0], [1, 1]] {

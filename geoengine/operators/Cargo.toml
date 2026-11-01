@@ -81,6 +81,5 @@ rand = { workspace = true }
 name = "ci_operators"
 harness = false
 
-
 [lints]
 workspace = true
