@@ -44,14 +44,10 @@ async fn stored_positions(first_tile_position: [isize; 2]) -> Vec<([isize; 2], [
             time,
             tile.tile_information().global_upper_left_pixel_idx(),
         ));
-        struct Foo {
-            chunk_indices: [u64; 2]
-        }
-        let stored: Foo = todo!()
-            // ZarrsStorageFormat::store(TypedRasterTile2D::U8(tile), key, &descriptor)
-            // .await
-            // .expect("store tile")
-            ;
+        let stored =
+            PreparedZarrStorageFormat::store(TypedRasterTile2D::U8(tile), key, &descriptor)
+                .await
+                .expect("store tile");
         positions.push((tile_position, stored.chunk_indices));
     }
     positions

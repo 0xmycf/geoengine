@@ -430,18 +430,22 @@ mod tests {
                 PreparedZarrStorageFormat::store(tile.clone(), key, &test_result_descriptor())
                     .await
                     .expect("it should be possible to store the tile.");
+            let disk_entry = stored
+                .write()
+                .await
+                .expect("it should be possible to write the tile to disk.");
 
             {
-                // check if the zarrs thing is there
+                // check if the zarrs cache is there
                 let full_path = temp_dir.path().join(PathBuf::from("zarr_cache"));
                 let _ =
                     fs::metadata(&full_path).expect(&format!("File should be at {full_path:#?}"));
             }
 
-            let loaded = stored
-                .load()
+            let loaded = disk_entry
+                .read()
                 .await
-                .expect(&format!("File should loadable as a TypedRasterTile"));
+                .expect(&format!("File should readable as a TypedRasterTile"));
 
             match loaded {
                 TypedRasterTile2D::U8(loaded_tile) => {
@@ -482,8 +486,8 @@ mod tests {
             let stored = store
                 .get(&key)
                 .await
-                .expect("it should be present") // TODO (crit): figure out a better way
-                .expect("it should be possible to extract the tile-ref from the cache.");
+                .expect("cache lookup should succeed (Result)")
+                .expect("inserted tiel should exist (Option)");
             let loaded = stored
                 .read()
                 .await
