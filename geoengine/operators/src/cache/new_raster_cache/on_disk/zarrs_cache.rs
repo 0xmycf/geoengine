@@ -112,12 +112,11 @@ impl DiskEntry for ZarrDiskEntry {
 #[derive(Debug)]
 struct ZarrStoreEntry {
     store_key: StoreKey,
-    /// The bytes are optional, for example for empty tiles
-    bytes: Option<bytes::Bytes>,
+    bytes: bytes::Bytes,
 }
 
 impl ZarrStoreEntry {
-    fn new((store_key, bytes): (StoreKey, Option<bytes::Bytes>)) -> Self {
+    fn new((store_key, bytes): (StoreKey, bytes::Bytes)) -> Self {
         Self { store_key, bytes }
     }
 
@@ -125,12 +124,9 @@ impl ZarrStoreEntry {
     where
         TStore: WritableStorageTraits,
     {
-        if let Some(bytes) = self.bytes.clone() {
-            store
-                .set(&self.store_key, bytes)
-                .map_err(|err| Error::ZarrArrayError { source: err.into() })?;
-        }
-        Ok(())
+        store
+            .set(&self.store_key, self.bytes.clone())
+            .map_err(|err| Error::ZarrArrayError { source: err.into() })
     }
 }
 
@@ -139,8 +135,8 @@ impl ZarrStoreEntry {
 pub struct PreparedZarrStorageFormat {
     // the zarr array definitions
     layout: [(StoreKey, bytes::Bytes); 4],
-    tile_data: ZarrStoreEntry,
-    validity_data: ZarrStoreEntry,
+    tile_data: Option<ZarrStoreEntry>,
+    validity_data: Option<ZarrStoreEntry>,
     metadata: ZarrStoreEntry,
 
     byte_size: u64,
@@ -175,7 +171,7 @@ impl StorageFormat for PreparedZarrStorageFormat {
         result_descriptor: &RasterResultDescriptor,
     ) -> Result<Self> {
         let store = Arc::new(MemoryStore::new());
-        let group = GroupBuilder::new()
+        let group = GroupBuilder::new() // TODO (high): {a83371d1-432d-46ff-b483-e1143a0a0fc3} look into zarr groups again
             .build(Arc::clone(&store), "/")
             .map_err(|source| Error::ZarrGroupCreateError { source })?;
         group
@@ -216,7 +212,7 @@ impl StorageFormat for PreparedZarrStorageFormat {
             result_descriptor,
         )?;
 
-        let _ = {
+        let is_empty = {
             let mut writer = ZarrChunkWriter::new(&arrays);
             match writer.store_tile_chunks(&tile, chunk_indices) {
                 Ok(sizes) => sizes,
@@ -243,7 +239,7 @@ impl StorageFormat for PreparedZarrStorageFormat {
         };
 
         let mut layout_builder = Vec::with_capacity(4);
-        let mut data: HashMap<&str, (StoreKey, Option<bytes::Bytes>)> = HashMap::with_capacity(3);
+        let mut data: HashMap<&str, (StoreKey, bytes::Bytes)> = HashMap::with_capacity(3);
         let mut byte_size = 0_u64;
         for key in store
             .list()
@@ -251,7 +247,7 @@ impl StorageFormat for PreparedZarrStorageFormat {
         {
             let is_json = key.as_str().ends_with(".json");
 
-            let bytes = store.get(&key).expect("The key to be present");
+            let bytes = store.get(&key).expect("there to be no storage error.");
 
             byte_size += bytes.as_ref().map(|x| x.len()).unwrap_or(0) as u64;
             if is_json {
@@ -261,7 +257,7 @@ impl StorageFormat for PreparedZarrStorageFormat {
                     key_to_array(&key).ok_or(Error::ZarrsGeoengineCacheArrayMappingError {
                         key: key.to_string(),
                     })?,
-                    (key, bytes),
+                    (key, bytes.expect("the value to be present")),
                 );
             }
         }
@@ -269,14 +265,12 @@ impl StorageFormat for PreparedZarrStorageFormat {
             layout: layout_builder
                 .try_into()
                 .expect("the layout to have 4 entries"),
-            tile_data: ZarrStoreEntry::new(
-                data.remove(PreparedZarrStorageFormat::TILES)
-                    .expect("tiles component to be present"),
-            ),
-            validity_data: ZarrStoreEntry::new(
-                data.remove(PreparedZarrStorageFormat::VALIDITY)
-                    .expect("validity component to be present"),
-            ),
+            tile_data: data
+                .remove(PreparedZarrStorageFormat::TILES)
+                .map(ZarrStoreEntry::new),
+            validity_data: data
+                .remove(PreparedZarrStorageFormat::VALIDITY)
+                .map(ZarrStoreEntry::new),
             metadata: ZarrStoreEntry::new(
                 data.remove(PreparedZarrStorageFormat::METADATA)
                     .expect("metadata component to be present"),
@@ -325,8 +319,12 @@ where
                 .map_err(|err| Error::ZarrArrayError { source: err.into() })?;
         }
     }
-    data.tile_data.set_in_store(store)?;
-    data.validity_data.set_in_store(store)?;
+    if let Some(data) = &data.tile_data {
+        data.set_in_store(store)?;
+    }
+    if let Some(data) = &data.validity_data {
+        data.set_in_store(store)?;
+    }
     data.metadata.set_in_store(store)?;
     Ok(())
 }
@@ -1151,16 +1149,22 @@ where
         Ok((byte_size_tile_data, byte_size_tile_validity)) // TODO (crit): {ef998d34-209e-4eb1-a8dc-30b6cf084e55}
     }
 
+    /// returns whether the file is empty (false = not empty, true = empty)
     fn store_tile_chunks(
         &mut self,
         tile: &TypedRasterTile2D,
         chunk_indices: [u64; 2],
-    ) -> Result<(usize, usize)> {
-        self.mark_attempted(CompletedZarrWrite::Tile);
-        let byte_size_tile_data = self.arrays.store_tile(tile, chunk_indices)?;
+    ) -> Result<bool> {
+        // cannot return early, must write metadata.
+        let is_empty = call_generic_raster_tile_2d!(&tile, tile => tile.is_empty());
 
-        self.mark_attempted(CompletedZarrWrite::Validity);
-        let byte_size_tile_validity = self.arrays.store_validity_mask(chunk_indices, tile)?;
+        if !is_empty {
+            self.mark_attempted(CompletedZarrWrite::Tile);
+            let _ = self.arrays.store_tile(tile, chunk_indices)?;
+
+            self.mark_attempted(CompletedZarrWrite::Validity);
+            let _ = self.arrays.store_validity_mask(chunk_indices, tile)?;
+        }
 
         self.mark_attempted(CompletedZarrWrite::Metadata);
         let () /* TODO (crit): this must return the correct bytes {ef998d34-209e-4eb1-a8dc-30b6cf084e55} */ = self.arrays.store_metadata_chunk(
@@ -1180,7 +1184,7 @@ where
                 },
             )?;
 
-        Ok((byte_size_tile_data, byte_size_tile_validity)) // TODO (crit): {ef998d34-209e-4eb1-a8dc-30b6cf084e55}
+        Ok(is_empty)
     }
 }
 
