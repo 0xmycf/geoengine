@@ -42,6 +42,7 @@ use tokio::{
     io::AsyncReadExt,
     sync::RwLock,
 };
+use tracing::instrument::WithDispatch;
 use uuid::Uuid;
 #[cfg(test)]
 use zarrs::array::CodecError::ExpectedFixedLengthBytes;
@@ -75,7 +76,7 @@ use crate::{
     engine::OperatorName,
     error::{
         Error,
-        WhichTile::{self, Metadata, Tiles, Validity},
+        WhichZarrArray::{self, Metadata, Tiles, Validity},
         ZarrArray, ZarrFilesystem,
     },
     util::gdal::create_ndvi_meta_data,
@@ -106,6 +107,12 @@ impl DiskEntry for ZarrDiskEntry {
             self.data_type,
             self.cache_hint,
         )
+    }
+
+    async fn erase(&self) -> Result<()> {
+        let store = open_zarrs_filesystemstore(&self.paths)?;
+        let arrays = self.paths.open(store)?;
+        arrays.delete_tile(self.chunk_indices)
     }
 }
 
@@ -216,25 +223,26 @@ impl StorageFormat for PreparedZarrStorageFormat {
             let mut writer = ZarrChunkWriter::new(&arrays);
             match writer.store_tile_chunks(&tile, chunk_indices) {
                 Ok(sizes) => sizes,
-                Err(err) => {
-                    for completed in writer.attempted() {
-                        let (name, array) = match completed {
-                            CompletedZarrWrite::Tile => ("tiles", &arrays.tiles),
-                            CompletedZarrWrite::Validity => ("validity", &arrays.validity),
-                            CompletedZarrWrite::Metadata => ("metadata", &arrays.metadata),
-                        };
-                        // TODO (crit): this is not even neccessary here.
-                        if let Err(error) = array.erase_chunk(&chunk_indices) {
-                            tracing::warn!(
-                                %error,
-                                array = name,
-                                chunk_indices = ?chunk_indices,
-                                "Failed to erase Zarr cache chunk after write failure"
-                            );
-                        }
-                    }
-                    return Err(err);
-                }
+                Err(err) => return Err(err),
+                // {
+                //     for attempt in writer.attempted() {
+                //         let (name, array) = match attempt {
+                //             CompletedZarrWrite::Tile => ("tiles", &arrays.tiles),
+                //             CompletedZarrWrite::Validity => ("validity", &arrays.validity),
+                //             CompletedZarrWrite::Metadata => ("metadata", &arrays.metadata),
+                //         };
+                //         // TODO (crit): this is not even neccessary here.
+                //         if let Err(error) = array.erase_chunk(&chunk_indices) {
+                //             tracing::warn!(
+                //                 %error,
+                //                 array = name,
+                //                 chunk_indices = ?chunk_indices,
+                //                 "Failed to erase Zarr cache chunk after write failure"
+                //             );
+                //         }
+                //     }
+                //     return Err(err);
+                // }
             }
         };
 
@@ -373,7 +381,24 @@ impl OnDiskStorageFormat for PreparedZarrStorageFormat {
         let store = open_zarrs_filesystemstore(&self.paths)?;
         ensure_layout(&store, &self.layout)?;
 
-        write_to_store(&self, &store, false /* dont write zarr-layout jsons */)?;
+        if let Err(err) =
+            write_to_store(&self, &store, false /* dont write zarr-layout jsons */)
+        {
+            // Delete the keys on a failed / partial write; missing indices are fine.
+            let cleanup_result = self
+                .paths
+                .open(store)
+                .and_then(|arrays| arrays.delete_tile(self.chunk_indices));
+            if let Err(cleanup_error) = cleanup_result {
+                tracing::error!(
+                    error = %cleanup_error,
+                    chunk_indices = ?self.chunk_indices,
+                    "Failed to clean up a failed Zarr write"
+                );
+                return Err(cleanup_error);
+            }
+            return Err(err);
+        };
         Ok(ZarrDiskEntry {
             paths: self.paths,
             data_type: self.common.data_type,
@@ -687,7 +712,7 @@ where
         self.tiles
             .store_chunk(chunk_indices, data)
             .map_err(|source| Error::ZarrArrayStoreError {
-                which_tile: WhichTile::Tiles,
+                which_array: WhichZarrArray::Tiles,
                 source,
             })?;
         Ok(ret)
@@ -753,7 +778,7 @@ where
                 .validity
                 .store_chunk(&chunk_indices, mask)
                 .map_err(|source| Error::ZarrArrayStoreError {
-                    which_tile: WhichTile::Validity,
+                    which_array: WhichZarrArray::Validity,
                     source,
                 })?;
             return Ok(ret);
@@ -773,7 +798,7 @@ where
                 .validity
                 .store_chunk(&chunk_indices, mask.data)
                 .map_err(|source| Error::ZarrArrayStoreError {
-                    which_tile: WhichTile::Validity,
+                    which_array: WhichZarrArray::Validity,
                     source,
                 })?;
             return Ok(ret);
@@ -789,7 +814,7 @@ where
         self.metadata
             .store_chunk(&chunk_indices, metadata_chunk)
             .map_err(|source| Error::ZarrArrayStoreError {
-                which_tile: WhichTile::Metadata,
+                which_array: WhichZarrArray::Metadata,
                 source,
             })
     }
@@ -802,12 +827,44 @@ where
         self.metadata
             .store_chunk(&chunk_indices, data)
             .map_err(|source| Error::ZarrArrayStoreError {
-                which_tile: WhichTile::Metadata,
+                which_array: WhichZarrArray::Metadata,
                 source,
             })
     }
 
-    fn single_tile_shape(self: &Self, chunk_indices: &[u64]) -> GridShape<[usize; 2]> {
+    // TODO (high): {801ba6b6-2134-4880-b434-12e310fd1ca0} Make deletion of parts-of-tiles atomic, and retry later if it failed and its reasonable to retry
+    fn delete_tile(&self, chunk_indices: [u64; 2]) -> Result<()> {
+        let mut errors = Vec::new();
+
+        // erase_chunk succeeds when the chunk_indices are not present
+        for (which_array, result) in [
+            (
+                WhichZarrArray::Tiles,
+                self.tiles.erase_chunk(&chunk_indices),
+            ),
+            (
+                WhichZarrArray::Validity,
+                self.validity.erase_chunk(&chunk_indices),
+            ),
+            (
+                WhichZarrArray::Metadata,
+                self.metadata.erase_chunk(&chunk_indices),
+            ),
+        ] {
+            if let Err(err) = result {
+                tracing::error!(error = %err, ?chunk_indices, ?which_array, "Failed to delete chunk");
+                errors.push((err, which_array));
+            }
+        }
+
+        if !errors.is_empty() {
+            return Err(map_storage_err(errors, chunk_indices));
+        }
+
+        Ok(())
+    }
+
+    fn single_tile_shape(&self, chunk_indices: &[u64]) -> GridShape<[usize; 2]> {
         let single_tile_shape = self
             .tiles
             .chunk_shape(chunk_indices)
@@ -833,6 +890,16 @@ where
                 serde_json::from_value(val.clone()).expect("it to be deserialisable")
             }
         }
+    }
+}
+
+fn map_storage_err(
+    errors: Vec<(zarrs::storage::StorageError, WhichZarrArray)>,
+    chunk_indices: [u64; 2],
+) -> Error {
+    Error::ZarrChunkDeleteError {
+        errors,
+        chunk_indices,
     }
 }
 
@@ -1731,7 +1798,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(crate::error::Error::ZarrArrayStoreError {
-                which_tile: WhichTile::Metadata,
+                which_array: WhichZarrArray::Metadata,
                 ..
             })
         ));

@@ -567,9 +567,9 @@ pub enum Error {
     ZarrArrayError {
         source: zarrs::array::ArrayError,
     },
-    #[snafu(display("Error while inserting on an array with zarrs: {source} for {which_tile}."))]
+    #[snafu(display("Error while inserting on an array with zarrs: {source} for {which_array}."))]
     ZarrArrayStoreError {
-        which_tile: WhichTile,
+        which_array: WhichZarrArray,
         source: zarrs::array::ArrayError,
     },
     #[snafu(display(
@@ -586,21 +586,28 @@ pub enum Error {
     InvalidZarrTileIndex {
         reason: &'static str,
     },
+    #[snafu(display(
+        "Could not delete a chunk of at least one zarr array at {chunk_indices:?}: {errors:?}."
+    ))]
+    ZarrChunkDeleteError {
+        chunk_indices: [u64; 2],
+        errors: Vec<(zarrs::storage::StorageError, WhichZarrArray)>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum WhichTile {
+pub enum WhichZarrArray {
     Tiles,
     Validity,
     Metadata,
 }
 
-impl std::fmt::Display for WhichTile {
+impl std::fmt::Display for WhichZarrArray {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WhichTile::Tiles => f.write_str("Tiles"),
-            WhichTile::Metadata => f.write_str("Metadata"),
-            WhichTile::Validity => f.write_str("Validity"),
+            WhichZarrArray::Tiles => f.write_str("Tiles"),
+            WhichZarrArray::Metadata => f.write_str("Metadata"),
+            WhichZarrArray::Validity => f.write_str("Validity"),
         }
     }
 }

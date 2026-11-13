@@ -26,7 +26,6 @@ pub struct OnDiskStore<SF: OnDiskStorageFormat, ES: EvictionStrategy> {
     pub total_current_size: Arc<AtomicUsize>,
 }
 
-// TODO (high): {462286af-362d-42f0-a803-ebe807aa820b}
 /// A storage format that can be written to disk and read from disk
 /// Eligible for in-memory caching as well.
 #[async_trait]
@@ -34,19 +33,22 @@ pub trait OnDiskStorageFormat: StorageFormat {
     /// Handle to the files on disk that can be read back into memory
     type Written: DiskEntry; //<Prepared = Self>;
 
-    // TODO (crit): {00ab4c2f-3bee-4f03-864f-a1d1e02e6d4a}
-    /// Write the data to disk and return a handle to the files on disk
+    /// Write the data to disk and return a handle to the files on disk.
+    ///
+    /// Assumption: Data is not overwritten, as
+    ///     key1 = key2 => data1 = data2
     async fn write(self) -> Result<Self::Written>;
 }
 
 /// A handle for one or multiple files on the disk
 #[async_trait]
 pub trait DiskEntry: Send + Sync + Sized + 'static {
-    // The type that may be written to disk
-    // this type is also eligible for in-memory caching
-    // type Prepared: OnDiskStorageFormat;
 
+    /// Read the entry from disk, returning the [`TypedRasterTile2D`]
     async fn read(&self) -> Result<TypedRasterTile2D>;
+
+    /// Delete the tile from disk.
+    async fn erase(&self) -> Result<()>;
 }
 
 #[async_trait]
@@ -66,7 +68,8 @@ where
         }
     }
 
-    // TODO (crit): this function probably not right anymore, the base has changed a lot. fix it! after rebase
+    // TODO (high): insertion should be looked over
+    // TODO (high): concrete issue; failed (partial) delete, leaves partial data behind on the disk.
     async fn insert(
         &self,
         key: Arc<CacheKey>,
@@ -85,14 +88,16 @@ where
         }
 
         let cache_hint = cache_hint(&tile);
+        // OnDiskStore prepares the tile here to insert it later with write()
+        // this (usually) does not write to disk, though this limitation is not enforced
         let prepared_tile = SF::store(tile, key.clone(), result_descriptor).await?;
         let value_size = prepared_tile.byte_size().await?;
 
         let key_size = cache_key_byte_size(&key);
         let required_space = value_size + key_size;
 
-        let mut cache = self.cache_index.write().await;
-        if cache.contains_key(&key) {
+        let mut cache_index = self.cache_index.write().await;
+        if cache_index.contains_key(&key) {
             return Ok(());
         }
 
@@ -101,7 +106,9 @@ where
 
         let eviction_plan =
             eviction_strategy.plan_eviction(current_size, required_space, |key| {
-                cache.get(key).is_none_or(|sf| Arc::strong_count(sf) > 1)
+                cache_index
+                    .get(key)
+                    .is_none_or(|sf| Arc::strong_count(sf) > 1)
             })?;
 
         let needed = (current_size + required_space).saturating_sub(eviction_strategy.capacity());
@@ -110,13 +117,29 @@ where
         }
 
         for evict_key in eviction_plan.keys_to_remove {
-            cache.remove(&evict_key);
+            let Some(entry) = cache_index.get(&evict_key) else {
+                continue;
+            };
+
+            // we cannot delete the file from disk yet if there are
+            // other readers to this handle.
+            // TODO (high): The types should enforce this if possible, look
+            //              into a better solution
+            if Arc::strong_count(entry) > 1 {
+                continue;
+            }
+
+            // delete the file from disk
+            entry.erase().await?;
+            // this just removes it from the index, the file is still there if entry.erase() is not called.
+            cache_index.remove(&evict_key);
             eviction_strategy.record_removal(&evict_key);
         }
 
+        // write to disk
         let written = prepared_tile.write().await?;
         eviction_strategy.record_access(&key, required_space, cache_hint);
-        cache.insert(
+        cache_index.insert(
             key,
             Arc::new(SizeTrackedEntry::new(
                 written,

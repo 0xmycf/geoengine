@@ -64,7 +64,7 @@ use crate::{
     engine::OperatorName,
     error::{
         Error,
-        WhichTile::{Metadata, Tiles, Validity},
+        WhichZarrArray::{Metadata, Tiles, Validity},
     },
     util::gdal::create_ndvi_meta_data,
 };
@@ -113,6 +113,12 @@ impl DiskEntry for ArrowIpcDiskEntry {
         Ok(ArrowIpcStorageFormat::new(buf, self.common.clone())
             .load()
             .await?)
+    }
+
+    async fn erase(&self) -> Result<()> {
+        tokio::fs::remove_file(&self.path)
+            .await
+            .map_err(|source| source.into())
     }
 }
 
