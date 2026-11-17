@@ -224,25 +224,6 @@ impl StorageFormat for PreparedZarrStorageFormat {
             match writer.store_tile_chunks(&tile, chunk_indices) {
                 Ok(sizes) => sizes,
                 Err(err) => return Err(err),
-                // {
-                //     for attempt in writer.attempted() {
-                //         let (name, array) = match attempt {
-                //             CompletedZarrWrite::Tile => ("tiles", &arrays.tiles),
-                //             CompletedZarrWrite::Validity => ("validity", &arrays.validity),
-                //             CompletedZarrWrite::Metadata => ("metadata", &arrays.metadata),
-                //         };
-                //         // TODO (crit): this is not even neccessary here.
-                //         if let Err(error) = array.erase_chunk(&chunk_indices) {
-                //             tracing::warn!(
-                //                 %error,
-                //                 array = name,
-                //                 chunk_indices = ?chunk_indices,
-                //                 "Failed to erase Zarr cache chunk after write failure"
-                //             );
-                //         }
-                //     }
-                //     return Err(err);
-                // }
             }
         };
 
@@ -257,10 +238,12 @@ impl StorageFormat for PreparedZarrStorageFormat {
 
             let bytes = store.get(&key).expect("there to be no storage error.");
 
-            byte_size += bytes.as_ref().map(|x| x.len()).unwrap_or(0) as u64;
             if is_json {
+                // don't count the byte size for metadata, as it would be
+                // duplicated by writing more chunks. The metadata is written only once.
                 layout_builder.push((key, bytes.expect("the bytes to be present")));
             } else {
+                byte_size += bytes.as_ref().map(|x| x.len()).unwrap_or(0) as u64;
                 data.insert(
                     key_to_array(&key).ok_or(Error::ZarrsGeoengineCacheArrayMappingError {
                         key: key.to_string(),
@@ -303,6 +286,7 @@ impl StorageFormat for PreparedZarrStorageFormat {
         )
     }
 
+    // TODO (high): {a8ad12e5-8282-451c-b44a-275ee2702b45} currently only the size of the chunks is calculated and used. Also change the bytesize to usize, so we dont need conversions all over the place.
     async fn byte_size(&self) -> Result<usize> {
         Ok(self.byte_size as usize)
     }
@@ -337,6 +321,7 @@ where
     Ok(())
 }
 
+/// returns whether the layout had to be written to disk.
 fn ensure_layout<TStore>(store: &TStore, layout: &[(StoreKey, bytes::Bytes); 4]) -> Result<()>
 where
     TStore: ReadableWritableStorageTraits,
@@ -346,12 +331,13 @@ where
             .get(key)
             .map_err(|err| Error::ZarrArrayError { source: err.into() })?
         {
+            // metadata is _not_ present -> Write it.
             None => {
-                // Definition is absent: write it.
                 store
                     .set(key, expected_bytes.clone())
                     .map_err(|err| Error::ZarrArrayError { source: err.into() })?;
             }
+            // metadata is present -> Check if valid
             Some(actual) => {
                 check_metadata_matches(key, &actual, expected_bytes)?;
             }
