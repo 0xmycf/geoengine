@@ -816,7 +816,7 @@ impl StorageFormat for TypedCompressedRasterTile2D {
     async fn store(
         tile: TypedRasterTile2D,
         _key: Arc<CacheKey>,
-        _result_descriptor: &RasterResultDescriptor, // TODO (crit): check if this is intentional
+        _result_descriptor: &RasterResultDescriptor,
     ) -> Result<Self> {
         tokio::task::spawn_blocking(move || match tile {
             TypedRasterTile2D::I8(tile) => Ok(TypedCompressedRasterTile2D::I8(

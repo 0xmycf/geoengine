@@ -88,7 +88,6 @@ impl ArrowIpcStorageFormat {
     }
 }
 
-// TODO (crit): {5c897d01-8846-473d-9976-3ef00d862c00}
 pub struct ArrowIpcDiskEntry {
     pub path: PathBuf,
     common: CommonOnDiskStorageData,
@@ -102,17 +101,12 @@ impl ArrowIpcDiskEntry {
 
 #[async_trait]
 impl DiskEntry for ArrowIpcDiskEntry {
-    // type Prepared = ArrowIpcStorageFormat; //: OnDiskStorageFormat;
-
     async fn read(&self) -> Result<TypedRasterTile2D> {
         let mut file = tokio::fs::File::open(self.path.clone()).await?;
         let mut buf = vec![];
 
         let _ = file.read_to_end(&mut buf).await?;
-        // TODO construct the tile right away
-        Ok(ArrowIpcStorageFormat::new(buf, self.common.clone())
-            .load()
-            .await?)
+        arrow_ipc_tile_to_typed_raster_for_data_type(&buf, self.common.data_type)
     }
 
     async fn erase(&self) -> Result<()> {
@@ -124,7 +118,7 @@ impl DiskEntry for ArrowIpcDiskEntry {
 
 #[async_trait]
 impl OnDiskStorageFormat for ArrowIpcStorageFormat {
-    type Written = ArrowIpcDiskEntry; //: DiskEntry<Prepared = Self>;
+    type Written = ArrowIpcDiskEntry;
 
     /// Removes the file if writing fails
     async fn write(self) -> Result<Self::Written> {
@@ -169,7 +163,7 @@ impl StorageFormat for ArrowIpcStorageFormat {
     async fn store(
         tile: TypedRasterTile2D,
         key: Arc<CacheKey>,
-        _result_descriptor: /* TODO (crit): check if this must be used after the rebase! */ &RasterResultDescriptor,
+        _result_descriptor: &RasterResultDescriptor,
     ) -> Result<Self> {
         let bytes = typed_raster_tile_to_arrow_ipc(tile.clone())?; // is cloning here necessary?
         let byte_size = bytes.len();
@@ -181,18 +175,7 @@ impl StorageFormat for ArrowIpcStorageFormat {
     }
 
     async fn load(&self) -> Result<TypedRasterTile2D> {
-        match self.common.data_type {
-            RasterDataType::I8 => arrow_ipc_tile_to_typed_raster::<i8>(&self.tile),
-            RasterDataType::I16 => arrow_ipc_tile_to_typed_raster::<i16>(&self.tile),
-            RasterDataType::I32 => arrow_ipc_tile_to_typed_raster::<i32>(&self.tile),
-            RasterDataType::I64 => arrow_ipc_tile_to_typed_raster::<i64>(&self.tile),
-            RasterDataType::U8 => arrow_ipc_tile_to_typed_raster::<u8>(&self.tile),
-            RasterDataType::U16 => arrow_ipc_tile_to_typed_raster::<u16>(&self.tile),
-            RasterDataType::U32 => arrow_ipc_tile_to_typed_raster::<u32>(&self.tile),
-            RasterDataType::U64 => arrow_ipc_tile_to_typed_raster::<u64>(&self.tile),
-            RasterDataType::F32 => arrow_ipc_tile_to_typed_raster::<f32>(&self.tile),
-            RasterDataType::F64 => arrow_ipc_tile_to_typed_raster::<f64>(&self.tile),
-        }
+        arrow_ipc_tile_to_typed_raster_for_data_type(&self.tile, self.common.data_type)
     }
 
     /// Returns only the size of the bytes that will be written to the disk.
@@ -211,6 +194,24 @@ fn typed_raster_tile_to_arrow_ipc(tile: TypedRasterTile2D) -> Result<Vec<u8>> {
         raster_tile_2d_to_arrow_ipc_file_for_ipc_channel(tile)
     })
     .map_err(|err| crate::error::Error::DataType { source: err })
+}
+
+fn arrow_ipc_tile_to_typed_raster_for_data_type(
+    tile: &[u8],
+    data_type: RasterDataType,
+) -> Result<TypedRasterTile2D> {
+    match data_type {
+        RasterDataType::I8 => arrow_ipc_tile_to_typed_raster::<i8>(tile),
+        RasterDataType::I16 => arrow_ipc_tile_to_typed_raster::<i16>(tile),
+        RasterDataType::I32 => arrow_ipc_tile_to_typed_raster::<i32>(tile),
+        RasterDataType::I64 => arrow_ipc_tile_to_typed_raster::<i64>(tile),
+        RasterDataType::U8 => arrow_ipc_tile_to_typed_raster::<u8>(tile),
+        RasterDataType::U16 => arrow_ipc_tile_to_typed_raster::<u16>(tile),
+        RasterDataType::U32 => arrow_ipc_tile_to_typed_raster::<u32>(tile),
+        RasterDataType::U64 => arrow_ipc_tile_to_typed_raster::<u64>(tile),
+        RasterDataType::F32 => arrow_ipc_tile_to_typed_raster::<f32>(tile),
+        RasterDataType::F64 => arrow_ipc_tile_to_typed_raster::<f64>(tile),
+    }
 }
 
 fn arrow_ipc_tile_to_typed_raster<P>(tile: &[u8]) -> Result<TypedRasterTile2D>
