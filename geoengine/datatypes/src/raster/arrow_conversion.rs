@@ -115,8 +115,8 @@ where
                 tracing::info!(
                     "Cache hint metadata is missing or could not be deserialized; using maximum cache duration"
                 );
-                CacheHint::no_cache()
-            }); // TODO (crit): {27B344EE-600E-448B-982D-8A7D6DDA2E30} {294c2ea8-84c3-4e72-9632-c10e3d06f001} check what is appropriate here
+                CacheHint::max_duration()
+            });
 
         let raster_tile_2d = RasterTile2D::new_with_properties(
             time,
