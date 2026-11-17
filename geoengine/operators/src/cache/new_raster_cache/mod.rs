@@ -2,8 +2,12 @@ pub mod on_disk;
 
 use crate::cache::cache_tiles::{CompressedRasterTile2D, CompressedRasterTileExt};
 use crate::cache::error::CacheError;
-use crate::cache::new_raster_cache::on_disk::arrow_ipc_cache::ArrowIpcStorageFormat;
-use crate::cache::new_raster_cache::on_disk::zarrs_cache::PreparedZarrStorageFormat;
+use crate::cache::new_raster_cache::on_disk::arrow_ipc_cache::{
+    ArrowIpcDiskEntry, ArrowIpcStorageFormat,
+};
+use crate::cache::new_raster_cache::on_disk::zarrs_cache::{
+    PreparedZarrStorageFormat, ZarrDiskEntry,
+};
 use crate::cache::new_raster_cache::on_disk::{DiskEntry, OnDiskStore};
 use crate::engine::{
     BoxRasterQueryProcessor, CanonicOperatorName, InitializedRasterOperator, QueryContext,
@@ -37,6 +41,33 @@ use tokio::sync::RwLock;
 
 pub struct NewRasterCache<Store> {
     store: Store,
+}
+
+/// An owned handle that pins the indexed entry until its last clone is dropped.
+#[derive(Clone)]
+enum RasterCacheEntry {
+    Memory(Arc<SizeTrackedEntry<TypedCompressedRasterTile2D>>),
+    Arrow(Arc<SizeTrackedEntry<ArrowIpcDiskEntry>>),
+    Zarr(Arc<SizeTrackedEntry<ZarrDiskEntry>>),
+}
+
+impl RasterCacheEntry {
+    async fn load(&self) -> Result<TypedRasterTile2D> {
+        match self {
+            Self::Memory(entry) => entry.load().await,
+            Self::Arrow(entry) => entry.read().await,
+            Self::Zarr(entry) => entry.read().await,
+        }
+    }
+
+    #[cfg(test)]
+    fn strong_count(&self) -> usize {
+        match self {
+            Self::Memory(entry) => Arc::strong_count(entry),
+            Self::Arrow(entry) => Arc::strong_count(entry),
+            Self::Zarr(entry) => Arc::strong_count(entry),
+        }
+    }
 }
 
 pub enum NewRasterCacheEnum {
@@ -171,48 +202,27 @@ impl NewRasterCacheEnum {
         })
     }
 
-    // TODO (crit): this needs to be rewroked.
-    // async fn get(&self, key: &CacheKey) -> Result<StorageFormatEnum> {
-    async fn get(
-        &self,
-        key: &CacheKey,
-    ) -> Result<Option<Arc<SizeTrackedEntry<TypedCompressedRasterTile2D>>>> {
+    async fn get(&self, key: &CacheKey) -> Result<Option<RasterCacheEntry>> {
         match self {
-            NewRasterCacheEnum::InMemoryCompressedRasterTile2DFifo(cache) => {
-                cache.store.get(key).await
+            Self::InMemoryCompressedRasterTile2DFifo(cache) => {
+                Ok(cache.store.get(key).await?.map(RasterCacheEntry::Memory))
             }
-            NewRasterCacheEnum::InMemoryCompressedRasterTile2DLru(cache) => {
-                cache.store.get(key).await
+            Self::InMemoryCompressedRasterTile2DLru(cache) => {
+                Ok(cache.store.get(key).await?.map(RasterCacheEntry::Memory))
             }
-            NewRasterCacheEnum::OnDiskMockFifoIpc(_cache) => {
-                todo!("TODO (crit): make this work again: change types in the anticache file")
-                // cache.store.get(key).await
+            Self::OnDiskMockFifoIpc(cache) => {
+                Ok(cache.store.get(key).await?.map(RasterCacheEntry::Arrow))
             }
-            NewRasterCacheEnum::OnDiskMockFifoZarr(_cache) => {
-                todo!("TODO (crit): make this work again: change types in the anticache file")
-                // cache.store.get(key).await
+            Self::OnDiskMockFifoZarr(cache) => {
+                Ok(cache.store.get(key).await?.map(RasterCacheEntry::Zarr))
             }
         }
     }
 
     async fn get_tile(&self, key: &CacheKey) -> Result<Option<TypedRasterTile2D>> {
-        match self {
-            Self::InMemoryCompressedRasterTile2DFifo(_)
-            | Self::InMemoryCompressedRasterTile2DLru(_) => match self.get(key).await? {
-                Some(entry) => Ok(Some(entry.load().await?)),
-                None => Ok(None),
-            },
-            Self::OnDiskMockFifoIpc(cache) => match cache.store.get(key).await? {
-                Some(entry) => Ok(Some(entry.read().await?)),
-                None => Ok(None),
-            },
-            Self::OnDiskMockFifoZarr(cache) => match cache.store.get(key).await? {
-                Some(entry) => {
-                    let x = entry.read().await?;
-                    Ok(Some(x))
-                }
-                None => Ok(None),
-            },
+        match self.get(key).await? {
+            Some(entry) => Ok(Some(entry.load().await?)),
+            None => Ok(None),
         }
     }
 
@@ -247,10 +257,14 @@ impl NewRasterCacheEnum {
             NewRasterCacheEnum::InMemoryCompressedRasterTile2DLru(cache) => {
                 cache.store.total_size.load(Ordering::SeqCst)
             }
-            NewRasterCacheEnum::OnDiskMockFifoIpc(_cache) => todo!("TODO (crit): see above"),
-            // NewRasterCacheEnum::OnDiskMockFifo(cache) => cache.store.insert(key, tile).await,
-            NewRasterCacheEnum::OnDiskMockFifoZarr(_cache) => todo!("TODO (crit): see above"),
-            // NewRasterCacheEnum::OnDiskMockFifoZarr(cache) => cache.store.insert(key, tile).await,
+            // TODO (high): must check whether this is actually the correct size {6a507ee6-a309-45e0-9a5e-a4ba954f8aa6}
+            NewRasterCacheEnum::OnDiskMockFifoIpc(cache) => {
+                cache.store.total_current_size.load(Ordering::SeqCst)
+            }
+            // TODO (high): must check whether this is actually the correct size {6a507ee6-a309-45e0-9a5e-a4ba954f8aa6}
+            NewRasterCacheEnum::OnDiskMockFifoZarr(cache) => {
+                cache.store.total_current_size.load(Ordering::SeqCst)
+            }
         }
     }
 }
@@ -1587,7 +1601,7 @@ mod tests {
             .unwrap()
             .expect("A should be cached");
         assert!(
-            Arc::strong_count(&pinned) > 1,
+            pinned.strong_count() > 1,
             "the cache and the held reference should both own an Arc to the entry"
         );
 
@@ -1603,7 +1617,18 @@ mod tests {
             "a failed insert must not disturb the still-pinned entry"
         );
 
+        let cloned = pinned.clone();
+        assert_eq!(cloned.strong_count(), 3);
         drop(pinned);
+        assert_eq!(cloned.strong_count(), 2);
+        assert!(
+            cache
+                .insert(key_b.clone(), tile_b.clone(), &test_result_descriptor())
+                .await
+                .is_err(),
+            "the cloned handle must keep the entry pinned"
+        );
+        drop(cloned);
 
         cache
             .insert(key_b.clone(), tile_b, &test_result_descriptor())
@@ -1748,7 +1773,7 @@ mod tests {
             .unwrap();
 
         let pinned = cache.get(&key_a).await.unwrap().unwrap();
-        assert!(Arc::strong_count(&pinned) > 1);
+        assert!(pinned.strong_count() > 1);
 
         let cache_size_before = cache.byte_size();
         let result = cache
@@ -1936,7 +1961,6 @@ mod tests {
             .expect("tile should be cached after query");
 
         let cached_tile_typed = cached_compressed
-            .value
             .load()
             .await
             .expect("decompression should succeed");
