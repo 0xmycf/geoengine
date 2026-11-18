@@ -31,7 +31,7 @@ pub struct OnDiskStore<SF: OnDiskStorageFormat, ES: EvictionStrategy> {
 #[async_trait]
 pub trait OnDiskStorageFormat: StorageFormat {
     /// Handle to the files on disk that can be read back into memory
-    type Written: DiskEntry; //<Prepared = Self>;
+    type Written: DiskEntry;
 
     /// Write the data to disk and return a handle to the files on disk.
     ///

@@ -1,5 +1,4 @@
 // TODO (low): handle all panics!
-#![allow(unused)]
 use std::{
     fmt::Write,
     fs,
@@ -96,8 +95,6 @@ pub struct ZarrDiskEntry {
 
 #[async_trait]
 impl DiskEntry for ZarrDiskEntry {
-    // type Prepared = New__ZarrsStorageFormat;
-
     async fn read(&self) -> Result<TypedRasterTile2D> {
         let store = open_zarrs_filesystemstore(&self.paths)?;
         let arrays = self.paths.open(store)?;
@@ -705,32 +702,6 @@ where
     }
 
     /// Store a tile.
-    fn store_tile_v2(
-        &self,
-        tile_data: Option<TypedGrid2D>,
-        chunk_indices: [u64; 2],
-    ) -> Result<usize> {
-        match tile_data {
-            None => Ok(0),
-            // TODO (low): {C482F320-772B-46FE-A6E5-0D7EE22B3AB4}
-            //      make sure that the 0 is correct.
-            //      (we dont write any tile (we dont need to) and at read side we initialize a NoDataTile)
-            Some(typed_grid) => match typed_grid {
-                TypedGrid::U8(grid) => self.store_tile_data_concrete(grid.data, &chunk_indices),
-                TypedGrid::U16(grid) => self.store_tile_data_concrete(grid.data, &chunk_indices),
-                TypedGrid::U32(grid) => self.store_tile_data_concrete(grid.data, &chunk_indices),
-                TypedGrid::U64(grid) => self.store_tile_data_concrete(grid.data, &chunk_indices),
-                TypedGrid::I8(grid) => self.store_tile_data_concrete(grid.data, &chunk_indices),
-                TypedGrid::I16(grid) => self.store_tile_data_concrete(grid.data, &chunk_indices),
-                TypedGrid::I32(grid) => self.store_tile_data_concrete(grid.data, &chunk_indices),
-                TypedGrid::I64(grid) => self.store_tile_data_concrete(grid.data, &chunk_indices),
-                TypedGrid::F32(grid) => self.store_tile_data_concrete(grid.data, &chunk_indices),
-                TypedGrid::F64(grid) => self.store_tile_data_concrete(grid.data, &chunk_indices),
-            },
-        }
-    }
-
-    /// Store a tile.
     fn store_tile(&self, tile: &TypedRasterTile2D, chunk_indices: [u64; 2]) -> Result<usize> {
         match typed_raster_tile_2d_to_typed_grid_2d_grid_array(tile) {
             None => Ok(0),
@@ -753,26 +724,6 @@ where
     }
 
     // Store the validity mask.
-    fn store_validity_mask_v2(
-        &self,
-        validity_mask: Option<Vec<bool>>,
-        chunk_indices: [u64; 2],
-    ) -> Result<usize> {
-        if let Some(mask) = validity_mask {
-            let ret = mask.byte_size();
-            let () = self
-                .validity
-                .store_chunk(&chunk_indices, mask)
-                .map_err(|source| Error::ZarrArrayStoreError {
-                    which_array: WhichZarrArray::Validity,
-                    source,
-                })?;
-            return Ok(ret);
-        }
-        return Ok(0); // TODO (low): see C482F320-772B-46FE-A6E5-0D7EE22B3AB4 , ef998d34-209e-4eb1-a8dc-30b6cf084e55
-    }
-
-    // Store the validity mask.
     fn store_validity_mask(
         &self,
         chunk_indices: [u64; 2],
@@ -790,19 +741,6 @@ where
             return Ok(ret);
         }
         return Ok(0); // TODO (low): see C482F320-772B-46FE-A6E5-0D7EE22B3AB4 , ef998d34-209e-4eb1-a8dc-30b6cf084e55
-    }
-
-    fn store_metadata_chunk_v2(
-        &self,
-        metadata_chunk: ZarrsMetaDataChunk,
-        chunk_indices: [u64; 2],
-    ) -> Result<()> {
-        self.metadata
-            .store_chunk(&chunk_indices, metadata_chunk)
-            .map_err(|source| Error::ZarrArrayStoreError {
-                which_array: WhichZarrArray::Metadata,
-                source,
-            })
     }
 
     fn store_metadata_chunk(
@@ -1174,34 +1112,6 @@ where
         attempted
     }
 
-    fn store_tile_chunks_v2(
-        &mut self,
-        tile: ZarrTileData,
-        chunk_indices: [u64; 2],
-    ) -> Result<(usize, usize)> {
-        let ZarrTileData {
-            tile_grid,
-            validity_mask,
-            zarr_metadata_chunk,
-        } = tile;
-        self.mark_attempted(CompletedZarrWrite::Tile);
-        let byte_size_tile_data = self.arrays.store_tile_v2(tile_grid, chunk_indices)?;
-
-        self.mark_attempted(CompletedZarrWrite::Validity);
-        let byte_size_tile_validity = self
-            .arrays
-            .store_validity_mask_v2(validity_mask, chunk_indices)?;
-
-        self.mark_attempted(CompletedZarrWrite::Metadata);
-        let () /* TODO (crit): this must return the correct bytes {ef998d34-209e-4eb1-a8dc-30b6cf084e55} */
-                = self.arrays.store_metadata_chunk_v2(
-                    zarr_metadata_chunk,
-                    chunk_indices,
-                )?;
-
-        Ok((byte_size_tile_data, byte_size_tile_validity)) // TODO (crit): {ef998d34-209e-4eb1-a8dc-30b6cf084e55}
-    }
-
     /// returns whether the file is empty (false = not empty, true = empty)
     fn store_tile_chunks(
         &mut self,
@@ -1220,22 +1130,22 @@ where
         }
 
         self.mark_attempted(CompletedZarrWrite::Metadata);
-        let () /* TODO (crit): this must return the correct bytes {ef998d34-209e-4eb1-a8dc-30b6cf084e55} */ = self.arrays.store_metadata_chunk(
-                chunk_indices,
-                ZarrsMetaDataChunk {
-                    tile_position: call_generic_raster_tile_2d!(tile, tile => tile
+        self.arrays.store_metadata_chunk(
+            chunk_indices,
+            ZarrsMetaDataChunk {
+                tile_position: call_generic_raster_tile_2d!(tile, tile => tile
                             .tile_position),
-                    properties: call_generic_raster_tile_2d!(tile, tile => tile
+                properties: call_generic_raster_tile_2d!(tile, tile => tile
                             .properties
                             .clone()),
-                    time_interval: call_generic_raster_tile_2d!(tile, tile => tile
+                time_interval: call_generic_raster_tile_2d!(tile, tile => tile
                             .time
                             .clone()),
-                    is_no_data: call_generic_raster_tile_2d!(tile, tile => tile
+                is_no_data: call_generic_raster_tile_2d!(tile, tile => tile
                             .grid_array
                             .is_empty()),
-                },
-            )?;
+            },
+        )?;
 
         Ok(is_empty)
     }

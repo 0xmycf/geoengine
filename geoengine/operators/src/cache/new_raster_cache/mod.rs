@@ -1550,7 +1550,6 @@ mod tests {
 
         let cache = NewRasterCacheEnum::new_lru(size_a + size_b);
 
-        // TODO (crit): Make it work again after rebase!c
         cache
             .insert(key_a.clone(), tile_a, &test_result_descriptor())
             .await
@@ -1589,7 +1588,6 @@ mod tests {
 
         let cache = make_cache(size_a.max(size_b));
 
-        // TODO (crit): make it work again after the rebase!
         cache
             .insert(key_a.clone(), tile_a, &test_result_descriptor())
             .await
