@@ -56,8 +56,11 @@ use zarrs::{
     filesystem::FilesystemStore,
     group::GroupBuilder,
     storage::{
-        ListableStorageTraits, ReadableStorageTraits, ReadableWritableStorageTraits, StoreKey,
-        WritableStorageTraits, store::MemoryStore,
+        AsyncReadableStorageTraits, AsyncReadableWritableListableStorageTraits,
+        AsyncReadableWritableStorageTraits, AsyncWritableStorageTraits, ListableStorageTraits,
+        ReadableStorageTraits, ReadableWritableStorageTraits, StoreKey, WritableStorageTraits,
+        storage_adapter::sync_to_async::{SyncToAsyncSpawnBlocking, SyncToAsyncStorageAdapter},
+        store::MemoryStore,
     },
 };
 
@@ -81,6 +84,28 @@ use crate::{
     util::gdal::create_ndvi_meta_data,
 };
 
+/*
+<https://docs.rs/zarrs_storage/0.4.5/zarrs_storage/storage_adapter/sync_to_async/trait.SyncToAsyncSpawnBlocking.html>
+*/
+struct TokioSpawnBlocking;
+
+impl SyncToAsyncSpawnBlocking for TokioSpawnBlocking {
+    async fn spawn_blocking<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        match crate::util::spawn_blocking(f).await {
+            Ok(r) => r,
+            Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+            Err(err) => std::panic::resume_unwind(Box::new(err)),
+        }
+    }
+}
+
+type AsyncFileSystemStore = SyncToAsyncStorageAdapter<FilesystemStore, TokioSpawnBlocking>;
+
+#[derive(Debug)]
 pub struct ZarrDiskEntry {
     // Abstraction over the filepaths to the different arrays used for serialising from/into Zarrs
     paths: ZarrsArrayPath,
@@ -96,24 +121,26 @@ pub struct ZarrDiskEntry {
 #[async_trait]
 impl DiskEntry for ZarrDiskEntry {
     async fn read(&self) -> Result<TypedRasterTile2D> {
-        let store = open_zarrs_filesystemstore(&self.paths)?;
-        let arrays = self.paths.open(store)?;
-        arrays.retrieve_tile(
-            &self.chunk_indices,
-            &self.paths,
-            self.data_type,
-            self.cache_hint,
-        )
+        let store = async_open_zarrs_filesystem_store(&self.paths).await?;
+        let arrays = self.paths.async_open(store).await?;
+        arrays
+            .async_retrieve_tile(
+                &self.chunk_indices,
+                &self.paths,
+                self.data_type,
+                self.cache_hint,
+            )
+            .await
     }
 
     async fn erase(&self) -> Result<()> {
-        let store = open_zarrs_filesystemstore(&self.paths)?;
-        let arrays = self.paths.open(store)?;
-        arrays.delete_tile(self.chunk_indices)
+        let store = async_open_zarrs_filesystem_store(&self.paths).await?;
+        let arrays = self.paths.async_open(store).await?;
+        arrays.async_erase_tile(self.chunk_indices).await
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ZarrStoreEntry {
     store_key: StoreKey,
     bytes: bytes::Bytes,
@@ -131,6 +158,21 @@ impl ZarrStoreEntry {
         store
             .set(&self.store_key, self.bytes.clone())
             .map_err(|err| Error::ZarrArrayError { source: err.into() })
+    }
+
+    // TODO (high): d7cdae44-8dd2-404a-9f9d-7fb4c0abaaff
+    /// Async version of [`set_in_store`]
+    ///
+    /// Returns the amount of bytes written.
+    async fn async_set_in_store<TStore>(&self, store: &TStore) -> Result<usize>
+    where
+        TStore: AsyncWritableStorageTraits,
+    {
+        store
+            .set(&self.store_key, self.bytes.clone())
+            .await
+            .map_err(|err| Error::ZarrArrayError { source: err.into() })?;
+        Ok(self.bytes.len())
     }
 }
 
@@ -318,21 +360,61 @@ where
     Ok(())
 }
 
-/// returns whether the layout had to be written to disk.
-fn ensure_layout<TStore>(store: &TStore, layout: &[(StoreKey, bytes::Bytes); 4]) -> Result<()>
+/// Async version of [`write_to_store`]
+///
+/// Returns the amount of bytes written excluding keys. TODO (high): d7cdae44-8dd2-404a-9f9d-7fb4c0abaaff
+async fn async_write_to_store<TStore>(
+    data: &PreparedZarrStorageFormat,
+    store: &TStore,
+    write_json: bool,
+) -> Result<usize>
 where
-    TStore: ReadableWritableStorageTraits,
+    TStore: AsyncWritableStorageTraits,
 {
+    let mut bytes_written = 0_usize;
+    if write_json {
+        for (key, bytes) in &data.layout {
+            store
+                .set(&key, bytes.clone())
+                .await
+                .map_err(|err| Error::ZarrArrayError { source: err.into() })?;
+            bytes_written += bytes.len();
+        }
+    }
+    if let Some(data) = &data.tile_data {
+        bytes_written += data.async_set_in_store(store).await?;
+    }
+    if let Some(data) = &data.validity_data {
+        bytes_written += data.async_set_in_store(store).await?;
+    }
+    bytes_written += data.metadata.async_set_in_store(store).await?;
+    Ok(bytes_written)
+}
+
+// TODO (high): d7cdae44-8dd2-404a-9f9d-7fb4c0abaaff
+/// Create missing layout documents and validate existing ones asynchronously.
+/// Returns the amount of bytes written.
+async fn async_ensure_layout<TStore>(
+    store: &TStore,
+    layout: &[(StoreKey, bytes::Bytes); 4],
+) -> Result<usize>
+where
+    TStore: AsyncReadableWritableStorageTraits,
+{
+    let mut bytes_written = 0_usize;
     for (key, expected_bytes) in layout {
         match store
             .get(key)
+            .await
             .map_err(|err| Error::ZarrArrayError { source: err.into() })?
         {
             // metadata is _not_ present -> Write it.
             None => {
                 store
                     .set(key, expected_bytes.clone())
+                    .await
                     .map_err(|err| Error::ZarrArrayError { source: err.into() })?;
+                bytes_written += expected_bytes.len();
             }
             // metadata is present -> Check if valid
             Some(actual) => {
@@ -340,7 +422,7 @@ where
             }
         }
     }
-    Ok(())
+    Ok(bytes_written)
 }
 
 fn check_metadata_matches(key: &StoreKey, actual: &[u8], expected: &[u8]) -> Result<()> {
@@ -361,26 +443,36 @@ impl OnDiskStorageFormat for PreparedZarrStorageFormat {
     type Written = ZarrDiskEntry;
 
     async fn write(self) -> Result<Self::Written> {
-        let store = open_zarrs_filesystemstore(&self.paths)?;
-        ensure_layout(&store, &self.layout)?;
+        let store = async_open_zarrs_filesystem_store(&self.paths).await?;
+        let _written_bytes = async_ensure_layout(&store, &self.layout).await?;
 
-        if let Err(err) =
-            write_to_store(&self, &store, false /* dont write zarr-layout jsons */)
+        if let Err(write_error) =
+            async_write_to_store(&self, &store, false /* dont write zarr-layout jsons */).await
         {
             // Delete the keys on a failed / partial write; missing indices are fine.
-            let cleanup_result = self
-                .paths
-                .open(store)
-                .and_then(|arrays| arrays.delete_tile(self.chunk_indices));
-            if let Err(cleanup_error) = cleanup_result {
-                tracing::error!(
-                    error = %cleanup_error,
-                    chunk_indices = ?self.chunk_indices,
-                    "Failed to clean up a failed Zarr write"
-                );
-                return Err(cleanup_error);
-            }
-            return Err(err);
+            let cleanup_result = match self.paths.async_open(store).await {
+                Ok(arrays) => {
+                    arrays
+                        .async_cleanup_parital_tile(self.chunk_indices, write_error)
+                        .await
+                }
+                Err(err) => Err(Error::ZarrChunkCleanupOpenError {
+                    chunk_indices: self.chunk_indices,
+                    write_error: Box::new(write_error),
+                    source: Box::new(err),
+                }),
+            };
+            return Err(match cleanup_result {
+                Ok(write_error) => write_error,
+                Err(cleanup_error) => {
+                    tracing::error!(
+                        error = %cleanup_error,
+                        chunk_indices = ?self.chunk_indices,
+                        "Failed to clean up a failed Zarr write"
+                    );
+                    cleanup_error
+                }
+            });
         };
         Ok(ZarrDiskEntry {
             paths: self.paths,
@@ -528,6 +620,30 @@ impl ZarrsArrayPath {
         Self::path("validity")
     }
 
+    /// Async version of [`Self::open`].
+    ///
+    /// Fails if the arrays where not created yet, or whenever [`zarrs:array::Array::open`] fails.
+    async fn async_open<TStore>(&self, store: Arc<TStore>) -> Result<ZarrsArrayAccess<TStore>>
+    where
+        TStore: AsyncReadableStorageTraits + 'static,
+    {
+        let tiles_array = Array::async_open(store.clone(), &self.tiles())
+            .await
+            .map_err(|source| Error::ZarrArrayCreateError { source })?;
+        let metadata_array = Array::async_open(store.clone(), &self.metadata())
+            .await
+            .map_err(|source| Error::ZarrArrayCreateError { source })?;
+        let validity_array = Array::async_open(store.clone(), &self.validity())
+            .await
+            .map_err(|source| Error::ZarrArrayCreateError { source })?;
+
+        Ok(ZarrsArrayAccess {
+            tiles: tiles_array,
+            validity: validity_array,
+            metadata: metadata_array,
+        })
+    }
+
     /// Fails if the arrays where not created yet, or whenever [`zarrs:array::Array::open`] fails.
     fn open<TStore>(&self, store: Arc<TStore>) -> Result<ZarrsArrayAccess<TStore>>
     where
@@ -561,6 +677,191 @@ struct ZarrsArrayAccess<TStore> {
     validity: ValidityMaskStore<TStore>,
     /// the store in which the metadata relevant for a single tile is stored
     metadata: MetaDataStore<TStore>,
+}
+
+// TODO (low): more cleanup with using this!
+impl<TStore> ZarrsArrayAccess<TStore>
+where
+    TStore: AsyncReadableWritableStorageTraits + 'static,
+{
+    /// Async version of [`Self::retrieve_metadata_chunk`]
+    async fn async_retrieve_metadata_chunk(
+        &self,
+        chunk_indices: &[u64],
+    ) -> std::result::Result<ZarrsMetaDataChunk, zarrs::array::ArrayError> {
+        self.metadata.async_retrieve_chunk(chunk_indices).await
+    }
+
+    /// Async version of [`Self::retrieve_validity_mask`]
+    async fn async_retrieve_validity_mask(
+        &self,
+        chunk_indices: &[u64],
+    ) -> std::result::Result<Vec<bool>, zarrs::array::ArrayError> {
+        self.validity.async_retrieve_chunk(chunk_indices).await
+    }
+
+    /// Async version of [`Self::retrieve_tile`]
+    async fn async_retrieve_tile(
+        &self,
+        chunk_indices: &[u64],
+        paths: &ZarrsArrayPath,
+        data_type: RasterDataType,
+        cache_hint: CacheHint,
+    ) -> Result<TypedRasterTile2D> {
+        let metadata_chunk: ZarrsMetaDataChunk = self
+            .async_retrieve_metadata_chunk(chunk_indices)
+            .await
+            .map_err(|source| Error::ZarrArrayError { source })?;
+        let time = metadata_chunk.time_interval;
+        let tile_position = metadata_chunk.tile_position;
+        let band = paths.band();
+        let global_geo_transform = self.read_global_geo_transform();
+
+        macro_rules! dispatch {
+            ($variant:ident, $ty:ty) => {{
+                if metadata_chunk.is_no_data {
+                    Ok(TypedRasterTile2D::$variant(
+                        RasterTile2D::new_with_properties(
+                            time,
+                            tile_position,
+                            band,
+                            global_geo_transform,
+                            // TODO (mid): do the tiles actually all have the same shape?
+                            GridOrEmpty::new_empty(EmptyGrid::new(
+                                self.single_tile_shape(chunk_indices),
+                            )),
+                            metadata_chunk.properties,
+                            cache_hint,
+                        ),
+                    ))
+                } else {
+                    let inner_tile = self
+                        .async_make_tile::<$ty>(
+                            chunk_indices,
+                            time,
+                            tile_position,
+                            band,
+                            global_geo_transform,
+                            cache_hint,
+                            metadata_chunk.properties,
+                        )
+                        .await?;
+                    Ok(TypedRasterTile2D::$variant(inner_tile))
+                }
+            }};
+        }
+
+        match data_type {
+            RasterDataType::U8 => dispatch!(U8, u8),
+            RasterDataType::U16 => dispatch!(U16, u16),
+            RasterDataType::U32 => dispatch!(U32, u32),
+            RasterDataType::U64 => dispatch!(U64, u64),
+            RasterDataType::I8 => dispatch!(I8, i8),
+            RasterDataType::I16 => dispatch!(I16, i16),
+            RasterDataType::I32 => dispatch!(I32, i32),
+            RasterDataType::I64 => dispatch!(I64, i64),
+            RasterDataType::F32 => dispatch!(F32, f32),
+            RasterDataType::F64 => dispatch!(F64, f64),
+        }
+    }
+
+    async fn async_make_tile<T: Pixel + zarrs::array::ElementOwned>(
+        &self,
+        chunk_indices: &[u64],
+        time: TimeInterval,
+        tile_position: GridIdx2D,
+        band: u32,
+        global_geo_transform: GeoTransform,
+        cache_hint: CacheHint,
+        properties: RasterProperties,
+    ) -> Result<RasterTile2D<T>> {
+        let raw_data: Vec<T> = self
+            .tiles
+            .async_retrieve_chunk(chunk_indices)
+            .await
+            .map_err(|source| Error::ZarrArrayError { source })?;
+        let validity_mask: Vec<bool> = self
+            .async_retrieve_validity_mask(chunk_indices)
+            .await
+            .map_err(|source| Error::ZarrArrayError { source })?;
+        let tile_shape = self.single_tile_shape(chunk_indices);
+        let data = GridOrEmpty::new_grid(
+            MaskedGrid2D::new(
+                Grid::new(
+                    // TODO (low): do we care about 32 bit systems at all? <- why is that even relevant?
+                    tile_shape, raw_data,
+                )
+                .expect("it to have the correct shape"),
+                Grid::new(tile_shape, validity_mask).expect("it to have the correct shape"),
+            )
+            .expect("it to be a valid input"),
+        );
+        Ok((RasterTile2D::new_with_properties(
+            time,
+            tile_position,
+            band,
+            global_geo_transform,
+            data,
+            properties,
+            cache_hint,
+        )))
+    }
+
+    async fn async_cleanup_parital_tile(
+        &self,
+        chunk_indices: [u64; 2],
+        write_error: Error,
+    ) -> Result<Error> {
+        match self.async_erase_tile(chunk_indices).await {
+            Ok(()) => Ok(write_error),
+            Err(Error::ZarrChunkEraseError {
+                chunk_indices,
+                errors,
+            }) => Err(Error::ZarrChunkCleanupError {
+                chunk_indices,
+                write_error: Box::new(write_error),
+                errors,
+            }),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Erase all three tile chunks asynchronously, collecting deletion errors.
+    ///
+    /// TODO (high): {801ba6b6-2134-4880-b434-12e310fd1ca0} Make deletion of parts-of-tiles atomic, and retry later if it failed and its reasonable to retry
+    async fn async_erase_tile(&self, chunk_indices: [u64; 2]) -> Result<()> {
+        let mut errors = Vec::new();
+
+        // erase_chunk succeeds when the chunk_indices are not present
+        for (which_array, result) in [
+            (
+                WhichZarrArray::Tiles,
+                self.tiles.async_erase_chunk(&chunk_indices).await,
+            ),
+            (
+                WhichZarrArray::Validity,
+                self.validity.async_erase_chunk(&chunk_indices).await,
+            ),
+            (
+                WhichZarrArray::Metadata,
+                self.metadata.async_erase_chunk(&chunk_indices).await,
+            ),
+        ] {
+            if let Err(err) = result {
+                tracing::error!(error = %err, ?chunk_indices, ?which_array, "Failed to delete chunk");
+                errors.push((err, which_array));
+            }
+        }
+
+        if !errors.is_empty() {
+            return Err(Error::ZarrChunkEraseError {
+                chunk_indices,
+                errors,
+            });
+        }
+
+        Ok(())
+    }
 }
 
 // TODO (low): more cleanup with using this!
@@ -755,39 +1056,9 @@ where
                 source,
             })
     }
+}
 
-    // TODO (high): {801ba6b6-2134-4880-b434-12e310fd1ca0} Make deletion of parts-of-tiles atomic, and retry later if it failed and its reasonable to retry
-    fn delete_tile(&self, chunk_indices: [u64; 2]) -> Result<()> {
-        let mut errors = Vec::new();
-
-        // erase_chunk succeeds when the chunk_indices are not present
-        for (which_array, result) in [
-            (
-                WhichZarrArray::Tiles,
-                self.tiles.erase_chunk(&chunk_indices),
-            ),
-            (
-                WhichZarrArray::Validity,
-                self.validity.erase_chunk(&chunk_indices),
-            ),
-            (
-                WhichZarrArray::Metadata,
-                self.metadata.erase_chunk(&chunk_indices),
-            ),
-        ] {
-            if let Err(err) = result {
-                tracing::error!(error = %err, ?chunk_indices, ?which_array, "Failed to delete chunk");
-                errors.push((err, which_array));
-            }
-        }
-
-        if !errors.is_empty() {
-            return Err(map_storage_err(errors, chunk_indices));
-        }
-
-        Ok(())
-    }
-
+impl<TStore> ZarrsArrayAccess<TStore> {
     fn single_tile_shape(&self, chunk_indices: &[u64]) -> GridShape<[usize; 2]> {
         let single_tile_shape = self
             .tiles
@@ -814,16 +1085,6 @@ where
                 serde_json::from_value(val.clone()).expect("it to be deserialisable")
             }
         }
-    }
-}
-
-fn map_storage_err(
-    errors: Vec<(zarrs::storage::StorageError, WhichZarrArray)>,
-    chunk_indices: [u64; 2],
-) -> Error {
-    Error::ZarrChunkDeleteError {
-        errors,
-        chunk_indices,
     }
 }
 
@@ -870,6 +1131,35 @@ impl FromArrayBytes for ZarrsMetaDataChunk {
     }
 }
 
+/// Async version of [`open_or_create_new_zarrs_array`].
+async fn async_open_or_create_new_zarrs_array<TStore>(
+    path: &str,
+    store: Arc<TStore>,
+    shape: impl Into<ArrayShape>, // The shape of the array
+    chunk_shape: impl Into<ArrayBuilderChunkGridMetadata>, // Usually the shape of a chunk
+    data_type: zarrs::array::DataType,
+    filler_value: impl Into<ArrayBuilderFillValue>,
+    attributes: Option<serde_json::Map<String, serde_json::Value>>,
+) -> std::result::Result<Array<TStore>, ArrayCreateError>
+where
+    TStore: AsyncReadableWritableStorageTraits + 'static,
+{
+    match Array::async_open(store.clone(), path).await {
+        Ok(array) => Ok(array),
+        Err(_) => {
+            let array = {
+                let mut builder = ArrayBuilder::new(shape, chunk_shape, data_type, filler_value);
+                if let Some(attrs) = attributes {
+                    builder.attributes(attrs);
+                }
+                builder.build(store.clone(), path)?
+            };
+            array.async_store_metadata().await?;
+            Ok(array)
+        }
+    }
+}
+
 fn open_or_create_new_zarrs_array<TStore>(
     path: &str,
     store: Arc<TStore>,
@@ -896,6 +1186,96 @@ where
             Ok(array)
         }
     }
+}
+
+/// Async version of [`open_or_create_new_zarrs_array`].
+///
+/// Opens or creates a new array at `/{operator_name}/band_{band}/{time}/tiles`.
+/// Stores the metadata of the array if a new one is created.
+async fn async_build_array_and_prepare_insert<TStore>(
+    key @ (operator_name, band, time_interval, tile_index): &CacheKey,
+    paths: &ZarrsArrayPath,
+    store: Arc<TStore>,
+    tile: &TypedRasterTile2D,
+    result_descriptor: &RasterResultDescriptor,
+) -> Result<ZarrsArrayAccess<TStore>>
+where
+    TStore: AsyncReadableWritableStorageTraits + 'static,
+{
+    let paths = ZarrsArrayPath::from_cache_key(key);
+    let attributes = geotransform_to_attributes_map(
+        &call_generic_raster_tile_2d!(tile, tile => tile.global_geo_transform),
+    );
+
+    // also the chunk shape
+    let tile_shape = {
+        let [tile_height, tile_width] =
+            call_generic_raster_tile_2d!(tile, tile => tile.grid_shape_array());
+        [tile_height as u64, tile_width as u64]
+    };
+    let tile_bounds = raster_tile_bounds(
+        result_descriptor,
+        call_generic_raster_tile_2d!(tile, tile => tile.global_geo_transform),
+        call_generic_raster_tile_2d!(tile, tile => tile.grid_shape_array()).into(),
+    );
+    let mut tile_counts = [0; 2];
+    let mut array_shape = [0; 2];
+    for axis in 0..2 {
+        let count = tile_bounds.max_index().as_slice()[axis] as i128
+            - tile_bounds.min_index().as_slice()[axis] as i128
+            + 1;
+        tile_counts[axis] = u64::try_from(count).map_err(|_| Error::InvalidZarrTileIndex {
+            reason: "array tile count exceeds u64",
+        })?;
+        array_shape[axis] =
+            tile_counts[axis]
+                .checked_mul(tile_shape[axis])
+                .ok_or(Error::InvalidZarrTileIndex {
+                    reason: "array pixel extent exceeds u64",
+                })?;
+    }
+
+    let data_arr = async_open_or_create_new_zarrs_array(
+        &paths.tiles(),
+        store.clone(),
+        array_shape.clone(),
+        tile_shape.clone(),
+        zarrs_data_type(tile),
+        filler_value(tile),
+        Some(attributes),
+    )
+    .await
+    .map_err(|source| Error::ZarrArrayCreateError { source })?;
+
+    let validity_arr = async_open_or_create_new_zarrs_array(
+        &paths.validity(),
+        store.clone(),
+        array_shape.clone(),
+        tile_shape.clone(),
+        data_type::bool(),
+        zarrs::array::FillValue::from(false),
+        None,
+    )
+    .await
+    .map_err(|source| Error::ZarrArrayCreateError { source })?;
+
+    let metadata_arr = async_open_or_create_new_zarrs_array(
+        &paths.metadata(),
+        store.clone(),
+        tile_counts,
+        vec![1, 1],
+        zarrs::array::data_type::bytes(),
+        zarrs::array::FillValue::from(Vec::<u8>::new()),
+        None,
+    )
+    .await
+    .map_err(|source| Error::ZarrArrayCreateError { source })?;
+
+    Ok(ZarrsArrayAccess {
+        tiles: data_arr,
+        validity: validity_arr,
+        metadata: metadata_arr,
+    })
 }
 
 /// Opens or creates a new array at `/{operator_name}/band_{band}/{time}/tiles`.
@@ -1025,15 +1405,28 @@ fn format_cache_key(root: PathBuf, paths: &ZarrsArrayPath) -> PathBuf {
 
 const ZARR_CACHE: &str = "zarr_cache";
 
-// TODO (mid): check the callsites how they handle this
-/// Opens a new ZarrArrayStore at "{op}/band_{band}/{time}"
-fn open_zarrs_filesystemstore(paths: &ZarrsArrayPath) -> Result<Arc<FilesystemStore>> {
-    let cache_dir = cache_dir();
-    let path = format_cache_key(cache_dir.join(ZARR_CACHE), &paths);
+/// Use [`async_open_zarrs_filesystem_store`] to resolve the cache path and wrap
+/// the store while running filesystem construction on a blocking worker.
+fn open_zarrs_filesystem_store_impl(path: PathBuf) -> Result<FilesystemStore> {
     let zarrs = zarrs::filesystem::FilesystemStore::new(path)
         // TODO (mid): check the callsites how they handle this
         .map_err(|err| Error::ZarrFilesystemError { source: err })?;
-    Ok(Arc::new(zarrs))
+    Ok(zarrs)
+}
+
+// TODO (mid): check the callsites how they handle this
+/// Opens a new ZarrArrayStore at "{op}/band_{band}/{time}"
+async fn async_open_zarrs_filesystem_store(
+    paths: &ZarrsArrayPath,
+) -> Result<Arc<AsyncFileSystemStore>> {
+    let cache_dir = cache_dir();
+    let path = format_cache_key(cache_dir.join(ZARR_CACHE), paths);
+    let store =
+        crate::util::spawn_blocking(move || open_zarrs_filesystem_store_impl(path)).await??;
+    Ok(Arc::new(SyncToAsyncStorageAdapter::new(
+        Arc::new(store),
+        TokioSpawnBlocking,
+    )))
 }
 
 /// Returns the inclusive global `[y, x]` tile-index bounds intersecting the raster.
@@ -1209,6 +1602,7 @@ mod tests {
     use geoengine_datatypes::util::test::TestDefault;
     use geoengine_datatypes::{primitives::DateTime, spatial_reference::SpatialReference};
     use tempfile::TempDir;
+    use zarrs::storage::{AsyncReadableStorageTraits, AsyncWritableStorageTraits};
 
     use super::*;
 
@@ -1393,13 +1787,19 @@ mod tests {
             }
 
             for (tile, disk_entry, value) in stored_tiles {
-                let arrays: ZarrsArrayAccess<FilesystemStore> = disk_entry
+                let arrays: ZarrsArrayAccess<_> = disk_entry
                     .paths
-                    .open(open_zarrs_filesystemstore(&disk_entry.paths).unwrap())
+                    .async_open(
+                        async_open_zarrs_filesystem_store(&disk_entry.paths)
+                            .await
+                            .unwrap(),
+                    )
+                    .await
                     .unwrap();
                 let pixels: Vec<u8> = arrays
                     .tiles
-                    .retrieve_chunk(&disk_entry.chunk_indices)
+                    .async_retrieve_chunk(&disk_entry.chunk_indices)
+                    .await
                     .unwrap();
                 assert_eq!(pixels, vec![value; 6]);
                 compare_tiles(&tile, &disk_entry.read().await.unwrap());
@@ -1458,9 +1858,14 @@ mod tests {
                 .write()
                 .await
                 .expect("write tile to disk should work");
-            let arrays: ZarrsArrayAccess<FilesystemStore> = disk_entry
+            let arrays: ZarrsArrayAccess<_> = disk_entry
                 .paths
-                .open(open_zarrs_filesystemstore(&disk_entry.paths).unwrap())
+                .async_open(
+                    async_open_zarrs_filesystem_store(&disk_entry.paths)
+                        .await
+                        .unwrap(),
+                )
+                .await
                 .unwrap();
             assert_eq!(disk_entry.chunk_indices, [2, 2]);
             assert_eq!(arrays.tiles.shape(), &[6, 9]);
@@ -1534,7 +1939,7 @@ mod tests {
 
         #[tokio::test(flavor = "current_thread")]
         async fn expired_cache_hint() {
-            set_tempdir();
+            let _directory = set_tempdir();
             let (cache_hint, tile, descriptor, key) = set_up();
             assert!(cache_hint.is_expired());
             let stored = PreparedZarrStorageFormat::store(
@@ -1548,12 +1953,19 @@ mod tests {
         }
     }
 
-    pub(crate) fn setup() -> (
-        GeoTransform,
-        TypedRasterTile2D,
-        Arc<CacheKey>,
-        RasterResultDescriptor,
-    ) {
+    pub(crate) struct TestSetup {
+        pub(crate) geo_transform: GeoTransform,
+        pub(crate) tile: TypedRasterTile2D,
+        pub(crate) key: Arc<CacheKey>,
+        pub(crate) result_descriptor: RasterResultDescriptor,
+    }
+
+    pub(crate) enum TestTile {
+        EmptyTile,
+        NonEmptyTile,
+    }
+
+    pub(crate) fn setup(test_tile: TestTile) -> TestSetup {
         let geo_transform = GeoTransform::new([0., 0.].into(), 1., -1.);
         let tile = {
             TypedRasterTile2D::U8(RasterTile2D::new_with_properties(
@@ -1561,13 +1973,16 @@ mod tests {
                 [0, 0].into(),
                 0,
                 geo_transform,
-                GridOrEmpty::new_grid(
-                    MaskedGrid2D::new(
-                        Grid::new([2, 2].into(), vec![1_u8, 2, 3, 4]).unwrap(),
-                        Grid::new([2, 2].into(), vec![true; 4]).unwrap(),
-                    )
-                    .unwrap(),
-                ),
+                match test_tile {
+                    TestTile::EmptyTile => GridOrEmpty::new_empty(EmptyGrid::new([2, 2].into())),
+                    TestTile::NonEmptyTile => GridOrEmpty::new_grid(
+                        MaskedGrid2D::new(
+                            Grid::new([2, 2].into(), vec![1_u8, 2, 3, 4]).unwrap(),
+                            Grid::new([2, 2].into(), vec![true; 4]).unwrap(),
+                        )
+                        .unwrap(),
+                    ),
+                },
                 RasterProperties::default(),
                 CacheHint::max_duration(),
             ))
@@ -1583,13 +1998,23 @@ mod tests {
             ),
             bands: RasterBandDescriptors::new_single_band(),
         };
-        (geo_transform, tile, key, result_descriptor)
+        TestSetup {
+            geo_transform,
+            tile,
+            key,
+            result_descriptor,
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn round_trip_test_zarr_storage_format_v2() {
-        set_tempdir();
-        let (geo_transform, tile, key, result_descriptor) = setup();
+        let _directory = set_tempdir();
+        let TestSetup {
+            tile,
+            key,
+            result_descriptor,
+            ..
+        } = setup(TestTile::NonEmptyTile);
         let storage_format =
             PreparedZarrStorageFormat::store(tile.clone(), key, &result_descriptor)
                 .await
@@ -1605,7 +2030,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_store_load_with_new_zarr_storage_format_v2() {
-        let (geo_transform, tile, key, result_descriptor) = setup();
+        let TestSetup {
+            tile,
+            key,
+            result_descriptor,
+            ..
+        } = setup(TestTile::NonEmptyTile);
         let storage_format =
             PreparedZarrStorageFormat::store(tile.clone(), key, &result_descriptor)
                 .await
@@ -1614,40 +2044,30 @@ mod tests {
         compare_tiles(&tile, &loaded);
     }
 
-    #[ignore = "Known failure right now. Zarr layout has changed since the refactor, fix this when resolving a83371d1-432d-46ff-b483-e1143a0a0fc3"]
     #[tokio::test(flavor = "current_thread")]
     async fn zarrs_failed_write_removes_partial_writes() {
         let directory = set_tempdir();
-        let key = test_key(0);
-        let geo_transform = GeoTransform::new([0., 0.].into(), 1., -1.);
-        let descriptor = RasterResultDescriptor {
-            data_type: RasterDataType::U8,
-            spatial_reference: SpatialReference::epsg_4326().into(),
-            time: TimeDescriptor::new_irregular(Some(TimeInterval::default())),
-            spatial_grid: SpatialGridDescriptor::source_from_parts(
-                geo_transform,
-                GridBoundingBox2D::new([0, 0], [1, 1]).unwrap(),
-            ),
-            bands: RasterBandDescriptors::new_single_band(),
-        };
+        let data = setup(TestTile::NonEmptyTile);
+        let zarr_array_paths = ZarrsArrayPath::from_cache_key(&data.key);
+        let store = async_open_zarrs_filesystem_store(&zarr_array_paths)
+            .await
+            .expect("it to open the store asynchronously");
 
-        let array_path = &ZarrsArrayPath::from_cache_key(&key);
-        let store = open_zarrs_filesystemstore(&array_path).unwrap();
-
-        let _array_access = build_array_and_prepare_insert(
-            &key,
-            &array_path,
+        let _array_access = async_build_array_and_prepare_insert(
+            &data.key,
+            &zarr_array_paths.clone(),
             store,
             &TypedRasterTile2D::U8(RasterTile2D::new(
                 TimeInterval::new(0, 1).unwrap(),
                 [0, 0].into(),
                 0,
-                geo_transform,
+                data.geo_transform,
                 Grid2D::new([2, 2].into(), vec![42_u8; 4]).unwrap().into(),
                 CacheHint::max_duration(),
             )),
-            &descriptor,
+            &data.result_descriptor,
         )
+        .await
         .unwrap();
 
         /*
@@ -1663,7 +2083,7 @@ mod tests {
         Zarr will write the chunks at:
 
             CACHE_DIR/zarr_cache/.../{tiles, validity, metadata}/c/dim1_key/dim2_key
-            where ... is some other stuff related to the cache key  that is not relevant here.
+            where ... is some other stuff related to the cache key that is not relevant here.
 
         Eg. if chunk_index = [1,2] for 'tiles', then:
             CACHE_DIR/zarr_cache/tiles/c/1/2
@@ -1672,11 +2092,12 @@ mod tests {
             CACHE_DIR/zarr_cache/metadata/c
         to prevent the writer from creating this chunk directory, thus failing the write.
         */
-        let root = directory.path().join(ZARR_CACHE);
-        let tiles_path = root.join(array_path.tiles().trim_start_matches("/"));
-        let validity_path = root.join(array_path.validity().trim_start_matches("/"));
-        let metadata_path = root.join(array_path.metadata().trim_start_matches("/"));
+        let root = format_cache_key(directory.path().join(ZARR_CACHE), &zarr_array_paths);
+        let tiles_path = root.join(zarr_array_paths.tiles().trim_start_matches("/"));
+        let validity_path = root.join(zarr_array_paths.validity().trim_start_matches("/"));
+        let metadata_path = root.join(zarr_array_paths.metadata().trim_start_matches("/"));
         let blocker_file = metadata_path.join("c");
+
         let () = std::fs::write(blocker_file, "You shall not pass!").unwrap();
         assert!(metadata_path.join("c").exists());
 
@@ -1684,19 +2105,39 @@ mod tests {
             TimeInterval::default(),
             [0, 0].into(),
             0,
-            descriptor.spatial_grid.geo_transform(),
+            data.result_descriptor.spatial_grid.geo_transform(),
             Grid2D::new([2, 2].into(), vec![42_u8; 4]).unwrap().into(),
             CacheHint::max_duration(),
         )
         .into();
-        let result = PreparedZarrStorageFormat::store(tile.clone(), key.clone(), &descriptor).await;
+        let prepared_tile = PreparedZarrStorageFormat::store(
+            tile.clone(),
+            data.key.clone(),
+            &data.result_descriptor,
+        )
+        .await
+        .unwrap();
 
+        let result = prepared_tile.write().await;
         assert!(matches!(
             result,
-            Err(crate::error::Error::ZarrArrayStoreError {
-                which_array: WhichZarrArray::Metadata,
-                ..
+            Err(crate::error::Error::ZarrChunkCleanupError {
+                chunk_indices: [0, 0],
+                write_error,
+                errors,
             })
+                if matches!(
+                    write_error.as_ref(),
+                    Error::ZarrArrayError {
+                        source: zarrs::array::ArrayError::StorageError(
+                            zarrs::storage::StorageError::IOError(error)
+                        ),
+                    } if error.kind() == std::io::ErrorKind::NotADirectory
+                ) && matches!(
+                    errors.as_slice(),
+                    [(zarrs::storage::StorageError::IOError(error), WhichZarrArray::Metadata)]
+                        if error.kind() == std::io::ErrorKind::NotADirectory
+                )
         ));
 
         // both should not exist
@@ -1710,71 +2151,407 @@ mod tests {
 
         // removing the blocker, should allow the write
         std::fs::remove_file(metadata_path.join("c")).unwrap();
-        let stored = PreparedZarrStorageFormat::store(tile.clone(), key, &descriptor)
+        let prepared =
+            PreparedZarrStorageFormat::store(tile.clone(), data.key, &data.result_descriptor)
+                .await
+                .expect("tile should be stored after removing blocker file");
+        let disk_entry = prepared
+            .write()
             .await
-            .expect("tile should be stored after removing blocker file");
+            .expect("write should work after removing blocker file");
         compare_tiles(
             &tile,
-            &stored.load().await.expect("stored tile should load"),
+            &disk_entry.read().await.expect("stored tile should load"),
         );
     }
 
-    #[test]
-    fn zarrs_array_path_operator_name_pathable() {
-        let path = ZarrsArrayPath::from_cache_key(&test_key(0));
-        let tiles_path = path.operator_name_path_safe();
-        assert_eq!(
-            "05643c4ac1135b60c1e9b65c47fc77d7ccd550b05485dc4f5597ac3d067f065d".to_string(),
-            tiles_path
-        );
+    #[tokio::test(flavor = "current_thread")]
+    async fn store_prepares_empty_tile_with_metadata() {
+        let _directory = set_tempdir();
+        let test_setup = setup(TestTile::EmptyTile);
+        let prepared = PreparedZarrStorageFormat::store(
+            test_setup.tile.clone(),
+            test_setup.key,
+            &test_setup.result_descriptor,
+        )
+        .await
+        .unwrap();
+        assert!(prepared.tile_data.is_none());
+        assert!(prepared.validity_data.is_none());
+        // zarr specific metadata is always present
+        assert!(!prepared.metadata.bytes.is_empty());
+        let loaded = prepared.load().await.unwrap();
+
+        compare_tiles(&test_setup.tile, &loaded);
     }
 
-    #[test]
-    fn get_tiles_path() {
-        let path = ZarrsArrayPath::from_cache_key(&test_key(0));
-        let tiles_path = path.tiles();
-        assert_eq!("/tiles".to_string(), tiles_path);
+    #[tokio::test(flavor = "current_thread")]
+    async fn it_runs_zarr_storage_work_on_a_blocking_thread() {
+        use zarrs::storage::storage_adapter::sync_to_async::SyncToAsyncSpawnBlocking;
+
+        let runtime_thread = std::thread::current().id();
+        let worker_thread = TokioSpawnBlocking
+            .spawn_blocking(|| std::thread::current().id())
+            .await;
+
+        assert_ne!(runtime_thread, worker_thread);
     }
 
-    #[test]
-    fn get_metadata_path() {
-        let path = ZarrsArrayPath::from_cache_key(&test_key(0));
-        let metadata_path = path.metadata();
-        assert_eq!("/metadata".to_string(), metadata_path);
+    #[tokio::test(flavor = "current_thread")]
+    async fn it_round_trips_bytes_through_async_storage() {
+        let _directory = set_tempdir();
+        let data = setup(TestTile::NonEmptyTile);
+        let paths = ZarrsArrayPath::from_cache_key(&data.key);
+        let store = async_open_zarrs_filesystem_store(&paths)
+            .await
+            .expect("it to open the store asynchronously");
+        let key = StoreKey::new("store/key").unwrap();
+        let expected = bytes::Bytes::from_static(b"data");
+
+        store.set(&key, expected.clone()).await.unwrap();
+        assert_eq!(store.get(&key).await.unwrap(), Some(expected));
+
+        store.erase(&key).await.unwrap();
+        assert!(store.get(&key).await.unwrap().is_none());
     }
 
-    #[test]
-    fn get_validity_path() {
-        let path = ZarrsArrayPath::from_cache_key(&test_key(0));
-        let validity_path = path.validity();
-        assert_eq!("/validity".to_string(), validity_path);
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_async_ensure_layout() {
+        let _directory = set_tempdir();
+        let data = setup(TestTile::NonEmptyTile);
+        let paths = ZarrsArrayPath::from_cache_key(&data.key);
+        let store = async_open_zarrs_filesystem_store(&paths).await.unwrap();
+        let prepared =
+            PreparedZarrStorageFormat::store(data.tile, data.key, &data.result_descriptor)
+                .await
+                .unwrap();
+        let result = async_ensure_layout(&store, &prepared.layout).await;
+        let expected_bytes_written = prepared
+            .layout
+            .iter()
+            .fold(0, |acc, (_, bytes)| acc + bytes.len());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), expected_bytes_written);
+
+        // when its checked again the written bytes should be 0
+        let result = async_ensure_layout(&store, &prepared.layout).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
     }
 
-    #[test]
-    fn test_format_cache_key() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_async_ensure_layout_mismatch() {
         let directory = set_tempdir();
+        let data = setup(TestTile::NonEmptyTile);
+        let paths = ZarrsArrayPath::from_cache_key(&data.key);
+        let store = async_open_zarrs_filesystem_store(&paths).await.unwrap();
+        let prepared =
+            PreparedZarrStorageFormat::store(data.tile, data.key, &data.result_descriptor)
+                .await
+                .unwrap();
 
-        let key = test_key(0);
-        let path = ZarrsArrayPath::from_cache_key(&key);
-        let pathbuf: String = format_cache_key(cache_dir().join(ZARR_CACHE), &path)
-            .to_str()
-            .unwrap()
-            .to_string();
-        let tmp = directory.path().display();
+        // write once to to create the necessary directories and files
+        let _ = async_ensure_layout(&store, &prepared.layout).await.unwrap();
+        let tiles_path = format_cache_key(directory.path().join(ZARR_CACHE), &paths)
+            .join(paths.tiles().trim_start_matches('/'));
+        let layout_file = tiles_path.join("zarr.json");
+        // overwrite file
+        std::fs::write(&layout_file, r#"{"different": "file"}"#).unwrap();
+        // check again
+        let result = async_ensure_layout(&store, &prepared.layout).await;
+        assert!(matches!(
+            result,
+            Err(Error::ZarrCacheMetadataMismatch { key: actual_key })
+                if actual_key == StoreKey::new("tiles/zarr.json").unwrap().as_str()
+        ),);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_async_write_to_store() {
+        let _directory = set_tempdir();
+        let data = setup(TestTile::NonEmptyTile);
+        let paths = ZarrsArrayPath::from_cache_key(&data.key);
+        let store = async_open_zarrs_filesystem_store(&paths).await.unwrap();
+        let prepared =
+            PreparedZarrStorageFormat::store(data.tile, data.key, &data.result_descriptor)
+                .await
+                .unwrap();
+        let result = async_write_to_store(&prepared, &store, true).await;
+        let expected_bytes_written_layout = prepared
+            .layout
+            .iter()
+            .fold(0, |acc, (_, bytes)| acc + bytes.len());
+        let expected_bytes_data = prepared.metadata.bytes.len()
+            + prepared.validity_data.as_ref().map_or(0, |v| v.bytes.len())
+            + prepared.tile_data.as_ref().map_or(0, |t| t.bytes.len());
+        let expected_bytes_written = expected_bytes_written_layout + expected_bytes_data;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), expected_bytes_written);
+
+        // check that the bytes written do not include json zarr metadata when false is passed as last argument
+        let result = async_write_to_store(&prepared, &store, false).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), expected_bytes_data);
+
+        // reading back the data should yield the same bytes
+        let data_bytes = store
+            .get(&prepared.tile_data.clone().unwrap().store_key)
+            .await;
+        let validity_bytes = store
+            .get(&prepared.validity_data.clone().unwrap().store_key)
+            .await;
+        let metadata_bytes = store.get(&prepared.metadata.clone().store_key).await;
         assert_eq!(
-            format!(
-                "{tmp}/{ZARR_CACHE}/05643c4ac1135b60c1e9b65c47fc77d7ccd550b05485dc4f5597ac3d067f065d/band_0/-262143-01-01T00-00-00Z_to_+262142-12-31T23-59-59.999Z"
-            ),
-            pathbuf
+            data_bytes.unwrap().unwrap(),
+            prepared.tile_data.unwrap().bytes
+        );
+        assert_eq!(
+            validity_bytes.unwrap().unwrap(),
+            prepared.validity_data.unwrap().bytes
+        );
+        assert_eq!(metadata_bytes.unwrap().unwrap(), prepared.metadata.bytes);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_async_write_to_store_empty_tile() {
+        let _directory = set_tempdir();
+        let data = setup(TestTile::EmptyTile);
+        let paths = ZarrsArrayPath::from_cache_key(&data.key);
+        let store = async_open_zarrs_filesystem_store(&paths).await.unwrap();
+        let prepared =
+            PreparedZarrStorageFormat::store(data.tile, data.key, &data.result_descriptor)
+                .await
+                .unwrap();
+        let bytes_written = async_write_to_store(&prepared, &store, false)
+            .await
+            .expect("it to write successfuly");
+        assert_eq!(
+            bytes_written,
+            prepared.metadata.bytes.len(),
+            "metadata was not written, but should always be written on succesfull write."
         );
     }
 
-    #[test]
-    fn metadata_and_tiles_are_valid_node_paths() {
-        let paths = ZarrsArrayPath::from_cache_key(&test_key(0));
-        let _ =
-            zarrs::node::NodePath::try_from(paths.tiles().as_str()).expect("it to be a valid path");
-        let _ = zarrs::node::NodePath::try_from(paths.metadata().as_str())
-            .expect("it to be a valid path");
+    async fn async_retrieve_tile_impl(kind: TestTile) {
+        let _directory = set_tempdir();
+        let data = setup(kind);
+        let paths = ZarrsArrayPath::from_cache_key(&data.key);
+        let store = async_open_zarrs_filesystem_store(&paths)
+            .await
+            .expect("it to open the store asynchronously");
+        let prepare =
+            PreparedZarrStorageFormat::store(data.tile.clone(), data.key, &data.result_descriptor)
+                .await
+                .expect("it to prepare the tile for storage");
+        let disk_entry = prepare
+            .write()
+            .await
+            .expect("it to write the tile to disk successfully");
+        let array_access = paths.async_open(store).await.unwrap();
+        let actual = array_access
+            .async_retrieve_tile(
+                &disk_entry.chunk_indices,
+                &paths,
+                disk_entry.data_type,
+                disk_entry.cache_hint,
+            )
+            .await
+            .unwrap();
+        compare_tiles(&data.tile, &actual);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_async_retrieve_tile() {
+        async_retrieve_tile_impl(TestTile::NonEmptyTile).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_async_retrieve_tile_empty_tile() {
+        async_retrieve_tile_impl(TestTile::EmptyTile).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_async_erase() {
+        let directory = set_tempdir();
+        let mut data = setup(TestTile::NonEmptyTile);
+        data.result_descriptor.spatial_grid = SpatialGridDescriptor::source_from_parts(
+            data.geo_transform,
+            GridBoundingBox2D::new([0, 0], [1, 3]).unwrap(),
+        );
+        let tile1 = data.tile.clone();
+        let tile2: TypedRasterTile2D = call_generic_raster_tile_2d!(tile1.clone(), tile => {
+            let mut tile = tile;
+            tile.tile_position.0[1] += 1;
+            tile.into()
+        });
+        let paths = ZarrsArrayPath::from_cache_key(&data.key);
+        let store = async_open_zarrs_filesystem_store(&paths)
+            .await
+            .expect("it to open the store asynchronously");
+
+        fn mk_key(i: usize, data: &TestSetup) -> Arc<CacheKey> {
+            let pixel_position = match i {
+                0 => [0, 0],
+                1 => [0, 2],
+                _ => unreachable!("test contains exactly two tiles"),
+            };
+
+            Arc::new((
+                data.key.0.clone(),
+                data.key.1,
+                data.key.2,
+                pixel_position.into(),
+            ))
+        }
+
+        // write both
+        let mut disk_entries = Vec::with_capacity(2);
+        for (i, tile) in [tile1, tile2.clone()].into_iter().enumerate() {
+            let prepared =
+                PreparedZarrStorageFormat::store(tile, mk_key(i, &data), &data.result_descriptor)
+                    .await
+                    .expect(&format!("it to prepare the tile{} for storage", i));
+            let disk_entry = prepared
+                .write()
+                .await
+                .expect(&format!("it to write the tile{} to disk", i));
+            disk_entries.push(disk_entry);
+        }
+
+        // erase the first one
+        disk_entries[0]
+            .erase()
+            .await
+            .expect("it to erase the first tile");
+
+        // verify the metadata is still present
+        let root = format_cache_key(directory.path().join(ZARR_CACHE), &paths);
+        let tiles_path = root.join(paths.tiles().trim_start_matches("/"));
+        let validity_path = root.join(paths.validity().trim_start_matches("/"));
+        let metadata_path = root.join(paths.metadata().trim_start_matches("/"));
+        assert!(tiles_path.join("zarr.json").exists());
+        assert!(validity_path.join("zarr.json").exists());
+        assert!(metadata_path.join("zarr.json").exists());
+        // verify that the actual data is not there anymore though
+        assert!(!tiles_path.join("c/0/0").exists());
+        assert!(!validity_path.join("c/0/0").exists());
+        assert!(!metadata_path.join("c/0/0").exists());
+
+        // verify the second tile can be read
+        let actual_tile_2 = disk_entries[1]
+            .read()
+            .await
+            .expect("it to read the second tile after erasing the first");
+        compare_tiles(&tile2, &actual_tile_2);
+
+        // deleting the first tile should do nothing and succeed
+        disk_entries[0]
+            .erase()
+            .await
+            .expect("it to erase the first tile");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_async_erase_failure() {
+        let directory = set_tempdir();
+        let data = setup(TestTile::NonEmptyTile);
+        let paths = ZarrsArrayPath::from_cache_key(&data.key);
+        let prepared =
+            PreparedZarrStorageFormat::store(data.tile, data.key, &data.result_descriptor)
+                .await
+                .expect("it to prepare the tile for storage");
+        let disk_entry = prepared
+            .write()
+            .await
+            .expect("it to write the tile to disk");
+
+        // overwrite the data to inject an erase error
+        let chunk_path =
+            format_cache_key(directory.path().join(ZARR_CACHE), &paths).join("tiles/c/0/0");
+        tokio::fs::remove_file(&chunk_path).await.unwrap();
+        tokio::fs::create_dir(&chunk_path).await.unwrap();
+        tokio::fs::write(chunk_path.join("blocker"), b"You shall not pass!")
+            .await
+            .unwrap();
+
+        let result = disk_entry.erase().await;
+        assert!(matches!(
+            result,
+            Err(Error::ZarrChunkEraseError {
+                chunk_indices: [0, 0],
+                errors,
+            }) if matches!(
+                errors.as_slice(),
+                [(zarrs::storage::StorageError::IOError(_), WhichZarrArray::Tiles)]
+            )
+        ));
+        // verify that validity and metadata chunks are deleted
+        let root = format_cache_key(directory.path().join(ZARR_CACHE), &paths);
+        let tiles_path = root.join(paths.tiles().trim_start_matches("/"));
+        let validity_path = root.join(paths.validity().trim_start_matches("/"));
+        let metadata_path = root.join(paths.metadata().trim_start_matches("/"));
+        assert!(!validity_path.join("c/0/0").exists());
+        assert!(!metadata_path.join("c/0/0").exists());
+
+        // layout should remain
+        let layout = format_cache_key(directory.path().join(ZARR_CACHE), &paths)
+            .join(paths.tiles().trim_start_matches("/"))
+            .join("zarr.json");
+        assert!(layout.exists());
+    }
+
+    mod format_tests {
+
+        use super::*;
+
+        #[test]
+        fn zarrs_array_path_operator_name_pathable() {
+            let path = ZarrsArrayPath::from_cache_key(&test_key(0));
+            let tiles_path = path.operator_name_path_safe();
+            assert_eq!(
+                "05643c4ac1135b60c1e9b65c47fc77d7ccd550b05485dc4f5597ac3d067f065d".to_string(),
+                tiles_path
+            );
+        }
+
+        #[test]
+        fn get_tiles_path() {
+            let path = ZarrsArrayPath::from_cache_key(&test_key(0));
+            let tiles_path = path.tiles();
+            assert_eq!("/tiles".to_string(), tiles_path);
+        }
+
+        #[test]
+        fn get_metadata_path() {
+            let path = ZarrsArrayPath::from_cache_key(&test_key(0));
+            let metadata_path = path.metadata();
+            assert_eq!("/metadata".to_string(), metadata_path);
+        }
+
+        #[test]
+        fn get_validity_path() {
+            let path = ZarrsArrayPath::from_cache_key(&test_key(0));
+            let validity_path = path.validity();
+            assert_eq!("/validity".to_string(), validity_path);
+        }
+
+        #[test]
+        fn test_format_cache_key() {
+            let directory = set_tempdir();
+
+            let key = test_key(0);
+            let path = ZarrsArrayPath::from_cache_key(&key);
+            let pathbuf: String = format_cache_key(cache_dir().join(ZARR_CACHE), &path)
+                .to_str()
+                .unwrap()
+                .to_string();
+            let tmp = directory.path().display();
+            assert_eq!(
+                format!(
+                    "{tmp}/{ZARR_CACHE}/05643c4ac1135b60c1e9b65c47fc77d7ccd550b05485dc4f5597ac3d067f065d/band_0/-262143-01-01T00-00-00Z_to_+262142-12-31T23-59-59.999Z"
+                ),
+                pathbuf
+            );
+        }
     }
 }

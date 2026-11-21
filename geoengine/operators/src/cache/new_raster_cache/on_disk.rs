@@ -43,7 +43,6 @@ pub trait OnDiskStorageFormat: StorageFormat {
 /// A handle for one or multiple files on the disk
 #[async_trait]
 pub trait DiskEntry: Send + Sync + Sized + 'static {
-
     /// Read the entry from disk, returning the [`TypedRasterTile2D`]
     async fn read(&self) -> Result<TypedRasterTile2D>;
 
@@ -196,9 +195,9 @@ fn cache_dir() -> PathBuf {
 fn cache_dir() -> PathBuf {
     RASTER_CACHE_DIR
         .read()
-        .expect("[cfg(test) cache_dir] read lock should not be poisoned")
+        .expect("[cfg(test) cache_dir()] read lock should not be poisoned")
         .get(&std::thread::current().id())
-        .expect("[cfg(test) cache_dir] the thread.id() to be present")
+        .expect("[cfg(test) cache_dir()] the thread.id() to be present")
         .clone()
 }
 

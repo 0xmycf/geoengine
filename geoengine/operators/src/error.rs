@@ -587,9 +587,25 @@ pub enum Error {
         reason: &'static str,
     },
     #[snafu(display(
+        "Could not delete a chunk during cleanup of partial write of at least one zarr array at {chunk_indices:?}: write error={write_error:?} rest={errors:?}."
+    ))]
+    ZarrChunkCleanupError {
+        chunk_indices: [u64; 2],
+        write_error: Box<Error>,
+        errors: Vec<(zarrs::storage::StorageError, WhichZarrArray)>,
+    },
+    #[snafu(display(
+        "Could not open Zarr arrays to clean up a partial write at {chunk_indices:?}: write error={write_error}; open error={source}."
+    ))]
+    ZarrChunkCleanupOpenError {
+        chunk_indices: [u64; 2],
+        write_error: Box<Error>,
+        source: Box<Error>,
+    },
+    #[snafu(display(
         "Could not delete a chunk of at least one zarr array at {chunk_indices:?}: {errors:?}."
     ))]
-    ZarrChunkDeleteError {
+    ZarrChunkEraseError {
         chunk_indices: [u64; 2],
         errors: Vec<(zarrs::storage::StorageError, WhichZarrArray)>,
     },
