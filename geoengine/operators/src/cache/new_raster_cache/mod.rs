@@ -55,8 +55,8 @@ impl RasterCacheEntry {
     async fn load(&self) -> Result<TypedRasterTile2D> {
         match self {
             Self::Memory(entry) => entry.load().await,
-            Self::Arrow(entry) => entry.read().await,
-            Self::Zarr(entry) => entry.read().await,
+            Self::Arrow(entry) => ArrowIpcDiskEntry::read(Arc::clone(entry)).await,
+            Self::Zarr(entry) => ZarrDiskEntry::read(Arc::clone(entry)).await,
         }
     }
 

@@ -118,19 +118,28 @@ pub struct ZarrDiskEntry {
     cache_hint: CacheHint,
 }
 
+impl ZarrDiskEntry {
+    fn store_path(&self) -> PathBuf {
+        format_cache_key(cache_dir().join(ZARR_CACHE), &self.paths)
+    }
+
+    fn read_sync(&self, store_path: PathBuf) -> Result<TypedRasterTile2D> {
+        let store = Arc::new(open_zarrs_filesystem_store_impl(store_path)?);
+        self.paths.open(store)?.retrieve_tile(
+            &self.chunk_indices,
+            &self.paths,
+            self.data_type,
+            self.cache_hint,
+        )
+    }
+}
+
 #[async_trait]
 impl DiskEntry for ZarrDiskEntry {
-    async fn read(&self) -> Result<TypedRasterTile2D> {
-        let store = async_open_zarrs_filesystem_store(&self.paths).await?;
-        let arrays = self.paths.async_open(store).await?;
-        arrays
-            .async_retrieve_tile(
-                &self.chunk_indices,
-                &self.paths,
-                self.data_type,
-                self.cache_hint,
-            )
-            .await
+    async fn read(entry: Arc<SizeTrackedEntry<Self>>) -> Result<TypedRasterTile2D> {
+        let store_path = entry.store_path();
+        // The job can finish after cancellation, so it owns the eviction pin.
+        crate::util::spawn_blocking(move || entry.read_sync(store_path)).await?
     }
 
     async fn erase(&self) -> Result<()> {
@@ -685,6 +694,7 @@ where
     TStore: AsyncReadableWritableStorageTraits + 'static,
 {
     /// Async version of [`Self::retrieve_metadata_chunk`]
+    #[cfg(test)]
     async fn async_retrieve_metadata_chunk(
         &self,
         chunk_indices: &[u64],
@@ -693,6 +703,7 @@ where
     }
 
     /// Async version of [`Self::retrieve_validity_mask`]
+    #[cfg(test)]
     async fn async_retrieve_validity_mask(
         &self,
         chunk_indices: &[u64],
@@ -701,6 +712,7 @@ where
     }
 
     /// Async version of [`Self::retrieve_tile`]
+    #[cfg(test)]
     async fn async_retrieve_tile(
         &self,
         chunk_indices: &[u64],
@@ -765,6 +777,7 @@ where
         }
     }
 
+    #[cfg(test)]
     async fn async_make_tile<T: Pixel + zarrs::array::ElementOwned>(
         &self,
         chunk_indices: &[u64],
@@ -1596,7 +1609,7 @@ mod tile_position_tests;
 #[cfg(test)]
 mod tests {
 
-    use crate::cache::new_raster_cache::on_disk::set_raster_cache_dir;
+    use crate::cache::new_raster_cache::on_disk::{set_raster_cache_dir, track_written_entry};
     use crate::cache::new_raster_cache::on_disk::tests::test_key;
     use crate::cache::new_raster_cache::on_disk::zarrs_cache::format_cache_key;
     use crate::engine::{RasterBandDescriptors, SpatialGridDescriptor, TimeDescriptor};
@@ -1803,7 +1816,12 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(pixels, vec![value; 6]);
-                compare_tiles(&tile, &disk_entry.read().await.unwrap());
+                compare_tiles(
+                    &tile,
+                    &DiskEntry::read(track_written_entry(disk_entry))
+                        .await
+                        .unwrap(),
+                );
             }
         }
 
@@ -2020,10 +2038,13 @@ mod tests {
             PreparedZarrStorageFormat::store(tile.clone(), key, &result_descriptor)
                 .await
                 .expect("store should work");
-        let disk_entry = storage_format.write().await.expect("write should work");
+        let disk_entry =
+            track_written_entry(storage_format.write().await.expect("write should work"));
         let mut tiles = Vec::with_capacity(10);
         for _ in (0..10) {
-            let loaded = disk_entry.read().await.expect("read should work");
+            let loaded = DiskEntry::read(Arc::clone(&disk_entry))
+                .await
+                .expect("read should work");
             tiles.push(loaded);
         }
         tiles.iter().for_each(|loaded| compare_tiles(&tile, loaded));
@@ -2162,7 +2183,9 @@ mod tests {
             .expect("write should work after removing blocker file");
         compare_tiles(
             &tile,
-            &disk_entry.read().await.expect("stored tile should load"),
+            &DiskEntry::read(track_written_entry(disk_entry))
+                .await
+                .expect("stored tile should load"),
         );
     }
 
@@ -2416,7 +2439,7 @@ mod tests {
                 .write()
                 .await
                 .expect(&format!("it to write the tile{} to disk", i));
-            disk_entries.push(disk_entry);
+            disk_entries.push(track_written_entry(disk_entry));
         }
 
         // erase the first one
@@ -2439,8 +2462,7 @@ mod tests {
         assert!(!metadata_path.join("c/0/0").exists());
 
         // verify the second tile can be read
-        let actual_tile_2 = disk_entries[1]
-            .read()
+        let actual_tile_2 = DiskEntry::read(Arc::clone(&disk_entries[1]))
             .await
             .expect("it to read the second tile after erasing the first");
         compare_tiles(&tile2, &actual_tile_2);

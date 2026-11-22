@@ -101,12 +101,12 @@ impl ArrowIpcDiskEntry {
 
 #[async_trait]
 impl DiskEntry for ArrowIpcDiskEntry {
-    async fn read(&self) -> Result<TypedRasterTile2D> {
-        let mut file = tokio::fs::File::open(self.path.clone()).await?;
+    async fn read(entry: Arc<SizeTrackedEntry<Self>>) -> Result<TypedRasterTile2D> {
+        let mut file = tokio::fs::File::open(&entry.path).await?;
         let mut buf = vec![];
 
         let _ = file.read_to_end(&mut buf).await?;
-        arrow_ipc_tile_to_typed_raster_for_data_type(&buf, self.common.data_type)
+        arrow_ipc_tile_to_typed_raster_for_data_type(&buf, entry.common.data_type)
     }
 
     async fn erase(&self) -> Result<()> {

@@ -43,11 +43,20 @@ pub trait OnDiskStorageFormat: StorageFormat {
 /// A handle for one or multiple files on the disk
 #[async_trait]
 pub trait DiskEntry: Send + Sync + Sized + 'static {
-    /// Read the entry from disk, returning the [`TypedRasterTile2D`]
-    async fn read(&self) -> Result<TypedRasterTile2D>;
+    /// Read the entry from disk while holding it against eviction.
+    ///
+    /// The caller passes the same Arc held by the cache index. A detached read
+    /// must keep this Arc alive until it finishes.
+    async fn read(entry: Arc<SizeTrackedEntry<Self>>) -> Result<TypedRasterTile2D>;
 
     /// Delete the tile from disk.
     async fn erase(&self) -> Result<()>;
+}
+
+/// Wrap a directly written test entry that has no cache index or size accounting.
+#[cfg(test)]
+fn track_written_entry<T>(entry: T) -> Arc<SizeTrackedEntry<T>> {
+    Arc::new(SizeTrackedEntry::new(entry, 0, Arc::default()))
 }
 
 #[async_trait]
@@ -371,8 +380,7 @@ mod tests {
             let metadata = fs::metadata(&path).expect(&format!("File should be at {path:#?}"));
             assert_eq!(byte_size as u64, metadata.len());
 
-            let loaded = written
-                .read()
+            let loaded = DiskEntry::read(track_written_entry(written))
                 .await
                 .expect("it should be possible to read the tile from disk.");
             // .expect(&format!("File '{path:#?}' should loadable as a RasterTile"));
@@ -421,8 +429,7 @@ mod tests {
                 .await
                 .expect("it should be present")
                 .expect("it should be possible to extract the tile-ref from the cache.");
-            let loaded = stored
-                .read()
+            let loaded = DiskEntry::read(stored)
                 .await
                 .expect("it should be possible to load the tile via the tile-ref.");
 
@@ -464,8 +471,7 @@ mod tests {
                     fs::metadata(&full_path).expect(&format!("File should be at {full_path:#?}"));
             }
 
-            let loaded = disk_entry
-                .read()
+            let loaded = DiskEntry::read(track_written_entry(disk_entry))
                 .await
                 .expect(&format!("File should readable as a TypedRasterTile"));
 
@@ -510,8 +516,7 @@ mod tests {
                 .await
                 .expect("cache lookup should succeed (Result)")
                 .expect("inserted tiel should exist (Option)");
-            let loaded = stored
-                .read()
+            let loaded = DiskEntry::read(stored)
                 .await
                 .expect("it should be possible to load the tile via the tile-ref.");
 
