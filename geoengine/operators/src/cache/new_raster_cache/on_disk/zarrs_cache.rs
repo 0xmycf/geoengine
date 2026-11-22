@@ -1421,8 +1421,9 @@ async fn async_open_zarrs_filesystem_store(
 ) -> Result<Arc<AsyncFileSystemStore>> {
     let cache_dir = cache_dir();
     let path = format_cache_key(cache_dir.join(ZARR_CACHE), paths);
-    let store =
-        crate::util::spawn_blocking(move || open_zarrs_filesystem_store_impl(path)).await??;
+    // let store =
+    //     crate::util::spawn_blocking(move || open_zarrs_filesystem_store_impl(path)).await??;
+    let store = open_zarrs_filesystem_store_impl(path)?;
     Ok(Arc::new(SyncToAsyncStorageAdapter::new(
         Arc::new(store),
         TokioSpawnBlocking,
