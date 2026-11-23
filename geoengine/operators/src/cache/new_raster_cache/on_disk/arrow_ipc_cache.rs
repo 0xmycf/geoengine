@@ -100,6 +100,13 @@ impl ArrowIpcDiskEntry {
 }
 
 #[async_trait]
+impl Expirable for ArrowIpcDiskEntry {
+    async fn is_expired(&self) -> bool {
+        self.common.cache_hint.is_expired()
+    }
+}
+
+#[async_trait]
 impl DiskEntry for ArrowIpcDiskEntry {
     async fn read(entry: Arc<SizeTrackedEntry<Self>>) -> Result<TypedRasterTile2D> {
         let mut file = tokio::fs::File::open(&entry.path).await?;
@@ -183,7 +190,10 @@ impl StorageFormat for ArrowIpcStorageFormat {
     async fn byte_size(&self) -> Result<usize> {
         Ok(self.tile.len())
     }
+}
 
+#[async_trait]
+impl Expirable for ArrowIpcStorageFormat {
     async fn is_expired(&self) -> bool {
         self.common.cache_hint.is_expired()
     }

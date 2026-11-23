@@ -135,6 +135,13 @@ impl ZarrDiskEntry {
 }
 
 #[async_trait]
+impl Expirable for ZarrDiskEntry {
+    async fn is_expired(&self) -> bool {
+        self.cache_hint.is_expired()
+    }
+}
+
+#[async_trait]
 impl DiskEntry for ZarrDiskEntry {
     async fn read(entry: Arc<SizeTrackedEntry<Self>>) -> Result<TypedRasterTile2D> {
         let store_path = entry.store_path();
@@ -338,7 +345,10 @@ impl StorageFormat for PreparedZarrStorageFormat {
     async fn byte_size(&self) -> Result<usize> {
         Ok(self.byte_size as usize)
     }
+}
 
+#[async_trait]
+impl Expirable for PreparedZarrStorageFormat {
     async fn is_expired(&self) -> bool {
         self.common.cache_hint.is_expired()
     }
@@ -1612,6 +1622,7 @@ mod tests {
     use crate::cache::new_raster_cache::on_disk::{set_raster_cache_dir, track_written_entry};
     use crate::cache::new_raster_cache::on_disk::tests::test_key;
     use crate::cache::new_raster_cache::on_disk::zarrs_cache::format_cache_key;
+    use crate::cache::new_raster_cache::test_util::test_default_fifo_zarr;
     use crate::engine::{RasterBandDescriptors, SpatialGridDescriptor, TimeDescriptor};
     use geoengine_datatypes::util::test::TestDefault;
     use geoengine_datatypes::{primitives::DateTime, spatial_reference::SpatialReference};
@@ -1898,19 +1909,23 @@ mod tests {
 
         use super::*;
 
+        pub(crate) fn invalid_cache_hint() -> CacheHint {
+            CacheHint::with_created_and_expires(
+                "2024-01-01T12:34:56.123Z".parse::<DateTime>().unwrap(),
+                "2024-01-02T12:34:56.789Z"
+                    .parse::<DateTime>()
+                    .unwrap()
+                    .into(),
+            )
+        }
+
         fn set_up() -> (
             CacheHint,
             RasterTile2D<u8>,
             RasterResultDescriptor,
             Arc<CacheKey>,
         ) {
-            let cache_hint = CacheHint::with_created_and_expires(
-                "2024-01-01T12:34:56.123Z".parse::<DateTime>().unwrap(),
-                "2024-01-02T12:34:56.789Z"
-                    .parse::<DateTime>()
-                    .unwrap()
-                    .into(),
-            );
+            let cache_hint = invalid_cache_hint();
             let time = TimeInterval::new(0, 1).unwrap();
             let geo_transform = GeoTransform::new([0., 0.].into(), 1., -1.);
             let descriptor = RasterResultDescriptor {
@@ -1971,6 +1986,63 @@ mod tests {
             .expect("tile should be stored with its cache hint");
             assert!(stored.is_expired().await);
         }
+
+        async fn insert_expired_zarr_entry() -> (NewRasterCacheEnum, TestSetup) {
+            let mut data = setup(TestTile::NonEmptyTile);
+            data.set_cache_hint(cache_hint::invalid_cache_hint());
+            // just making sure
+            assert!(data.cache_hint().is_expired());
+
+            let mut cache = test_default_fifo_zarr(None);
+            cache
+                .insert(data.key(), data.tile(), &data.result_descriptor)
+                .await
+                .expect("the cache should succesfully insert the tile");
+            assert!(cache.byte_size() > 0, "the tile should occupy space");
+
+            let get_result = cache
+                .get(&data.key())
+                .await
+                .expect("the tile should be present for key");
+            assert!(
+                get_result.is_none(),
+                "The tile resulted in a cache hit, despite expired cache hint."
+            );
+            assert_eq!(cache.byte_size(), 0, "the expired tile should free its space");
+            (cache, data)
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn test_expired_zarr_entry_is_a_cache_miss() {
+            let _directory = set_tempdir();
+            insert_expired_zarr_entry().await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn test_replaces_expired_zarr_entry_with_same_key() {
+            let _directory = set_tempdir();
+            let (mut cache, mut data) = insert_expired_zarr_entry().await;
+            let TypedRasterTile2D::U8(mut new_tile) = data.tile() else {
+                panic!("expeced u8 tile");
+            };
+            let fresh_hint = CacheHint::max_duration();
+            new_tile.cache_hint = fresh_hint;
+
+            cache
+                .insert(data.key(), new_tile.into(), &data.result_descriptor())
+                .await
+                .expect("the cache should succesfully insert the tile");
+            let actual = cache
+                .get_tile(&data.key())
+                .await
+                .expect("lookup should succeed")
+                .expect("the new tile should be hit after replacing the expired tile1");
+            compare_tiles(&data.tile(), &actual);
+            assert_eq!(
+                call_generic_raster_tile_2d!(actual, tile => tile.cache_hint),
+                fresh_hint
+            );
+        }
     }
 
     pub(crate) struct TestSetup {
@@ -1978,6 +2050,27 @@ mod tests {
         pub(crate) tile: TypedRasterTile2D,
         pub(crate) key: Arc<CacheKey>,
         pub(crate) result_descriptor: RasterResultDescriptor,
+    }
+
+    impl TestSetup {
+        pub(crate) fn cache_hint(&self) -> CacheHint {
+            call_generic_raster_tile_2d!(&self.tile, tile => tile.cache_hint)
+        }
+        pub(crate) fn set_cache_hint(&mut self, ch: CacheHint) {
+            call_generic_raster_tile_2d!(&mut self.tile, tile => tile.cache_hint = ch)
+        }
+        pub(crate) fn tile(&self) -> TypedRasterTile2D {
+            self.tile.clone()
+        }
+        pub(crate) fn arc_key(&self) -> Arc<CacheKey> {
+            self.key.clone()
+        }
+        pub(crate) fn key(&self) -> CacheKey {
+            self.key.as_ref().clone()
+        }
+        pub(crate) fn result_descriptor(&self) -> RasterResultDescriptor {
+            self.result_descriptor.clone()
+        }
     }
 
     pub(crate) enum TestTile {

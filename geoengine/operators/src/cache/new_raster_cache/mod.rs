@@ -755,6 +755,13 @@ impl<SF> Drop for SizeTrackedEntry<SF> {
     }
 }
 
+#[async_trait]
+impl<T: Expirable + Sync + 'static> Expirable for SizeTrackedEntry<T> {
+    async fn is_expired(&self) -> bool {
+        self.value.is_expired().await
+    }
+}
+
 pub struct InMemoryCacheStore<SF, ES> {
     cache: RwLock<HashMap<Arc<CacheKey>, Arc<SizeTrackedEntry<SF>>>>,
     eviction_strategy: Arc<RwLock<ES>>,
@@ -780,23 +787,11 @@ pub trait StorageFormat: Send + Sync + Sized + 'static {
     async fn load(&self) -> Result<TypedRasterTile2D>;
 
     async fn byte_size(&self) -> Result<usize>;
-
-    async fn is_expired(&self) -> bool;
 }
 
-fn cache_hint(this: &TypedRasterTile2D) -> CacheHint {
-    match this {
-        TypedRasterTile2D::I8(tile) => tile.cache_hint,
-        TypedRasterTile2D::I16(tile) => tile.cache_hint,
-        TypedRasterTile2D::I32(tile) => tile.cache_hint,
-        TypedRasterTile2D::I64(tile) => tile.cache_hint,
-        TypedRasterTile2D::U8(tile) => tile.cache_hint,
-        TypedRasterTile2D::U16(tile) => tile.cache_hint,
-        TypedRasterTile2D::U32(tile) => tile.cache_hint,
-        TypedRasterTile2D::U64(tile) => tile.cache_hint,
-        TypedRasterTile2D::F32(tile) => tile.cache_hint,
-        TypedRasterTile2D::F64(tile) => tile.cache_hint,
-    }
+#[async_trait]
+pub trait Expirable {
+    async fn is_expired(&self) -> bool;
 }
 
 #[derive(Clone)]
@@ -909,7 +904,10 @@ impl StorageFormat for TypedCompressedRasterTile2D {
         };
         Ok(size)
     }
+}
 
+#[async_trait]
+impl Expirable for TypedCompressedRasterTile2D {
     async fn is_expired(&self) -> bool {
         match self {
             TypedCompressedRasterTile2D::I8(compressed) => compressed.cache_hint.is_expired(),
@@ -929,7 +927,7 @@ impl StorageFormat for TypedCompressedRasterTile2D {
 #[async_trait]
 impl<SF, ES> CacheStore for InMemoryCacheStore<SF, ES>
 where
-    SF: StorageFormat,
+    SF: StorageFormat + Expirable,
     ES: EvictionStrategy,
 {
     type SF = SizeTrackedEntry<SF>;
@@ -975,7 +973,7 @@ where
             }
         }
 
-        let cache_hint = cache_hint(&tile);
+        let cache_hint = call_generic_raster_tile_2d!(&tile, tile => tile.cache_hint);
         let value = SF::store(tile, key.clone(), result_descriptor).await?;
         let value_size = value.byte_size().await?;
 

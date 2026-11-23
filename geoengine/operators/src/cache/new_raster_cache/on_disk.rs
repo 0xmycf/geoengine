@@ -125,7 +125,7 @@ impl<T> DiskEntries<T> {
 #[async_trait]
 pub trait OnDiskStorageFormat: StorageFormat {
     /// Handle to the files on disk that can be read back into memory
-    type Written: DiskEntry;
+    type Written: DiskEntry + Expirable;
 
     /// Write the data to disk and return a handle to the files on disk.
     ///
@@ -163,11 +163,50 @@ where
     type ES = ES;
 
     async fn get(&self, key: &CacheKey) -> Result<Option<Arc<Self::SF>>> {
-        let entries = self.entries.read().await;
-        if entries.marked_for_deletion(key) {
-            return Ok(None);
+        let hit = {
+            let entries = self.entries.read().await;
+            if entries.marked_for_deletion(key) {
+                return Ok(None);
+            }
+            entries.get(key).map(Arc::clone)
+        };
+
+        if let Some(entry) = &hit {
+            if entry.is_expired().await {
+                // Release this lookup's pin before checking for other readers.
+                drop(hit);
+
+                let _mutation = self.mutations.lock().await;
+                let arc_key = Arc::new(key.clone());
+                {
+                    let mut entries = self.entries.write().await;
+                    if entries.marked_for_deletion(key) {
+                        return Ok(None);
+                    }
+
+                    let Some(current) = entries.get(key) else {
+                        return Ok(None);
+                    };
+                    if !current.is_expired().await || entries.pinned(&arc_key) {
+                        return Ok(None);
+                    }
+
+                    let mut eviction_strategy = self.eviction_strategy.write().await;
+                    entries.mark_delete(Arc::clone(&arc_key));
+                    eviction_strategy.record_removal(&arc_key);
+                }
+
+                if let Err(err) = self.erase_marked(key).await {
+                    tracing::warn!(error = ?err, ?key, "Failed to erase expired cache entry");
+                }
+
+                return Ok(None);
+            }
+
+            ES::record_hit(self.eviction_strategy.clone(), key).await;
         }
-        Ok(entries.get(key).cloned())
+
+        Ok(hit)
     }
 
     // TODO (high): insertion should be looked over
@@ -188,7 +227,7 @@ where
             }
         }
 
-        let cache_hint = cache_hint(&tile);
+        let cache_hint = call_generic_raster_tile_2d!(&tile, tile => tile.cache_hint);
         // OnDiskStore prepares the tile here to insert it later with write()
         // this (usually) does not write to disk, though this limitation is not enforced
         let prepared_tile = SF::store(tile, key.clone(), result_descriptor).await?;
@@ -332,7 +371,7 @@ fn time_interval_to_path_safe_iso(time: &TimeInterval) -> String {
 pub struct CommonOnDiskStorageData {
     /// the datatype of the TypedRasterTile2D
     pub data_type: RasterDataType,
-    /// The cache_hint from the tile, only used for [`StorageFormat::is_expired`]
+    /// The cache_hint from the tile, only used for [`Expirable::is_expired`]
     pub cache_hint: CacheHint,
     /// the cache key
     pub cache_key: Arc<CacheKey>,
