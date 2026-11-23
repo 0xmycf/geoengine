@@ -137,10 +137,6 @@ pub enum StorageFormatEnum {
 /// regular library build, including `MockQueryContext`, without `cfg(test)`.
 pub mod test_util {
     use super::{FifoEvictionStrategy, NewRasterCache, NewRasterCacheEnum, OnDiskStore};
-    use std::collections::{HashMap, HashSet};
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicUsize;
-    use tokio::sync::{Mutex, RwLock};
 
     const DEFAULT_CAPACITY_BYTES: usize = 8_589_934_592;
 
@@ -157,28 +153,20 @@ pub mod test_util {
     /// Creates a FIFO Zarr cache with the given capacity, defaulting to 8 GiB.
     pub fn test_default_fifo_zarr(cap_bytes: Option<usize>) -> NewRasterCacheEnum {
         NewRasterCacheEnum::OnDiskMockFifoZarr(NewRasterCache {
-            store: OnDiskStore {
-                cache_index: RwLock::new(HashMap::new()),
-                pending_deletes: Mutex::new(HashSet::new()),
-                eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(
-                    cap_bytes.unwrap_or(DEFAULT_CAPACITY_BYTES),
-                ))),
-                total_current_size: Arc::new(AtomicUsize::new(0)),
-            },
+            store: OnDiskStore::new(
+                cap_bytes.unwrap_or(DEFAULT_CAPACITY_BYTES),
+                FifoEvictionStrategy::new,
+            ),
         })
     }
 
     /// Creates a FIFO Arrow IPC cache with the given capacity, defaulting to 8 GiB.
     pub fn test_default_fifo_arrow_ipc(cap_bytes: Option<usize>) -> NewRasterCacheEnum {
         NewRasterCacheEnum::OnDiskMockFifoIpc(NewRasterCache {
-            store: OnDiskStore {
-                cache_index: RwLock::new(HashMap::new()),
-                pending_deletes: Mutex::new(HashSet::new()),
-                eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(
-                    cap_bytes.unwrap_or(DEFAULT_CAPACITY_BYTES),
-                ))),
-                total_current_size: Arc::new(AtomicUsize::new(0)),
-            },
+            store: OnDiskStore::new(
+                cap_bytes.unwrap_or(DEFAULT_CAPACITY_BYTES),
+                FifoEvictionStrategy::new,
+            ),
         })
     }
 }
