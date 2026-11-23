@@ -10,7 +10,6 @@ use std::{
 };
 
 use geoengine_datatypes::{primitives::DateTimeParseFormat, raster::RasterDataType};
-use opentelemetry::trace::FutureExt;
 use tokio::sync::Mutex;
 
 use crate::cache::new_raster_cache::*;
@@ -26,6 +25,7 @@ pub struct OnDiskStore<SF: OnDiskStorageFormat, ES: EvictionStrategy> {
     pub entries: RwLock<DiskEntries<SF::Written>>,
     pub eviction_strategy: Arc<RwLock<ES>>,
     pub total_current_size: Arc<AtomicUsize>,
+    mutations: Mutex<()>,
 }
 
 impl<SF: OnDiskStorageFormat, ES: EvictionStrategy> OnDiskStore<SF, ES> {
@@ -37,6 +37,34 @@ impl<SF: OnDiskStorageFormat, ES: EvictionStrategy> OnDiskStore<SF, ES> {
             entries: RwLock::new(DiskEntries::new()),
             eviction_strategy: Arc::new(RwLock::new(mk_evicion(capacity))),
             total_current_size: Arc::new(AtomicUsize::new(0)),
+            mutations: Mutex::new(()),
+        }
+    }
+
+    // The caller holds the mutation lock, so this key cannot be replaced
+    // between taking its handle and completing its deletion.
+    async fn erase_marked(&self, key: &CacheKey) -> Result<()> {
+        let entry = self.entries.read().await.get(key).cloned();
+        if let Some(entry) = entry {
+            entry.erase().await?;
+        }
+        self.entries.write().await.remove(key);
+        Ok(())
+    }
+
+    async fn retry_pending_deletes(&self) {
+        let keys: Vec<_> = self
+            .entries
+            .read()
+            .await
+            .pending_deletes
+            .iter()
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Err(err) = self.erase_marked(&key).await {
+                tracing::warn!(error = ?err, ?key, "Failed to retry cache entry deletion");
+            }
         }
     }
 }
@@ -85,32 +113,10 @@ impl<T> DiskEntries<T> {
         self.pending_deletes.insert(key)
     }
 
-    /// Remove a cache entry from the index. Returns the removed entry if it existed.
+    /// Remove an erased entry and its deletion marker from the index.
     pub fn remove(&mut self, key: &CacheKey) -> Option<Arc<SizeTrackedEntry<T>>> {
+        self.pending_deletes.remove(key);
         self.cache_index.remove(key)
-    }
-}
-
-impl<T: DiskEntry> DiskEntries<T> {
-    pub async fn remove_marked(&mut self) {
-        let keys: Vec<_> = self.pending_deletes.iter().cloned().collect();
-        for key in keys {
-            let Some(entry) = self.cache_index.get(&key) else {
-                self.pending_deletes.remove(&key);
-                continue;
-            };
-            match entry.erase().await {
-                Ok(()) => {
-                    self.cache_index.remove(&key);
-                    self.pending_deletes.remove(&key);
-                }
-                Err(err) => {
-                    tracing::warn!(error = ?err, key = ?key, "Failed to retry cache entry deletion.");
-                }
-            }
-        }
-        self.pending_deletes
-            .retain(|key| matches!(self.cache_index.get(key), Some(_)));
     }
 }
 
@@ -157,11 +163,14 @@ where
     type ES = ES;
 
     async fn get(&self, key: &CacheKey) -> Result<Option<Arc<Self::SF>>> {
-        Ok(self.entries.read().await.get(key).map(Arc::clone))
+        let entries = self.entries.read().await;
+        if entries.marked_for_deletion(key) {
+            return Ok(None);
+        }
+        Ok(entries.get(key).cloned())
     }
 
     // TODO (high): insertion should be looked over
-    // TODO (high): concrete issue; failed (partial) delete, leaves partial data behind on the disk.
     async fn insert(
         &self,
         key: Arc<CacheKey>,
@@ -173,9 +182,7 @@ where
         Otherwise we will have orphaned files. */
         {
             let entries = self.entries.read().await;
-            if let Some(_) = entries.get(&key)
-                && !entries.marked_for_deletion(&key)
-            {
+            if entries.get(&key).is_some() && !entries.marked_for_deletion(&key) {
                 ES::record_hit(self.eviction_strategy.clone(), &key).await;
                 return Ok(());
             }
@@ -190,57 +197,58 @@ where
         let key_size = cache_key_byte_size(&key);
         let required_space = value_size + key_size;
 
-        let mut entries = self.entries.write().await;
-        {
-            let () = entries.remove_marked().await;
+        // Serialize disk mutations and capacity decisions while letting
+        // lookups access the index during filesystem I/O.
+        let _mutation = self.mutations.lock().await;
+        self.retry_pending_deletes().await;
+
+        let (eviction_plan, capacity) = {
+            let entries = self.entries.read().await;
             if entries.marked_for_deletion(&key) {
                 return Err(CacheError::PendingDelete.into());
             }
-            if let Some(_) = entries.get(&key) {
+            if entries.get(&key).is_some() {
                 return Ok(());
             }
+
+            let eviction_strategy = self.eviction_strategy.read().await;
+            let current_size = self.total_current_size.load(Ordering::SeqCst);
+            let capacity = eviction_strategy.capacity();
+            let plan = eviction_strategy
+                .plan_eviction(current_size, required_space, |key| entries.pinned(key))?;
+            let needed = required_space.saturating_sub(capacity.saturating_sub(current_size));
+            if plan.freed_bytes < needed {
+                return Err(CacheError::NotEnoughSpaceInCache.into());
+            }
+            (plan, capacity)
+        };
+
+        for evict_key in eviction_plan.keys_to_remove {
+            {
+                let mut entries = self.entries.write().await;
+                if entries.marked_for_deletion(&evict_key) || entries.pinned(&evict_key) {
+                    continue;
+                }
+                let mut eviction_strategy = self.eviction_strategy.write().await;
+                entries.mark_delete(Arc::clone(&evict_key));
+                eviction_strategy.record_removal(&evict_key);
+            }
+
+            self.erase_marked(&evict_key).await.inspect_err(|err| {
+                tracing::warn!(error = ?err, key = ?evict_key, "Failed to erase cache entry.");
+            })?;
         }
 
-        let mut eviction_strategy = self.eviction_strategy.write().await;
+        // Check that eviction freed enough space.
+        // A planned candidate may have become pinned after planning eviction.
         let current_size = self.total_current_size.load(Ordering::SeqCst);
-
-        let eviction_plan =
-            eviction_strategy
-                .plan_eviction(current_size, required_space, |key| entries.pinned(key))?;
-
-        let needed = (current_size + required_space).saturating_sub(eviction_strategy.capacity());
-        if eviction_plan.freed_bytes < needed {
+        if required_space > capacity.saturating_sub(current_size) {
             return Err(CacheError::NotEnoughSpaceInCache.into());
         }
 
-        for evict_key in eviction_plan.keys_to_remove {
-            let Some(entry) = entries.get(&evict_key) else {
-                continue;
-            };
-            if !entries.marked_for_deletion(&evict_key) {
-                continue;
-            }
-
-            // we cannot delete the file from disk yet if there are
-            // other readers to this handle.
-            if Arc::strong_count(entry) > 1 {
-                continue;
-            }
-
-            let entry = Arc::clone(entry);
-            entries.mark_delete(evict_key.clone());
-            eviction_strategy.record_removal(&evict_key);
-
-            // delete the file from disk
-            entry.erase().await.inspect_err(|err| {
-                tracing::warn!(error = ?err, key = ?evict_key, "Failed to erase cache entry.");
-            })?;
-            // this just removes it from the index, the file is still there if entry.erase() is not called.
-            entries.remove(&evict_key);
-        }
-
-        // write to disk
         let written = prepared_tile.write().await?;
+        let mut entries = self.entries.write().await;
+        let mut eviction_strategy = self.eviction_strategy.write().await;
         eviction_strategy.record_access(&key, required_space, cache_hint);
         entries.insert(
             key,
