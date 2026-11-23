@@ -10,6 +10,7 @@ use std::{
 };
 
 use geoengine_datatypes::{primitives::DateTimeParseFormat, raster::RasterDataType};
+use tokio::sync::Mutex;
 
 use crate::cache::new_raster_cache::*;
 #[cfg(not(test))]
@@ -21,7 +22,8 @@ pub mod zarrs_cache;
 const GLOBAL_GEOTRANSFORM_KEY: &'static str = "global_geo_transform";
 
 pub struct OnDiskStore<SF: OnDiskStorageFormat, ES: EvictionStrategy> {
-    pub cache_index: RwLock<HashMap<Arc<CacheKey>, Arc<SizeTrackedEntry<SF::Written>>>>,
+    pub cache_index: RwLock<HashMap<Arc<CacheKey>, DiskEntryIndex<SF::Written>>>,
+    pub pending_deletes: Mutex<HashSet<Arc<CacheKey>>>,
     pub eviction_strategy: Arc<RwLock<ES>>,
     pub total_current_size: Arc<AtomicUsize>,
 }
@@ -59,6 +61,24 @@ fn track_written_entry<T>(entry: T) -> Arc<SizeTrackedEntry<T>> {
     Arc::new(SizeTrackedEntry::new(entry, 0, Arc::default()))
 }
 
+//#[derive(Clone)]
+pub enum DiskEntryIndex<T> {
+    Live(Arc<SizeTrackedEntry<T>>),
+    PendingDelete(Arc<SizeTrackedEntry<T>>),
+}
+
+impl<T> DiskEntryIndex<T> {
+    fn on_live<F, R>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce(&Arc<SizeTrackedEntry<T>>) -> R,
+    {
+        match self {
+            DiskEntryIndex::Live(size_tracked_entry) => Some(f(size_tracked_entry)),
+            DiskEntryIndex::PendingDelete(_) => None,
+        }
+    }
+}
+
 #[async_trait]
 impl<SF, ES> CacheStore for OnDiskStore<SF, ES>
 where
@@ -69,10 +89,9 @@ where
     type ES = ES;
 
     async fn get(&self, key: &CacheKey) -> Result<Option<Arc<Self::SF>>> {
-        let x = self.cache_index.read().await.get(key).map(Arc::clone);
-        match x {
-            Some(key) => Ok(Some(key)),
-            None => Ok(None),
+        match self.cache_index.read().await.get(key) {
+            Some(DiskEntryIndex::Live(key)) => Ok(Some(Arc::clone(&key))),
+            _ => Ok(None),
         }
     }
 
@@ -88,10 +107,13 @@ where
         without actually being inserted in the cache / index later on.
         Otherwise we will have orphaned files. */
         {
-            let cache = self.cache_index.read().await;
-            if cache.contains_key(&key) {
-                ES::record_hit(self.eviction_strategy.clone(), &key).await;
-                return Ok(());
+            let cache_index = self.cache_index.read().await;
+            match cache_index.get(&key) {
+                Some(DiskEntryIndex::Live(..)) => {
+                    ES::record_hit(self.eviction_strategy.clone(), &key).await;
+                    return Ok(());
+                }
+                Some(DiskEntryIndex::PendingDelete(..)) | None => {}
             }
         }
 
@@ -105,19 +127,50 @@ where
         let required_space = value_size + key_size;
 
         let mut cache_index = self.cache_index.write().await;
-        if cache_index.contains_key(&key) {
-            return Ok(());
+        {
+            let mut pending_deletes = self.pending_deletes.lock().await;
+            // TODO (low): c2926fe8-4fa9-4403-ab06-00837345bad3
+            for key in pending_deletes.iter() {
+                let Some(DiskEntryIndex::PendingDelete(entry)) = cache_index.get(key) else {
+                    continue;
+                };
+                match entry.erase().await {
+                    Ok(()) => {
+                        cache_index.remove(key);
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = ?err, key = ?key, "Failed to retry cache entry deletion.");
+                    }
+                }
+            }
+
+            pending_deletes.retain(|key| {
+                matches!(cache_index.get(key), Some(DiskEntryIndex::PendingDelete(_)))
+            });
+
+            match cache_index.get(&key) {
+                Some(DiskEntryIndex::Live(..)) => return Ok(()),
+                Some(DiskEntryIndex::PendingDelete(..)) => {
+                    return Err(CacheError::PendingDelete.into());
+                }
+                None => {}
+            }
         }
 
         let mut eviction_strategy = self.eviction_strategy.write().await;
         let current_size = self.total_current_size.load(Ordering::SeqCst);
 
-        let eviction_plan =
-            eviction_strategy.plan_eviction(current_size, required_space, |key| {
+        let eviction_plan = eviction_strategy.plan_eviction(
+            current_size,
+            required_space,
+            /* is_pinned?(key) */
+            |key| {
                 cache_index
                     .get(key)
-                    .is_none_or(|sf| Arc::strong_count(sf) > 1)
-            })?;
+                    .and_then(|entry| entry.on_live(Arc::strong_count))
+                    .is_none_or(|count| count > 1)
+            },
+        )?;
 
         let needed = (current_size + required_space).saturating_sub(eviction_strategy.capacity());
         if eviction_plan.freed_bytes < needed {
@@ -125,23 +178,33 @@ where
         }
 
         for evict_key in eviction_plan.keys_to_remove {
-            let Some(entry) = cache_index.get(&evict_key) else {
+            let Some(state) = cache_index.get_mut(&evict_key) else {
+                continue;
+            };
+            let DiskEntryIndex::Live(entry) = state else {
                 continue;
             };
 
             // we cannot delete the file from disk yet if there are
             // other readers to this handle.
-            // TODO (high): The types should enforce this if possible, look
-            //              into a better solution
             if Arc::strong_count(entry) > 1 {
                 continue;
             }
 
+            let entry = Arc::clone(entry);
+            *state = DiskEntryIndex::PendingDelete(Arc::clone(&entry));
+            self.pending_deletes
+                .lock()
+                .await
+                .insert(Arc::clone(&evict_key));
+            eviction_strategy.record_removal(&evict_key);
+
             // delete the file from disk
-            entry.erase().await?;
+            entry.erase().await.inspect_err(|err| {
+                tracing::warn!(error = ?err, key = ?evict_key, "Failed to erase cache entry.");
+            })?;
             // this just removes it from the index, the file is still there if entry.erase() is not called.
             cache_index.remove(&evict_key);
-            eviction_strategy.record_removal(&evict_key);
         }
 
         // write to disk
@@ -149,11 +212,11 @@ where
         eviction_strategy.record_access(&key, required_space, cache_hint);
         cache_index.insert(
             key,
-            Arc::new(SizeTrackedEntry::new(
+            DiskEntryIndex::Live(Arc::new(SizeTrackedEntry::new(
                 written,
                 required_space,
                 self.total_current_size.clone(),
-            )),
+            ))),
         );
         Ok(())
     }
@@ -411,6 +474,7 @@ mod tests {
 
             let store: OnDiskStore<PreparedZarrStorageFormat, FifoEvictionStrategy> = OnDiskStore {
                 cache_index: RwLock::new(HashMap::new()),
+                pending_deletes: Mutex::new(HashSet::new()),
                 eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(usize::MAX))),
                 total_current_size: Arc::new(AtomicUsize::new(0)),
             };
@@ -498,6 +562,7 @@ mod tests {
 
             let store: OnDiskStore<PreparedZarrStorageFormat, FifoEvictionStrategy> = OnDiskStore {
                 cache_index: RwLock::new(HashMap::new()),
+                pending_deletes: Mutex::new(HashSet::new()),
                 eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(usize::MAX))),
                 total_current_size: Arc::new(AtomicUsize::new(0)),
             };

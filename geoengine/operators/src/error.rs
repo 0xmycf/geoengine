@@ -17,6 +17,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use strum::IntoStaticStr;
 
+/// TODO (low): {b80d3225-dbc8-4fe9-9f7f-e1c95cebda72}
 #[derive(Debug, Snafu, IntoStaticStr)]
 #[snafu(visibility(pub(crate)))]
 #[snafu(context(suffix(false)))] // disables default `Snafu` suffix

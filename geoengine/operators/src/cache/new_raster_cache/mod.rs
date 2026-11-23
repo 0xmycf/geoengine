@@ -137,43 +137,45 @@ pub enum StorageFormatEnum {
 /// regular library build, including `MockQueryContext`, without `cfg(test)`.
 pub mod test_util {
     use super::{FifoEvictionStrategy, NewRasterCache, NewRasterCacheEnum, OnDiskStore};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
-    use tokio::sync::RwLock;
+    use tokio::sync::{Mutex, RwLock};
 
     const DEFAULT_CAPACITY_BYTES: usize = 8_589_934_592;
 
-    /// Creates a FIFO in-memory compressed tile cache with an 8 GiB capacity.
-    pub fn test_default_fifo_in_memory() -> NewRasterCacheEnum {
-        NewRasterCacheEnum::new_fifo(DEFAULT_CAPACITY_BYTES)
+    /// Creates a FIFO in-memory compressed tile cache with the given capacity, defaulting to 8 GiB.
+    pub fn test_default_fifo_in_memory(cap_bytes: Option<usize>) -> NewRasterCacheEnum {
+        NewRasterCacheEnum::new_fifo(cap_bytes.unwrap_or(DEFAULT_CAPACITY_BYTES))
     }
 
-    /// Creates an LRU in-memory compressed tile cache with an 8 GiB capacity.
-    pub fn test_default_lru_in_memory() -> NewRasterCacheEnum {
-        NewRasterCacheEnum::new_lru(DEFAULT_CAPACITY_BYTES)
+    /// Creates an LRU in-memory compressed tile cache with the given capacity, defaulting to 8 GiB.
+    pub fn test_default_lru_in_memory(cap_bytes: Option<usize>) -> NewRasterCacheEnum {
+        NewRasterCacheEnum::new_lru(cap_bytes.unwrap_or(DEFAULT_CAPACITY_BYTES))
     }
 
-    /// Creates a FIFO Zarr cache with an 8 GiB capacity.
-    pub fn test_default_fifo_zarr() -> NewRasterCacheEnum {
+    /// Creates a FIFO Zarr cache with the given capacity, defaulting to 8 GiB.
+    pub fn test_default_fifo_zarr(cap_bytes: Option<usize>) -> NewRasterCacheEnum {
         NewRasterCacheEnum::OnDiskMockFifoZarr(NewRasterCache {
             store: OnDiskStore {
                 cache_index: RwLock::new(HashMap::new()),
+                pending_deletes: Mutex::new(HashSet::new()),
                 eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(
-                    DEFAULT_CAPACITY_BYTES,
+                    cap_bytes.unwrap_or(DEFAULT_CAPACITY_BYTES),
                 ))),
                 total_current_size: Arc::new(AtomicUsize::new(0)),
             },
         })
     }
 
-    /// Creates a FIFO Arrow IPC cache with an 8 GiB capacity.
-    pub fn test_default_fifo_arrow_ipc() -> NewRasterCacheEnum {
+    /// Creates a FIFO Arrow IPC cache with the given capacity, defaulting to 8 GiB.
+    pub fn test_default_fifo_arrow_ipc(cap_bytes: Option<usize>) -> NewRasterCacheEnum {
         NewRasterCacheEnum::OnDiskMockFifoIpc(NewRasterCache {
             store: OnDiskStore {
                 cache_index: RwLock::new(HashMap::new()),
+                pending_deletes: Mutex::new(HashSet::new()),
                 eviction_strategy: Arc::new(RwLock::new(FifoEvictionStrategy::new(
-                    DEFAULT_CAPACITY_BYTES,
+                    cap_bytes.unwrap_or(DEFAULT_CAPACITY_BYTES),
                 ))),
                 total_current_size: Arc::new(AtomicUsize::new(0)),
             },
@@ -230,21 +232,33 @@ impl NewRasterCacheEnum {
         &self,
         key: CacheKey,
         tile: TypedRasterTile2D,
-        raster_properties: &RasterResultDescriptor,
+        raster_result_descriptor: &RasterResultDescriptor,
     ) -> Result<()> {
         let key = Arc::new(key);
         match self {
             NewRasterCacheEnum::InMemoryCompressedRasterTile2DFifo(cache) => {
-                cache.store.insert(key, tile, raster_properties).await
+                cache
+                    .store
+                    .insert(key, tile, raster_result_descriptor)
+                    .await
             }
             NewRasterCacheEnum::InMemoryCompressedRasterTile2DLru(cache) => {
-                cache.store.insert(key, tile, raster_properties).await
+                cache
+                    .store
+                    .insert(key, tile, raster_result_descriptor)
+                    .await
             }
             NewRasterCacheEnum::OnDiskMockFifoIpc(cache) => {
-                cache.store.insert(key, tile, raster_properties).await
+                cache
+                    .store
+                    .insert(key, tile, raster_result_descriptor)
+                    .await
             }
             NewRasterCacheEnum::OnDiskMockFifoZarr(cache) => {
-                cache.store.insert(key, tile, raster_properties).await
+                cache
+                    .store
+                    .insert(key, tile, raster_result_descriptor)
+                    .await
             }
         }
     }

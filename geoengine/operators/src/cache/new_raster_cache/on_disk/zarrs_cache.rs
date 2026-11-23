@@ -1615,6 +1615,7 @@ mod tests {
     use crate::engine::{RasterBandDescriptors, SpatialGridDescriptor, TimeDescriptor};
     use geoengine_datatypes::util::test::TestDefault;
     use geoengine_datatypes::{primitives::DateTime, spatial_reference::SpatialReference};
+    use opentelemetry::global::set_text_map_propagator;
     use tempfile::TempDir;
     use zarrs::storage::{AsyncReadableStorageTraits, AsyncWritableStorageTraits};
 
@@ -2394,10 +2395,23 @@ mod tests {
         async_retrieve_tile_impl(TestTile::EmptyTile).await;
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_async_erase() {
-        let directory = set_tempdir();
-        let mut data = setup(TestTile::NonEmptyTile);
+    fn prepare_two_tiles(
+        data: &mut TestSetup,
+    ) -> ((TypedRasterTile2D, CacheKey), (TypedRasterTile2D, CacheKey)) {
+        fn mk_key(i: usize, data: &TestSetup) -> CacheKey {
+            let pixel_position = match i {
+                0 => [0, 0],
+                1 => [0, 2],
+                _ => unreachable!("test contains exactly two tiles"),
+            };
+
+            (
+                data.key.0.clone(),
+                data.key.1,
+                data.key.2,
+                pixel_position.into(),
+            )
+        }
         data.result_descriptor.spatial_grid = SpatialGridDescriptor::source_from_parts(
             data.geo_transform,
             GridBoundingBox2D::new([0, 0], [1, 3]).unwrap(),
@@ -2408,31 +2422,27 @@ mod tests {
             tile.tile_position.0[1] += 1;
             tile.into()
         });
+        ((tile1, mk_key(0, data)), (tile2, mk_key(1, data)))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_async_erase() {
+        let mut data = setup(TestTile::NonEmptyTile);
+        let directory = set_tempdir();
+        let ((tile1, key1), (tile2, key2)) = prepare_two_tiles(&mut data);
         let paths = ZarrsArrayPath::from_cache_key(&data.key);
         let store = async_open_zarrs_filesystem_store(&paths)
             .await
             .expect("it to open the store asynchronously");
 
-        fn mk_key(i: usize, data: &TestSetup) -> Arc<CacheKey> {
-            let pixel_position = match i {
-                0 => [0, 0],
-                1 => [0, 2],
-                _ => unreachable!("test contains exactly two tiles"),
-            };
-
-            Arc::new((
-                data.key.0.clone(),
-                data.key.1,
-                data.key.2,
-                pixel_position.into(),
-            ))
-        }
-
         // write both
         let mut disk_entries = Vec::with_capacity(2);
-        for (i, tile) in [tile1, tile2.clone()].into_iter().enumerate() {
+        for (i, (tile, key)) in [(tile1, key1), (tile2.clone(), key2)]
+            .into_iter()
+            .enumerate()
+        {
             let prepared =
-                PreparedZarrStorageFormat::store(tile, mk_key(i, &data), &data.result_descriptor)
+                PreparedZarrStorageFormat::store(tile, Arc::new(key), &data.result_descriptor)
                     .await
                     .expect(&format!("it to prepare the tile{} for storage", i));
             let disk_entry = prepared
@@ -2474,8 +2484,8 @@ mod tests {
             .expect("it to erase the first tile");
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_async_erase_failure() {
+    async fn erase_and_inject_failure()
+    -> (Result<()>, PathBuf, TempDir, ZarrsArrayPath, ZarrDiskEntry) {
         let directory = set_tempdir();
         let data = setup(TestTile::NonEmptyTile);
         let paths = ZarrsArrayPath::from_cache_key(&data.key);
@@ -2488,7 +2498,15 @@ mod tests {
             .await
             .expect("it to write the tile to disk");
 
-        // overwrite the data to inject an erase error
+        let chunk_path = overwrite_tiles_arr_coords_0_0_and_write_blocker(&directory, &paths).await;
+        let result = disk_entry.erase().await;
+        (result, chunk_path, directory, paths, disk_entry)
+    }
+
+    async fn overwrite_tiles_arr_coords_0_0_and_write_blocker(
+        directory: &TempDir,
+        paths: &ZarrsArrayPath,
+    ) -> PathBuf {
         let chunk_path =
             format_cache_key(directory.path().join(ZARR_CACHE), &paths).join("tiles/c/0/0");
         tokio::fs::remove_file(&chunk_path).await.unwrap();
@@ -2496,8 +2514,12 @@ mod tests {
         tokio::fs::write(chunk_path.join("blocker"), b"You shall not pass!")
             .await
             .unwrap();
+        chunk_path
+    }
 
-        let result = disk_entry.erase().await;
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_async_erase_failure() {
+        let (result, chunk_path, directory, paths, disk_entry) = erase_and_inject_failure().await;
         assert!(matches!(
             result,
             Err(Error::ZarrChunkEraseError {
@@ -2521,6 +2543,169 @@ mod tests {
             .join(paths.tiles().trim_start_matches("/"))
             .join("zarr.json");
         assert!(layout.exists());
+    }
+
+    mod eviction_tests {
+        use super::*;
+        use crate::cache::new_raster_cache::{
+            NewRasterCacheEnum, test_util::test_default_fifo_zarr,
+        };
+
+        struct FailedEviction {
+            _directory: TempDir,
+            cache: NewRasterCacheEnum,
+            key1: CacheKey,
+            key2: CacheKey,
+            tile2: TypedRasterTile2D,
+            result_descriptor: RasterResultDescriptor,
+            chunk_path: PathBuf,
+            expected_bytes_after_retry: usize,
+        }
+
+        async fn setup_failed_eviction() -> FailedEviction {
+            let directory = set_tempdir();
+            let mut data = setup(TestTile::NonEmptyTile);
+            let ((tile1, key1), (tile2, key2)) = prepare_two_tiles(&mut data);
+            let (prepared1, prepared2) = {
+                let x = PreparedZarrStorageFormat::store(
+                    tile1.clone(),
+                    Arc::new(key1.clone()),
+                    &data.result_descriptor,
+                )
+                .await
+                .expect("it to prepare the first tile for storage");
+                let y = PreparedZarrStorageFormat::store(
+                    tile2.clone(),
+                    Arc::new(key2.clone()),
+                    &data.result_descriptor,
+                )
+                .await
+                .expect("it to prepare the second tile for storage");
+                (x, y)
+            };
+
+            // inserts counts per tile: tile.size + key.size
+            // thus the maximum of the tiles is enough to make eviction happen
+            let max_bytes_in_cache = usize::max(
+                prepared1.byte_size().await.unwrap(),
+                prepared2.byte_size().await.unwrap(),
+            ) + cache_key_byte_size(&key1);
+            assert_eq!(cache_key_byte_size(&key1), cache_key_byte_size(&key2));
+            let mut cache = test_default_fifo_zarr(Some(max_bytes_in_cache));
+            let () = cache
+                .insert(key1.clone(), tile1.clone(), &data.result_descriptor)
+                .await
+                .expect("the cache should succesfully insert tile1");
+
+            // verify its inside, but dont hold on to the Arc, or eviction cannot trigger
+            {
+                let get_result = cache
+                    .get(&key1)
+                    .await
+                    .expect("it to get the option out of the store")
+                    .expect("the key1 to map to tile1");
+                let tile = get_result.load().await.expect("loading should work");
+                compare_tiles(&tile1, &tile);
+            }
+
+            let paths = ZarrsArrayPath::from_cache_key(&key1);
+            // overwrite the data to inject an erase error
+            let chunk_path =
+                overwrite_tiles_arr_coords_0_0_and_write_blocker(&directory, &paths).await;
+
+            let size_before_insert_2 = cache.byte_size();
+            assert!(size_before_insert_2 > 0);
+            // write the second tile, triggering the eviction
+            let result = cache
+                .insert(key2.clone(), tile2.clone(), &data.result_descriptor)
+                .await;
+            assert!(matches!(
+                result,
+                Err(Error::ZarrChunkEraseError {
+                    chunk_indices: [0, 0],
+                    errors,
+                }) if matches!(
+                    errors.as_slice(),
+                    [(zarrs::storage::StorageError::IOError(_), WhichZarrArray::Tiles)]
+                )
+            ));
+            assert_eq!(size_before_insert_2, cache.byte_size());
+
+            let get_result_2 = cache
+                .get(&key2)
+                .await
+                .expect("getting a result for key2 should work");
+            assert!(get_result_2.is_none());
+
+            // eviction should have removed this (key, tile) pair value
+            let get_result_1 = cache
+                .get(&key1)
+                .await
+                .expect("getting a result for key1 should work");
+            assert!(get_result_1.is_none());
+
+            assert_eq!(size_before_insert_2, cache.byte_size());
+
+            let expected_bytes_after_retry =
+                cache_key_byte_size(&key2) + prepared2.byte_size().await.unwrap();
+            FailedEviction {
+                _directory: directory,
+                cache,
+                key1,
+                key2,
+                tile2,
+                result_descriptor: data.result_descriptor,
+                chunk_path,
+                expected_bytes_after_retry,
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn test_it_invalidates_zarr_entry_after_partial_erase() {
+            let _failed_eviction = setup_failed_eviction().await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn test_it_frees_cache_capacity_after_successful_eviction_retry() {
+            let FailedEviction {
+                _directory,
+                mut cache,
+                key1,
+                key2,
+                tile2,
+                result_descriptor,
+                chunk_path,
+                expected_bytes_after_retry,
+            } = setup_failed_eviction().await;
+
+            // now remove the blocker
+            tokio::fs::remove_dir_all(&chunk_path).await.unwrap();
+
+            cache
+                .insert(key2.clone(), tile2.clone(), &result_descriptor)
+                .await
+                .expect("it to insert tile2 again after removing the blocker");
+
+            // tile1 is a miss, tile2 should be inside
+            {
+                let get_result_1 = cache
+                    .get(&key1)
+                    .await
+                    .expect("getting a result for key1 should work");
+                assert!(get_result_1.is_none());
+
+                let get_result_2 = cache
+                    .get(&key2)
+                    .await
+                    .expect("getting a result for key2 should work")
+                    .expect("the key2 to map to tile2");
+                let tile = get_result_2.load().await.expect("loading should work");
+                compare_tiles(&tile2, &tile);
+
+                // size of the cache should now be only sizeof(tile2) + sizeof(key2) , as (tile1, key1) is fully removed
+                assert_eq!(expected_bytes_after_retry, cache.byte_size());
+            }
+        }
     }
 
     mod format_tests {
