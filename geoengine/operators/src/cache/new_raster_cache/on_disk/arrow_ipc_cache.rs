@@ -117,9 +117,11 @@ impl DiskEntry for ArrowIpcDiskEntry {
     }
 
     async fn erase(&self) -> Result<()> {
-        tokio::fs::remove_file(&self.path)
-            .await
-            .map_err(|source| source.into())
+        match tokio::fs::remove_file(&self.path).await {
+            Ok(()) => Ok(()),
+            Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(source.into()),
+        }
     }
 }
 

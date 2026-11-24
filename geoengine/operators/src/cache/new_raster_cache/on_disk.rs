@@ -498,6 +498,62 @@ mod tests {
         use super::*;
 
         #[tokio::test]
+        async fn it_retries_arrow_ipc_eviction_after_file_disappears() {
+            let _temp_dir = initialize_test_zarrs_cache_dir();
+            let old_key = test_key(0);
+            let new_key = Arc::new((old_key.0.clone(), 1, old_key.2, old_key.3));
+            let old_tile = test_tile_u8(0);
+            let new_tile = test_tile_u8(1);
+            let descriptor = test_result_descriptor();
+
+            let old_size =
+                ArrowIpcStorageFormat::store(old_tile.clone(), old_key.clone(), &descriptor)
+                    .await
+                    .unwrap()
+                    .byte_size()
+                    .await
+                    .unwrap()
+                    + cache_key_byte_size(&old_key);
+            let new_size =
+                ArrowIpcStorageFormat::store(new_tile.clone(), new_key.clone(), &descriptor)
+                    .await
+                    .unwrap()
+                    .byte_size()
+                    .await
+                    .unwrap()
+                    + cache_key_byte_size(&new_key);
+            let store: OnDiskStore<ArrowIpcStorageFormat, FifoEvictionStrategy> =
+                OnDiskStore::new(old_size.max(new_size), FifoEvictionStrategy::new);
+
+            store
+                .insert(old_key.clone(), old_tile, &descriptor)
+                .await
+                .unwrap();
+            let path = store.get(&old_key).await.unwrap().unwrap().path.clone();
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+
+            let error = store
+                .insert(new_key.clone(), new_tile.clone(), &descriptor)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, crate::error::Error::Io { .. }));
+            assert!(store.get(&old_key).await.unwrap().is_none());
+            assert!(store.get(&new_key).await.unwrap().is_none());
+            assert_eq!(store.total_current_size.load(Ordering::SeqCst), old_size);
+
+            fs::remove_dir(&path).unwrap();
+            store
+                .insert(new_key.clone(), new_tile, &descriptor)
+                .await
+                .unwrap();
+
+            assert!(store.get(&old_key).await.unwrap().is_none());
+            assert!(store.get(&new_key).await.unwrap().is_some());
+            assert_eq!(store.total_current_size.load(Ordering::SeqCst), new_size);
+        }
+
+        #[tokio::test]
         async fn arrow_ipc_storage_format_store_and_load() {
             initialize_test_zarrs_cache_dir();
 
